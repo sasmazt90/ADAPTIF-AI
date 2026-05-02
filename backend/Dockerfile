@@ -20,15 +20,14 @@ RUN apt-get update \
         libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+COPY backend/requirements.txt .
 RUN pip install --upgrade pip \
     && pip install -r requirements.txt
 
-COPY app ./app
-COPY scripts ./scripts
+COPY backend/app ./app
+COPY backend/scripts ./scripts
 
 # Copy shared frontend templates (needed by main.py for placement schema)
-# These are copied from the repo root via the build context (railway.json sets context to repo root)
 COPY src/shared/preview-templates.json ./src/shared/preview-templates.json
 
 RUN mkdir -p /data/huggingface /data/torch /data/easyocr /data/tmp/adaptifai
