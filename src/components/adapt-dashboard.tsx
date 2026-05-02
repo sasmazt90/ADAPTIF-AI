@@ -1206,7 +1206,7 @@ export function AdaptDashboard() {
       if (payload.outputs?.[0]?.placement_id) setActivePlacementId(payload.outputs[0].placement_id);
       if (payload.outputs?.[0]?.source_name) setActiveResizeSource(payload.outputs[0].source_name);
       setActiveOutputIndex(0);
-      setCopy(payload.outputs?.[0]?.translated_text ?? sampleCopy[mode]);
+      setCopy(payload.outputs?.[0]?.translated_text ?? "");
       setCredits(Number(payload.credits_remaining ?? credits));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Pipeline failed.");
@@ -1465,7 +1465,7 @@ export function AdaptDashboard() {
               <div className="mb-3 flex items-center justify-between"><h2 className="font-semibold">{mode === "adapt" ? "Translation Editor" : "Resize Modifier"}</h2>{mode === "adapt" ? <Type className="h-4 w-4 text-[#0f766e]" /> : <Frame className="h-4 w-4 text-[#0f766e]" />}</div>
               {mode === "adapt" ? (
                 <>
-                  <textarea className="min-h-32 w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]" value={copy} onChange={(e) => setCopy(e.target.value)} aria-label="Manual translation override" />
+                  <textarea className="min-h-32 w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]" value={copy} onChange={(e) => setCopy(e.target.value)} placeholder="Translated text will appear here after localization runs." aria-label="Manual translation override" />
                   {(() => {
                     const actions: Array<{ label: string; icon: typeof Type; active: boolean; onClick: () => void }> = [
                       { label: "Preserve bold", icon: Type, active: preserveBold, onClick: () => setPreserveBold((value) => !value) },

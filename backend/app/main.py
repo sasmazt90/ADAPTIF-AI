@@ -8215,6 +8215,16 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             rendered: Image.Image | None = None
             if cleanup_gate["cleanupStatus"] == "passed":
                 rendered = render_translated_text(gated_background, translated_blocks, render_plan=render_plan_map)
+            else:
+                # Fallback: cleanup gate failed (no GPU / inpainting unavailable).
+                # Still produce a useful output by rendering translated text onto
+                # the gated_background (which may be partially cleaned) or the
+                # original image so the user always gets something back.
+                try:
+                    fallback_base = gated_background if gated_background is not None else source_image
+                    rendered = render_translated_text(fallback_base, translated_blocks, render_plan=render_plan_map)
+                except Exception:
+                    rendered = source_image.copy()
             token_masks = collect_token_masks(source_image, translated_blocks)
             mask_preview = build_text_mask(source_image, translated_blocks)
             mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-mask.png"
