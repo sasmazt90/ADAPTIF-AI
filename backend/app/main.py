@@ -7501,165 +7501,271 @@ def build_resize_focus_bbox(source: Image.Image) -> tuple[int, int, int, int]:
     )
 
 
-def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Image:
+def _detect_cta_button_bbox(
+    source: Image.Image,
+    text_blocks: list[TextBlock],
+) -> tuple[int, int, int, int] | None:
     """
-    Smart resize: instead of cropping, this function:
-    1. Detects text regions via OCR
-    2. Detects the visual subject (foreground) bounding box
-    3. Generates a clean background (inpainted / background-extended)
-    4. Re-scales the foreground element to fit the new canvas
-    5. Re-renders OCR-detected text at appropriate positions/sizes
+    Detect a CTA button region in a source image.
+    Strategy: find text blocks with role='cta', then look for a solid-colour
+    rectangular region immediately around them (the button background).
+    Returns the expanded button bounding box or None if not found.
+    """
+    src_w, src_h = source.width, source.height
+    cta_blocks = [b for b in text_blocks if b.role == "cta" or (b.translate and classify_text_role(b.text) == "cta")]
+    if not cta_blocks:
+        return None
 
-    Falls back to focus-aware cover crop if any step fails.
+    # Pick the most prominent CTA block (largest area among those with short text)
+    best: TextBlock | None = None
+    for b in cta_blocks:
+        bw = b.bbox[2] - b.bbox[0]
+        bh = b.bbox[3] - b.bbox[1]
+        # Buttons are typically short-text, horizontally wide relative to height
+        if bw > bh and len(b.text.split()) <= 6:
+            if best is None or bw * bh > (best.bbox[2] - best.bbox[0]) * (best.bbox[3] - best.bbox[1]):
+                best = b
+    if best is None:
+        best = cta_blocks[0]
+
+    tx0, ty0, tx1, ty1 = best.bbox
+    # Expand outward to include button padding (typically 30-50% of text height on each side)
+    pad_h = max(8, int((ty1 - ty0) * 0.55))
+    pad_w = max(16, int((tx1 - tx0) * 0.22))
+
+    # Try to detect the button background by colour uniformity in an expanded region
+    bx0 = max(0, tx0 - pad_w * 2)
+    by0 = max(0, ty0 - pad_h * 2)
+    bx1 = min(src_w, tx1 + pad_w * 2)
+    by1 = min(src_h, ty1 + pad_h * 2)
+
+    try:
+        region = np.array(source.crop((bx0, by0, bx1, by1)).convert("RGB"), dtype=np.float32)
+        # Compute per-pixel distance from region median colour
+        median_color = np.median(region.reshape(-1, 3), axis=0)
+        dist = np.linalg.norm(region - median_color, axis=2)
+        # If >55% of pixels are close to the median, it's a uniform background (button)
+        uniform_fraction = float(np.mean(dist < 40))
+        if uniform_fraction > 0.55:
+            return (bx0, by0, bx1, by1)
+    except Exception:
+        pass
+
+    # Fallback: just return the padded text bbox
+    return (
+        max(0, tx0 - pad_w),
+        max(0, ty0 - pad_h),
+        min(src_w, tx1 + pad_w),
+        min(src_h, ty1 + pad_h),
+    )
+
+
+def _suppress_cta_button(
+    image: Image.Image,
+    button_bbox: tuple[int, int, int, int],
+) -> Image.Image:
+    """
+    Remove a CTA button from the image by filling it with the surrounding
+    background colour (sampled from just outside the button edges).
+    """
+    bx0, by0, bx1, by1 = button_bbox
+    img_w, img_h = image.size
+    arr = np.array(image.convert("RGB"))
+
+    # Sample background from a thin strip outside the button on each side
+    samples: list[np.ndarray] = []
+    strip = max(4, min(20, (by1 - by0) // 4))
+    if by0 - strip >= 0:
+        samples.append(arr[max(0, by0 - strip):by0, bx0:bx1].reshape(-1, 3))
+    if by1 + strip <= img_h:
+        samples.append(arr[by1:min(img_h, by1 + strip), bx0:bx1].reshape(-1, 3))
+    if bx0 - strip >= 0:
+        samples.append(arr[by0:by1, max(0, bx0 - strip):bx0].reshape(-1, 3))
+    if bx1 + strip <= img_w:
+        samples.append(arr[by0:by1, bx1:min(img_w, bx1 + strip)].reshape(-1, 3))
+
+    if samples:
+        all_samples = np.concatenate(samples, axis=0)
+        fill_color = tuple(int(v) for v in np.median(all_samples, axis=0))
+    else:
+        fill_color = _sample_edge_color(image)
+
+    result = image.copy()
+    draw = ImageDraw.Draw(result)
+    draw.rectangle((bx0, by0, bx1, by1), fill=fill_color)  # type: ignore[arg-type]
+
+    # Soften the fill boundary with a small blur patch
+    try:
+        import cv2  # type: ignore[import]
+        result_arr = np.array(result)
+        feather = max(2, (by1 - by0) // 6)
+        y0f = max(0, by0 - feather)
+        y1f = min(img_h, by1 + feather)
+        x0f = max(0, bx0 - feather)
+        x1f = min(img_w, bx1 + feather)
+        patch = result_arr[y0f:y1f, x0f:x1f]
+        blurred = cv2.GaussianBlur(patch, (feather * 2 + 1, feather * 2 + 1), feather / 2)
+        # Only apply blur to the interior/border of the button, not the full patch
+        result_arr[by0:by1, bx0:bx1] = blurred[by0 - y0f:by1 - y0f, bx0 - x0f:bx1 - x0f]
+        result = Image.fromarray(result_arr)
+    except Exception:
+        pass
+
+    return result
+
+
+# Meta and TikTok placement prefixes — these platforms render their own CTA buttons
+_NATIVE_CTA_PLATFORMS = {"meta_", "facebook_", "instagram_", "tiktok_"}
+
+
+def _placement_has_native_cta(placement_id: str) -> bool:
+    """Return True if the platform provides its own CTA button natively."""
+    pid = (placement_id or "").lower()
+    return any(pid.startswith(prefix) for prefix in _NATIVE_CTA_PLATFORMS)
+
+
+def smart_resize_image(
+    source: Image.Image,
+    width: int,
+    height: int,
+    placement_id: str = "",
+) -> Image.Image:
+    """
+    Smart resize pipeline:
+    1. OCR to find text blocks + detect CTA button
+    2. If META/TIKTOK placement: inpaint/fill the CTA button from source
+    3. Detect visual foreground subject bounding box
+    4. Build clean background (text removed if possible), scale to COVER target canvas
+    5. Scale and reposition the foreground subject onto the canvas, preserving
+       its relative anchor position (works for ALL aspect ratio changes)
+    6. Re-render translated text at proportionally scaled bounding boxes
+
+    Falls back to focus-aware cover crop on any unhandled exception.
     """
     try:
         src_w, src_h = source.width, source.height
         tgt_w, tgt_h = width, height
-        src_ratio = src_w / max(1, src_h)
-        tgt_ratio = tgt_w / max(1, tgt_h)
 
-        # ── Step 1: Run OCR to find text blocks ──────────────────────────
+        # ── Step 1: OCR ───────────────────────────────────────────────────
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         source.save(tmp_path, "PNG")
         try:
-            ocr_blocks = run_trocr_ocr_on_image(tmp_path)
             text_blocks = build_localize_blocks(tmp_path, source)
         except Exception:
-            ocr_blocks = []
             text_blocks = []
         finally:
             tmp_path.unlink(missing_ok=True)
 
         has_translatable = any(b.translate for b in text_blocks)
 
-        # ── Step 2: Detect foreground / subject region ───────────────────
-        focus_bbox = build_resize_focus_bbox(source)
+        # ── Step 2: CTA suppression for native-CTA platforms ─────────────
+        working_source = source
+        if _placement_has_native_cta(placement_id) and text_blocks:
+            cta_bbox = _detect_cta_button_bbox(source, text_blocks)
+            if cta_bbox is not None:
+                working_source = _suppress_cta_button(source, cta_bbox)
+                # Also remove the CTA block from text_blocks so it isn't re-rendered
+                text_blocks = [b for b in text_blocks if b.role != "cta" and classify_text_role(b.text) != "cta"]
+                has_translatable = any(b.translate for b in text_blocks)
+
+        # ── Step 3: Detect foreground / subject region ───────────────────
+        focus_bbox = build_resize_focus_bbox(working_source)
         fx0, fy0, fx1, fy1 = focus_bbox
         fg_w = fx1 - fx0
         fg_h = fy1 - fy0
 
-        # ── Step 3: Build clean background (remove text if possible) ─────
+        # ── Step 4: Build clean background (text removed) ────────────────
         if has_translatable:
             try:
-                cleaned, cleanup_debug = build_clean_background(source, text_blocks, cleanup_strength=100, return_debug=True)  # type: ignore[misc]
-                gated, _ = enforce_localize_cleanup_gate(source, cleaned, text_blocks, cleanup_debug)
+                cleaned, cleanup_debug = build_clean_background(working_source, text_blocks, cleanup_strength=100, return_debug=True)  # type: ignore[misc]
+                gated, _ = enforce_localize_cleanup_gate(working_source, cleaned, text_blocks, cleanup_debug)
                 bg_base = gated if gated is not None else cleaned
             except Exception:
-                bg_base = source
+                bg_base = working_source
         else:
-            bg_base = source
+            bg_base = working_source
 
-        # ── Detect extreme vs moderate ratio change ───────────────────────
-        src_ratio = src_w / max(1, src_h)
-        tgt_ratio = tgt_w / max(1, tgt_h)
-        # Extreme = ratios differ by more than 2x (e.g. 4:1 banner → 9:16 story)
-        extreme_ratio = (src_ratio > tgt_ratio * 2.0) or (tgt_ratio > src_ratio * 2.0)
-
-        if extreme_ratio:
-            # ── LETTERBOX + BACKGROUND FILL (extreme aspect ratio change) ────
-            # Background: scale bg_base to COVER the target canvas
-            bg_cover_scale = max(tgt_w / src_w, tgt_h / src_h)
-            bg_cover_w = max(1, int(src_w * bg_cover_scale))
-            bg_cover_h = max(1, int(src_h * bg_cover_scale))
-            bg_big = bg_base.resize((bg_cover_w, bg_cover_h), Image.Resampling.LANCZOS)
-            bx0 = max(0, (bg_cover_w - tgt_w) // 2)
-            by0 = max(0, (bg_cover_h - tgt_h) // 2)
-            bg_crop = bg_big.crop((bx0, by0, bx0 + tgt_w, by0 + tgt_h))
-            canvas = Image.new("RGB", (tgt_w, tgt_h), _sample_edge_color(bg_base))
-            canvas.paste(bg_crop, (0, 0))
-
-            # Content: scale source to FIT within target (letterbox, preserving layout)
-            content_fit_scale = min(tgt_w / src_w, tgt_h / src_h)
-            content_w = max(1, int(src_w * content_fit_scale))
-            content_h = max(1, int(src_h * content_fit_scale))
-            content = source.resize((content_w, content_h), Image.Resampling.LANCZOS)
-
-            # Center content on canvas
-            cx = (tgt_w - content_w) // 2
-            cy = (tgt_h - content_h) // 2
-            canvas.paste(content, (cx, cy))
-
-            # ── Soft-blend the content edges to reduce visible seam ───────
-            try:
-                import cv2  # type: ignore[import]
-                canvas_arr = np.array(canvas)
-                # Build a mask that feathers the content rectangle edges
-                mask = np.zeros((tgt_h, tgt_w), dtype=np.float32)
-                feather = max(8, int(min(content_w, content_h) * 0.04))
-                mask[cy:cy + content_h, cx:cx + content_w] = 1.0
-                mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), feather / 2)
-                # Blend canvas (which has bg outside, content inside) using the mask
-                # — already correct since we pasted content after background; just smooth the seam
-                bg_arr = np.array(bg_crop.resize((tgt_w, tgt_h), Image.Resampling.LANCZOS))
-                mask3 = mask[:, :, None]
-                blended = (canvas_arr.astype(np.float32) * mask3 + bg_arr.astype(np.float32) * (1 - mask3)).clip(0, 255).astype(np.uint8)
-                # Restore the content area without blending to keep crisp interior
-                interior_y1 = cy + feather
-                interior_y2 = cy + content_h - feather
-                interior_x1 = cx + feather
-                interior_x2 = cx + content_w - feather
-                if interior_y2 > interior_y1 and interior_x2 > interior_x1:
-                    blended[interior_y1:interior_y2, interior_x1:interior_x2] = canvas_arr[interior_y1:interior_y2, interior_x1:interior_x2]
-                canvas = Image.fromarray(blended)
-            except Exception:
-                pass  # skip blending if opencv unavailable
-
-            return canvas
-
-        # ── MODERATE RATIO CHANGE: background-extend + foreground reposition ──
-        # ── Step 4: Extend / scale background to target dimensions ───────
+        # ── Step 4b: Scale background to COVER the target canvas ─────────
         bg_color = _sample_edge_color(bg_base)
         canvas = Image.new("RGB", (tgt_w, tgt_h), bg_color)
 
-        # Determine scale so the background covers the target fully
         bg_scale = max(tgt_w / src_w, tgt_h / src_h)
         bg_resized_w = max(1, int(src_w * bg_scale))
         bg_resized_h = max(1, int(src_h * bg_scale))
         bg_resized = bg_base.resize((bg_resized_w, bg_resized_h), Image.Resampling.LANCZOS)
-        # Center-crop to target
-        bx0 = max(0, (bg_resized_w - tgt_w) // 2)
-        by0 = max(0, (bg_resized_h - tgt_h) // 2)
-        canvas.paste(bg_resized.crop((bx0, by0, bx0 + tgt_w, by0 + tgt_h)), (0, 0))
 
-        # ── Step 5: Scale and reposition the foreground subject ───────────
-        # Fit foreground element so it occupies a similar visual proportion
-        tgt_fg_max_w = int(tgt_w * 0.85)
-        tgt_fg_max_h = int(tgt_h * 0.85)
-        fg_scale = min(tgt_fg_max_w / max(1, fg_w), tgt_fg_max_h / max(1, fg_h), 1.4)
-        # Also don't shrink below a minimum readable size
-        fg_scale = max(fg_scale, min(tgt_w / src_w, tgt_h / src_h) * 0.8)
+        # Focus-aware crop for background: keep the focal region visible
+        focus_cx = (fx0 + fx1) / 2 / src_w  # 0..1
+        focus_cy = (fy0 + fy1) / 2 / src_h
+        bg_cx = int(focus_cx * bg_resized_w)
+        bg_cy = int(focus_cy * bg_resized_h)
+        bg_crop_x = max(0, min(bg_resized_w - tgt_w, bg_cx - tgt_w // 2))
+        bg_crop_y = max(0, min(bg_resized_h - tgt_h, bg_cy - tgt_h // 2))
+        canvas.paste(bg_resized.crop((bg_crop_x, bg_crop_y, bg_crop_x + tgt_w, bg_crop_y + tgt_h)), (0, 0))
 
-        fg_crop = source.crop(focus_bbox)
+        # ── Step 5: Scale and reposition foreground subject ───────────────
+        #
+        # Goal: the foreground keeps roughly the same visual size proportion
+        # relative to the new canvas, and its relative anchor (left/center/right,
+        # top/center/bottom) is preserved.
+        #
+        # For extreme ratio changes (e.g. 4:1 → 9:16) the foreground is
+        # allowed to grow significantly to fill the taller canvas naturally.
+        #
+        tgt_fg_max_w = int(tgt_w * 0.88)
+        tgt_fg_max_h = int(tgt_h * 0.88)
+
+        # Base scale: fit the foreground within tgt_fg_max
+        fg_scale_fit = min(tgt_fg_max_w / max(1, fg_w), tgt_fg_max_h / max(1, fg_h))
+        # Cover scale: the scale at which the whole source would cover the target
+        cover_scale = max(tgt_w / src_w, tgt_h / src_h)
+        # Use whichever is larger so the subject fills the canvas better
+        fg_scale = max(fg_scale_fit, cover_scale * 0.9)
+        # Hard cap: don't upscale beyond 2.2× (avoids extreme pixellation)
+        fg_scale = min(fg_scale, 2.2)
+
+        fg_crop = working_source.crop(focus_bbox)
         new_fg_w = max(1, int(fg_w * fg_scale))
         new_fg_h = max(1, int(fg_h * fg_scale))
         fg_resized = fg_crop.resize((new_fg_w, new_fg_h), Image.Resampling.LANCZOS)
 
-        # Place foreground: use same relative anchor (top/center/bottom)
-        rel_cx = (fx0 + fx1) / 2 / src_w  # 0..1 horizontal center
-        rel_cy = (fy0 + fy1) / 2 / src_h  # 0..1 vertical center
+        # Anchor: use the relative center of the foreground in the source
+        rel_cx = (fx0 + fx1) / 2 / src_w
+        rel_cy = (fy0 + fy1) / 2 / src_h
         target_cx = int(rel_cx * tgt_w)
         target_cy = int(rel_cy * tgt_h)
+
+        # For wide→tall: bias subject slightly downward so it feels grounded
+        src_ratio = src_w / max(1, src_h)
+        tgt_ratio = tgt_w / max(1, tgt_h)
+        if src_ratio > tgt_ratio * 1.4:
+            target_cy = int(min(0.65, rel_cy + 0.08) * tgt_h)
+
         paste_x = max(0, min(tgt_w - new_fg_w, target_cx - new_fg_w // 2))
         paste_y = max(0, min(tgt_h - new_fg_h, target_cy - new_fg_h // 2))
         canvas.paste(fg_resized, (paste_x, paste_y))
 
-        # ── Step 6: Re-render text at scaled positions ───────────────────
+        # ── Step 6: Re-render text at proportionally scaled positions ─────
         if has_translatable and text_blocks:
             try:
                 x_scale = tgt_w / src_w
                 y_scale = tgt_h / src_h
+                font_scale = min(x_scale, y_scale)
                 scaled_blocks = []
                 for block in text_blocks:
                     if not block.translate:
                         continue
-                    bx, by, bw, bh = block.x, block.y, block.width, block.height
+                    bx0s, by0s, bx1s, by1s = block.bbox
                     scaled_block = block.model_copy(update={
-                        "x": int(bx * x_scale),
-                        "y": int(by * y_scale),
-                        "width": max(10, int(bw * x_scale)),
-                        "height": max(8, int(bh * y_scale)),
-                        "font_size_estimate": max(8, int((block.font_size_estimate or 14) * min(x_scale, y_scale))),
+                        "bbox": (
+                            int(bx0s * x_scale),
+                            int(by0s * y_scale),
+                            int(bx1s * x_scale),
+                            int(by1s * y_scale),
+                        ),
+                        "font_size_estimate": max(8, int((block.font_size_estimate or 14) * font_scale)),
+                        "line_height_estimate": max(9, int((block.line_height_estimate or 16) * font_scale)),
                     })
                     scaled_blocks.append(scaled_block)
                 if scaled_blocks:
@@ -8797,7 +8903,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
         placement_assets: list[dict[str, Any]] = []
         for source_entry in source_entries:
             try:
-                rendered = smart_resize_image(source_entry["image"], width, height)
+                rendered = smart_resize_image(source_entry["image"], width, height, placement_id=canonical_id)
             except Exception:
                 rendered = render_resize_image(
                     source_entry["image"],
