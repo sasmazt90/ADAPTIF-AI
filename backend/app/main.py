@@ -107,7 +107,16 @@ SHARED_PREVIEW_TEMPLATE_PATH = REPO_ROOT / "src" / "shared" / "preview-templates
 
 
 def load_shared_preview_template_schema() -> dict[str, Any]:
-    return json.loads(SHARED_PREVIEW_TEMPLATE_PATH.read_text(encoding="utf-8"))
+    # In Docker: __file__ = /app/app/main.py → parents[2] = / (wrong)
+    # Fall back to parents[1] = /app which matches WORKDIR
+    candidates = [
+        SHARED_PREVIEW_TEMPLATE_PATH,
+        Path(__file__).resolve().parent.parent / "src" / "shared" / "preview-templates.json",
+    ]
+    for path in candidates:
+        if path.exists():
+            return json.loads(path.read_text(encoding="utf-8"))
+    return {}
 
 
 SHARED_PREVIEW_TEMPLATE_SCHEMA = load_shared_preview_template_schema()
