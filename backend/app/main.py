@@ -7496,6 +7496,141 @@ def build_resize_focus_bbox(source: Image.Image) -> tuple[int, int, int, int]:
     )
 
 
+def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Image:
+    """
+    Smart resize: instead of cropping, this function:
+    1. Detects text regions via OCR
+    2. Detects the visual subject (foreground) bounding box
+    3. Generates a clean background (inpainted / background-extended)
+    4. Re-scales the foreground element to fit the new canvas
+    5. Re-renders OCR-detected text at appropriate positions/sizes
+
+    Falls back to focus-aware cover crop if any step fails.
+    """
+    try:
+        src_w, src_h = source.width, source.height
+        tgt_w, tgt_h = width, height
+        src_ratio = src_w / max(1, src_h)
+        tgt_ratio = tgt_w / max(1, tgt_h)
+
+        # ── Step 1: Run OCR to find text blocks ──────────────────────────
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+        source.save(tmp_path, "PNG")
+        try:
+            ocr_blocks = run_trocr_ocr_on_image(tmp_path)
+            text_blocks = build_localize_blocks(tmp_path, source)
+        except Exception:
+            ocr_blocks = []
+            text_blocks = []
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+        has_translatable = any(b.translate for b in text_blocks)
+
+        # ── Step 2: Detect foreground / subject region ───────────────────
+        focus_bbox = build_resize_focus_bbox(source)
+        fx0, fy0, fx1, fy1 = focus_bbox
+        fg_w = fx1 - fx0
+        fg_h = fy1 - fy0
+
+        # ── Step 3: Build clean background (remove text if possible) ─────
+        if has_translatable:
+            try:
+                cleaned, cleanup_debug = build_clean_background(source, text_blocks, cleanup_strength=100, return_debug=True)  # type: ignore[misc]
+                gated, _ = enforce_localize_cleanup_gate(source, cleaned, text_blocks, cleanup_debug)
+                bg_base = gated if gated is not None else cleaned
+            except Exception:
+                bg_base = source
+        else:
+            bg_base = source
+
+        # ── Step 4: Extend / scale background to target dimensions ───────
+        bg_color = _sample_edge_color(bg_base)
+        canvas = Image.new("RGB", (tgt_w, tgt_h), bg_color)
+
+        # Determine scale so the background covers the target fully
+        bg_scale = max(tgt_w / src_w, tgt_h / src_h)
+        bg_resized_w = max(1, int(src_w * bg_scale))
+        bg_resized_h = max(1, int(src_h * bg_scale))
+        bg_resized = bg_base.resize((bg_resized_w, bg_resized_h), Image.Resampling.LANCZOS)
+        # Center-crop to target
+        bx0 = max(0, (bg_resized_w - tgt_w) // 2)
+        by0 = max(0, (bg_resized_h - tgt_h) // 2)
+        canvas.paste(bg_resized.crop((bx0, by0, bx0 + tgt_w, by0 + tgt_h)), (0, 0))
+
+        # ── Step 5: Scale and reposition the foreground subject ───────────
+        # Fit foreground element so it occupies a similar visual proportion
+        src_area_ratio = (fg_w * fg_h) / max(1, src_w * src_h)
+        tgt_fg_max_w = int(tgt_w * 0.85)
+        tgt_fg_max_h = int(tgt_h * 0.85)
+        fg_scale = min(tgt_fg_max_w / max(1, fg_w), tgt_fg_max_h / max(1, fg_h), 1.4)
+        # Also don't shrink below a minimum readable size
+        fg_scale = max(fg_scale, min(tgt_w / src_w, tgt_h / src_h) * 0.8)
+
+        fg_crop = source.crop(focus_bbox)
+        new_fg_w = max(1, int(fg_w * fg_scale))
+        new_fg_h = max(1, int(fg_h * fg_scale))
+        fg_resized = fg_crop.resize((new_fg_w, new_fg_h), Image.Resampling.LANCZOS)
+
+        # Place foreground: use same relative anchor (top/center/bottom)
+        rel_cx = (fx0 + fx1) / 2 / src_w  # 0..1 horizontal center
+        rel_cy = (fy0 + fy1) / 2 / src_h  # 0..1 vertical center
+        # Bias vertical: keep bottom-heavy subjects in lower half
+        target_cx = int(rel_cx * tgt_w)
+        target_cy = int(rel_cy * tgt_h)
+        paste_x = max(0, min(tgt_w - new_fg_w, target_cx - new_fg_w // 2))
+        paste_y = max(0, min(tgt_h - new_fg_h, target_cy - new_fg_h // 2))
+        canvas.paste(fg_resized, (paste_x, paste_y))
+
+        # ── Step 6: Re-render text at scaled positions ───────────────────
+        if has_translatable and text_blocks:
+            try:
+                # Scale block bounding boxes to new canvas
+                x_scale = tgt_w / src_w
+                y_scale = tgt_h / src_h
+                scaled_blocks = []
+                for block in text_blocks:
+                    if not block.translate:
+                        continue
+                    # Scale bbox
+                    bx, by, bw, bh = block.x, block.y, block.width, block.height
+                    scaled_block = block.model_copy(update={
+                        "x": int(bx * x_scale),
+                        "y": int(by * y_scale),
+                        "width": max(10, int(bw * x_scale)),
+                        "height": max(8, int(bh * y_scale)),
+                        "font_size_estimate": max(8, int((block.font_size_estimate or 14) * min(x_scale, y_scale))),
+                    })
+                    scaled_blocks.append(scaled_block)
+                if scaled_blocks:
+                    canvas = render_translated_text(canvas, scaled_blocks, render_plan={})
+            except Exception:
+                pass  # text re-render failed → keep canvas without re-rendered text
+
+        return canvas
+
+    except Exception:
+        # Full fallback: focus-aware cover crop
+        focus = build_resize_focus_bbox(source)
+        return render_resize_image(source, width, height, fit="cover", focus_bbox=focus)
+
+
+def _sample_edge_color(image: Image.Image) -> tuple[int, int, int]:
+    """Sample the average color from a thin border around the image edges."""
+    arr = np.array(image.convert("RGB"))
+    h, w = arr.shape[:2]
+    border = max(1, min(8, h // 20, w // 20))
+    top = arr[:border, :, :]
+    bot = arr[h - border:, :, :]
+    left = arr[:, :border, :]
+    right = arr[:, w - border:, :]
+    sample = np.concatenate([top.reshape(-1, 3), bot.reshape(-1, 3),
+                              left.reshape(-1, 3), right.reshape(-1, 3)], axis=0)
+    mean = sample.mean(axis=0).astype(int)
+    return (int(mean[0]), int(mean[1]), int(mean[2]))
+
+
 def crop_to_ratio(image: Image.Image, focus_bbox: tuple[int, int, int, int], target_ratio: float, offset_x: int = 0, offset_y: int = 0) -> Image.Image:
     image_ratio = image.width / max(1, image.height)
     if abs(image_ratio - target_ratio) < 0.015:
@@ -8602,13 +8737,16 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
         width, height = resolve_resize_dimensions(canonical_id, custom_width, custom_height)
         placement_assets: list[dict[str, Any]] = []
         for source_entry in source_entries:
-            rendered = render_resize_image(
-                source_entry["image"],
-                width,
-                height,
-                fit=resize_mode,
-                focus_bbox=source_entry["focus_bbox"],
-            )
+            try:
+                rendered = smart_resize_image(source_entry["image"], width, height)
+            except Exception:
+                rendered = render_resize_image(
+                    source_entry["image"],
+                    width,
+                    height,
+                    fit=resize_mode,
+                    focus_bbox=source_entry["focus_bbox"],
+                )
             placement_assets.append(
                 {
                     "source_name": source_entry["path"].name,
