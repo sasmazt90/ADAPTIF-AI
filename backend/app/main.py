@@ -7550,6 +7550,64 @@ def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Im
         else:
             bg_base = source
 
+        # ── Detect extreme vs moderate ratio change ───────────────────────
+        src_ratio = src_w / max(1, src_h)
+        tgt_ratio = tgt_w / max(1, tgt_h)
+        # Extreme = ratios differ by more than 2x (e.g. 4:1 banner → 9:16 story)
+        extreme_ratio = (src_ratio > tgt_ratio * 2.0) or (tgt_ratio > src_ratio * 2.0)
+
+        if extreme_ratio:
+            # ── LETTERBOX + BACKGROUND FILL (extreme aspect ratio change) ────
+            # Background: scale bg_base to COVER the target canvas
+            bg_cover_scale = max(tgt_w / src_w, tgt_h / src_h)
+            bg_cover_w = max(1, int(src_w * bg_cover_scale))
+            bg_cover_h = max(1, int(src_h * bg_cover_scale))
+            bg_big = bg_base.resize((bg_cover_w, bg_cover_h), Image.Resampling.LANCZOS)
+            bx0 = max(0, (bg_cover_w - tgt_w) // 2)
+            by0 = max(0, (bg_cover_h - tgt_h) // 2)
+            bg_crop = bg_big.crop((bx0, by0, bx0 + tgt_w, by0 + tgt_h))
+            canvas = Image.new("RGB", (tgt_w, tgt_h), _sample_edge_color(bg_base))
+            canvas.paste(bg_crop, (0, 0))
+
+            # Content: scale source to FIT within target (letterbox, preserving layout)
+            content_fit_scale = min(tgt_w / src_w, tgt_h / src_h)
+            content_w = max(1, int(src_w * content_fit_scale))
+            content_h = max(1, int(src_h * content_fit_scale))
+            content = source.resize((content_w, content_h), Image.Resampling.LANCZOS)
+
+            # Center content on canvas
+            cx = (tgt_w - content_w) // 2
+            cy = (tgt_h - content_h) // 2
+            canvas.paste(content, (cx, cy))
+
+            # ── Soft-blend the content edges to reduce visible seam ───────
+            try:
+                import cv2  # type: ignore[import]
+                canvas_arr = np.array(canvas)
+                # Build a mask that feathers the content rectangle edges
+                mask = np.zeros((tgt_h, tgt_w), dtype=np.float32)
+                feather = max(8, int(min(content_w, content_h) * 0.04))
+                mask[cy:cy + content_h, cx:cx + content_w] = 1.0
+                mask = cv2.GaussianBlur(mask, (feather * 2 + 1, feather * 2 + 1), feather / 2)
+                # Blend canvas (which has bg outside, content inside) using the mask
+                # — already correct since we pasted content after background; just smooth the seam
+                bg_arr = np.array(bg_crop.resize((tgt_w, tgt_h), Image.Resampling.LANCZOS))
+                mask3 = mask[:, :, None]
+                blended = (canvas_arr.astype(np.float32) * mask3 + bg_arr.astype(np.float32) * (1 - mask3)).clip(0, 255).astype(np.uint8)
+                # Restore the content area without blending to keep crisp interior
+                interior_y1 = cy + feather
+                interior_y2 = cy + content_h - feather
+                interior_x1 = cx + feather
+                interior_x2 = cx + content_w - feather
+                if interior_y2 > interior_y1 and interior_x2 > interior_x1:
+                    blended[interior_y1:interior_y2, interior_x1:interior_x2] = canvas_arr[interior_y1:interior_y2, interior_x1:interior_x2]
+                canvas = Image.fromarray(blended)
+            except Exception:
+                pass  # skip blending if opencv unavailable
+
+            return canvas
+
+        # ── MODERATE RATIO CHANGE: background-extend + foreground reposition ──
         # ── Step 4: Extend / scale background to target dimensions ───────
         bg_color = _sample_edge_color(bg_base)
         canvas = Image.new("RGB", (tgt_w, tgt_h), bg_color)
@@ -7566,7 +7624,6 @@ def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Im
 
         # ── Step 5: Scale and reposition the foreground subject ───────────
         # Fit foreground element so it occupies a similar visual proportion
-        src_area_ratio = (fg_w * fg_h) / max(1, src_w * src_h)
         tgt_fg_max_w = int(tgt_w * 0.85)
         tgt_fg_max_h = int(tgt_h * 0.85)
         fg_scale = min(tgt_fg_max_w / max(1, fg_w), tgt_fg_max_h / max(1, fg_h), 1.4)
@@ -7581,7 +7638,6 @@ def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Im
         # Place foreground: use same relative anchor (top/center/bottom)
         rel_cx = (fx0 + fx1) / 2 / src_w  # 0..1 horizontal center
         rel_cy = (fy0 + fy1) / 2 / src_h  # 0..1 vertical center
-        # Bias vertical: keep bottom-heavy subjects in lower half
         target_cx = int(rel_cx * tgt_w)
         target_cy = int(rel_cy * tgt_h)
         paste_x = max(0, min(tgt_w - new_fg_w, target_cx - new_fg_w // 2))
@@ -7591,14 +7647,12 @@ def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Im
         # ── Step 6: Re-render text at scaled positions ───────────────────
         if has_translatable and text_blocks:
             try:
-                # Scale block bounding boxes to new canvas
                 x_scale = tgt_w / src_w
                 y_scale = tgt_h / src_h
                 scaled_blocks = []
                 for block in text_blocks:
                     if not block.translate:
                         continue
-                    # Scale bbox
                     bx, by, bw, bh = block.x, block.y, block.width, block.height
                     scaled_block = block.model_copy(update={
                         "x": int(bx * x_scale),
@@ -7611,7 +7665,7 @@ def smart_resize_image(source: Image.Image, width: int, height: int) -> Image.Im
                 if scaled_blocks:
                     canvas = render_translated_text(canvas, scaled_blocks, render_plan={})
             except Exception:
-                pass  # text re-render failed → keep canvas without re-rendered text
+                pass
 
         return canvas
 
@@ -8939,6 +8993,52 @@ def _draw_text_decoration(
     return out
 
 
+def _apply_italic_shear(
+    image: Image.Image,
+    blocks: list[TextBlock],
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> Image.Image:
+    """
+    Simulate italic by applying a forward-lean affine shear to each translate block region.
+    Shear ~14° (tan ≈ 0.25): top of each block region leans to the right.
+    PIL AFFINE coefficients (a,b,c,d,e,f): src_x = a*dst_x + b*dst_y + c
+    For forward-lean: src_x = dst_x + shear*dst_y  →  (a=1, b=shear, c=0, d=0, e=1, f=0)
+    """
+    shear = 0.25
+    result = image.copy()
+    img_w, img_h = image.size
+    for block in blocks:
+        if not block.translate or not text_changed(block.text, block.translated_text):
+            continue
+        bx1 = max(0, block.bbox[0] + x_offset)
+        by1 = max(0, block.bbox[1] + y_offset)
+        bx2 = min(img_w, block.bbox[2] + x_offset)
+        by2 = min(img_h, block.bbox[3] + y_offset)
+        if bx2 <= bx1 or by2 <= by1:
+            continue
+        rw, rh = bx2 - bx1, by2 - by1
+        shear_px = int(shear * rh)
+        # Extract a slightly wider region so we have background to fill shear gaps
+        extract_x1 = max(0, bx1 - shear_px)
+        extract_x2 = min(img_w, bx2 + shear_px)
+        region = image.crop((extract_x1, by1, extract_x2, by2))
+        ext_w = extract_x2 - extract_x1
+        # Apply shear transform
+        try:
+            sheared = region.transform(
+                (ext_w, rh),
+                Image.Transform.AFFINE,
+                (1, shear, 0, 0, 1, 0),
+                resample=Image.Resampling.BILINEAR,
+                fillcolor=(255, 255, 255),
+            )
+        except Exception:
+            continue
+        result.paste(sheared, (extract_x1, by1))
+    return result
+
+
 def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: EditRequest) -> OutputAsset:
     source_image = Image.open(asset_meta["source_path"]).convert("RGB")
     stored_blocks = [TextBlock.model_validate(block) for block in asset_meta.get("blocks", [])]
@@ -8965,6 +9065,8 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
         base = source_image
     rendered = render_translated_text(base, styled_blocks, edit.x, edit.y, edit.preserve_bold, edit.fit_bounds)
     rendered = _draw_text_decoration(rendered, styled_blocks, edit.text_underline, edit.text_strike, edit.x, edit.y)
+    if edit.text_italic:
+        rendered = _apply_italic_shear(rendered, styled_blocks, edit.x, edit.y)
     output_path = job_dir / asset_meta["filename"]
     save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
     asset_meta["translated_text"] = "\n\n".join(editor_parts)

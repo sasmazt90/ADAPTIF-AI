@@ -25,7 +25,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type { User as SupabaseUser } from "@supabase/supabase-js";
-import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { creditPricing, estimateEditCredits, estimateLocalizeCredits, estimateResizeCredits } from "@/lib/credit-pricing";
 import { languages, outputFormats, Placement, placements } from "@/lib/placements";
 import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata as PlatformPreviewMetadata } from "@/lib/preview-templates";
@@ -995,6 +995,8 @@ export function AdaptDashboard() {
   const [textItalic, setTextItalic] = useState(false);
   const [textUnderline, setTextUnderline] = useState(false);
   const [textStrike, setTextStrike] = useState(false);
+  const [isDraggingPreview, setIsDraggingPreview] = useState(false);
+  const previewDragRef = useRef<{ mouseX: number; mouseY: number; startX: number; startY: number } | null>(null);
   const [fit, setFit] = useState<FitMode>("cover");
   const [customWidth, setCustomWidth] = useState(1200);
   const [customHeight, setCustomHeight] = useState(800);
@@ -1568,16 +1570,37 @@ export function AdaptDashboard() {
                 </>
               )}
 
-              {/* Live preview */}
+              {/* Live preview — draggable to adjust x/y offset */}
               {activeOutput?.download_url && (
                 <div className="mt-4 overflow-hidden rounded-md border border-[#151515]/10">
-                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#666]">Current output</p>
-                  <div className="relative overflow-hidden bg-[#f6f1e7]" style={{ aspectRatio: "4/3" }}>
+                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#666]">
+                    Current output
+                    <span className="ml-2 font-normal normal-case text-[#aaa]">drag to reposition</span>
+                  </p>
+                  <div
+                    className={["relative overflow-hidden bg-[#f6f1e7] select-none", isDraggingPreview ? "cursor-grabbing" : "cursor-grab"].join(" ")}
+                    style={{ aspectRatio: "4/3" }}
+                    onMouseDown={(e) => {
+                      setIsDraggingPreview(true);
+                      previewDragRef.current = { mouseX: e.clientX, mouseY: e.clientY, startX: x, startY: y };
+                      e.preventDefault();
+                    }}
+                    onMouseMove={(e) => {
+                      if (!isDraggingPreview || !previewDragRef.current) return;
+                      const dx = e.clientX - previewDragRef.current.mouseX;
+                      const dy = e.clientY - previewDragRef.current.mouseY;
+                      setX(Math.max(-24, Math.min(24, previewDragRef.current.startX + dx)));
+                      setY(Math.max(-24, Math.min(24, previewDragRef.current.startY + dy)));
+                    }}
+                    onMouseUp={() => { setIsDraggingPreview(false); previewDragRef.current = null; }}
+                    onMouseLeave={() => { setIsDraggingPreview(false); previewDragRef.current = null; }}
+                  >
                     <img
                       src={activeOutput.download_url}
                       alt="Output preview"
-                      className="h-full w-full object-contain transition-transform duration-150"
-                      style={{ transform: `translate(${x}px, ${y}px) scale(${mode === "resize" ? scale / 100 : 1})`, opacity: mode === "adapt" ? 1 - opacity / 200 : 1 }}
+                      draggable={false}
+                      className="h-full w-full object-contain"
+                      style={{ transform: `translate(${x}px, ${y}px) scale(${mode === "resize" ? scale / 100 : 1})`, opacity: mode === "adapt" ? 1 - opacity / 200 : 1, transition: isDraggingPreview ? "none" : "transform 0.15s" }}
                     />
                   </div>
                 </div>
