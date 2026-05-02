@@ -18,6 +18,7 @@ import {
   LogOut,
   Move,
   Scissors,
+  Settings2,
   Shield,
   Sparkles,
   Type,
@@ -64,7 +65,7 @@ function formatCreditText(value: number) {
 
 const platformOrder = ["META", "TIKTOK", "GOOGLE", "SNAPCHAT", "LINKEDIN", "NATIVE/WEB"];
 const sampleCopy = {
-  adapt: "[BOLD]Launch faster[/BOLD] with localized ads",
+  adapt: "Launch faster with localized ads",
   resize: "Creative resized for every paid channel",
 };
 const pricingPacks = [
@@ -1023,13 +1024,14 @@ export function AdaptDashboard() {
     ?? result?.outputs.find((output) => output.source_name === effectiveResizeSource)
     ?? activeOutput;
   const carouselPreviewAssets = useMemo(() => {
-    const placementOutputs = (result?.outputs ?? [])
+    if (!result) return [];
+    const placementOutputs = (result.outputs ?? [])
       .filter((output) => output.placement_id === activePlacementId)
       .map((output) => output.download_url)
       .filter(Boolean);
     if (placementOutputs.length > 1) return placementOutputs.slice(0, 6);
     return files.map((file) => filePreviewUrls[file.name]).filter(Boolean).slice(0, 6);
-  }, [activePlacementId, filePreviewUrls, files, result?.outputs]);
+  }, [activePlacementId, filePreviewUrls, files, result]);
   const derivedPreviewMetadata = useMemo(
     () => {
       const base = derivePreviewMetadata(activePlacement, activeResizeOutput?.translated_text ?? copy, activeResizeOutput?.source_name, currentUserEmail);
@@ -1350,40 +1352,46 @@ export function AdaptDashboard() {
             </div>
           </div>
         </header>
-        <section className="mx-auto grid max-w-[1180px] gap-5 px-4 py-8 lg:grid-cols-[1.2fr_0.8fr]">
-          <section className="rounded-md border border-[#151515]/10 bg-white p-5">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-xs font-black uppercase text-[#0f766e]">Admin</p>
-                <h1 className="text-3xl font-black">Credit management</h1>
-              </div>
-              <Shield className="h-5 w-5 text-[#0f766e]" />
+        <section className="mx-auto max-w-[480px] px-4 py-12">
+          <div className="flex items-center gap-3 mb-6">
+            <Shield className="h-6 w-6 text-[#0f766e]" />
+            <div>
+              <p className="text-xs font-black uppercase text-[#0f766e]">Admin</p>
+              <h1 className="text-2xl font-black">Credit Management</h1>
             </div>
-            {adminStatus && <p className="mt-4 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{adminStatus}</p>}
-            <div className="mt-5 overflow-hidden rounded-md border border-[#151515]/10">
-              <div className="grid grid-cols-[1fr_auto_auto] gap-3 bg-[#faf9f5] px-4 py-2 text-xs font-semibold uppercase text-[#666]">
-                <span>User</span><span>Credits</span><span>Updated</span>
-              </div>
-              <div className="max-h-[460px] overflow-auto">
-                {adminUsers.map((user) => (
-                  <button key={user.user_id} type="button" onClick={() => setAdminTargetEmail(user.user_id)} className="grid w-full grid-cols-[1fr_auto_auto] gap-3 border-t border-[#151515]/10 px-4 py-3 text-left text-sm hover:bg-[#faf9f5]">
-                    <span className="truncate">{user.user_id}</span>
-                    <span className="font-semibold">{user.credits}</span>
-                    <span className="text-xs text-[#666]">{user.updated_at ? new Date(user.updated_at).toLocaleDateString() : "-"}</span>
-                  </button>
-                ))}
-                {adminUsers.length === 0 && <div className="px-4 py-6 text-sm text-[#666]">No users found yet.</div>}
-              </div>
-            </div>
-          </section>
-          <section className="rounded-md border border-[#151515]/10 bg-white p-5">
-            <p className="text-xs font-black uppercase text-[#0f766e]">Manual adjustment</p>
-            <h2 className="mt-2 text-2xl font-black">Add or deduct credits</h2>
-            <label className="mt-5 block text-sm font-semibold">User email<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="email" value={adminTargetEmail} onChange={(e) => setAdminTargetEmail(e.target.value)} /></label>
-            <label className="mt-4 block text-sm font-semibold">Credits<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="number" min="1" value={adminAmount} onChange={(e) => setAdminAmount(Number(e.target.value))} /></label>
-            <div className="mt-4 grid grid-cols-2 gap-1 rounded-md bg-[#f1eee6] p-1">{(["add", "deduct"] as const).map((action) => <button key={action} type="button" onClick={() => setAdminAction(action)} className={["h-10 rounded text-sm font-semibold capitalize", adminAction === action ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{action}</button>)}</div>
-            <button type="button" onClick={adjustCredits} disabled={isAdminUpdating} className="mt-5 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#0f766e] text-sm font-semibold text-white disabled:bg-[#d6d0c4]">{isAdminUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />}Apply credit change</button>
-          </section>
+          </div>
+          <div className="rounded-md border border-[#151515]/10 bg-white p-6 shadow-sm space-y-4">
+            {adminStatus && <p className="rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{adminStatus}</p>}
+            <label className="block text-sm font-semibold">
+              User email
+              <input
+                className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]"
+                type="email"
+                placeholder="user@example.com"
+                value={adminTargetEmail}
+                onChange={(e) => setAdminTargetEmail(e.target.value)}
+              />
+            </label>
+            <label className="block text-sm font-semibold">
+              Credits to add
+              <input
+                className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]"
+                type="number"
+                min="1"
+                value={adminAmount}
+                onChange={(e) => setAdminAmount(Number(e.target.value))}
+              />
+            </label>
+            <button
+              type="button"
+              onClick={adjustCredits}
+              disabled={isAdminUpdating || !adminTargetEmail}
+              className="flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#0f766e] text-sm font-semibold text-white disabled:bg-[#d6d0c4]"
+            >
+              {isAdminUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />}
+              Add credits
+            </button>
+          </div>
         </section>
       </main>
     );
@@ -1433,7 +1441,12 @@ export function AdaptDashboard() {
           <div className="flex items-center gap-3">
             <div className="flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold"><Sparkles className="h-4 w-4 text-[#0f766e]" />{credits} credits</div>
             <button type="button" onClick={() => setShowCreditStore(true)} className="flex h-10 items-center gap-2 rounded-md bg-[#151515] px-4 text-sm font-semibold text-white"><CreditCard className="h-4 w-4" />Buy credits</button>
-            <button type="button" onClick={openAdminPanel} className={["flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold", isAdmin ? "hover:border-[#0f766e]" : "cursor-default"].join(" ")}><User className="h-4 w-4 text-[#0f766e]" /><span className="hidden max-w-[190px] truncate md:block">{currentUserEmail}</span></button>
+            {isAdmin && (
+              <button type="button" onClick={openAdminPanel} title="Admin panel" className="grid h-10 w-10 place-items-center rounded-md border border-[#0f766e] bg-[#e8f7f1] hover:bg-[#c7efe4]" aria-label="Admin panel">
+                <Settings2 className="h-4 w-4 text-[#0f766e]" />
+              </button>
+            )}
+            <div className="flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold"><User className="h-4 w-4 text-[#0f766e]" /><span className="hidden max-w-[190px] truncate md:block">{currentUserEmail}</span></div>
             {supabaseConfigured && <button type="button" onClick={() => supabase?.auth.signOut()} className="grid h-10 w-10 place-items-center rounded-md border border-[#151515]/15 bg-white" aria-label="Sign out"><LogOut className="h-4 w-4 text-[#0f766e]" /></button>}
           </div>
         </div>
@@ -1573,17 +1586,43 @@ export function AdaptDashboard() {
               onNext={() => selectOutput(activeOutputIndex + 1)}
             />
           ) : (
-            <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
+            <div className="flex items-center justify-center py-6">
+              {result ? (
+                <div style={{ transform: "scale(0.72)", transformOrigin: "top center" }} className="w-full">
+                  <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
+                </div>
+              ) : (
+                <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
+                  <Frame className="h-12 w-12 opacity-30" />
+                  <p className="text-sm">Select placements and click <span className="font-semibold text-[#555]">Run Resize</span> to see the preview.</p>
+                </div>
+              )}
+            </div>
           )}
           <div className="border-t border-[#151515]/10 p-4">
             {error && <div className="mb-3 flex gap-2 rounded-md bg-[#fff0d8] p-3 text-sm text-[#6b3b00]"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}
-            {result ? (
+            {result && result.outputs.length > 0 ? (
               <div className="space-y-3 text-sm">
-                <div className="rounded-md bg-[#e8f7f1] p-3">Job {result.job_id} completed / {result.outputs.length} exports</div>
-                <div className="grid gap-2 sm:grid-cols-2">{result.outputs.map((output, index) => <div key={output.filename} className={["flex items-center justify-between rounded-md border px-3 py-2", activeOutput?.filename === output.filename ? "border-[#0f766e] bg-[#e8f7f1]" : "border-[#151515]/10"].join(" ")}><button type="button" onClick={() => selectOutput(index)} className="min-w-0 flex-1 text-left"><span className="block truncate font-semibold">{output.filename}</span><span className="text-[11px] text-[#666]">{output.source_name}{output.language ? ` / ${output.language}` : ""}</span></button><a href={output.download_url} className="ml-3 shrink-0 rounded-md border border-[#151515]/10 p-2 hover:border-[#0f766e]"><Download className="h-4 w-4 text-[#0f766e]" /></a></div>)}</div>
+                <div className="rounded-md bg-[#e8f7f1] p-3 font-semibold text-[#064e46]">{result.outputs.length} file{result.outputs.length === 1 ? "" : "s"} ready for download</div>
+                <div className="grid gap-2 sm:grid-cols-2">{result.outputs.map((output, index) => {
+                  const friendlyName = mode === "resize"
+                    ? `${output.source_name.replace(/\.[^.]+$/, "")} — ${output.placement_id ? placements.find((p) => p.id === output.placement_id)?.label ?? output.placement_id : "resized"} (${output.width}×${output.height})`
+                    : `${output.source_name.replace(/\.[^.]+$/, "")}${output.language ? ` — ${output.language}` : ""}`;
+                  return (
+                    <div key={output.filename} className={["flex items-center justify-between rounded-md border px-3 py-2", activeOutput?.filename === output.filename ? "border-[#0f766e] bg-[#e8f7f1]" : "border-[#151515]/10"].join(" ")}>
+                      <button type="button" onClick={() => selectOutput(index)} className="min-w-0 flex-1 text-left">
+                        <span className="block truncate font-semibold text-[13px]">{friendlyName}</span>
+                        <span className="text-[11px] text-[#666]">{output.width}×{output.height} px</span>
+                      </button>
+                      <a href={output.download_url} className="ml-3 shrink-0 rounded-md border border-[#151515]/10 p-2 hover:border-[#0f766e]"><Download className="h-4 w-4 text-[#0f766e]" /></a>
+                    </div>
+                  );
+                })}</div>
               </div>
+            ) : result ? (
+              <p className="text-sm text-[#b42318]">Processing completed but no output files were generated. Please try again.</p>
             ) : (
-              <p className="text-sm text-[#666]">{mode === "adapt" ? "Localized image output will appear here after translation and background restoration." : "Selected dimension exports and platform-specific previews will appear here."}</p>
+              mode === "adapt" ? <p className="text-sm text-[#666]">Localized images will appear here after processing.</p> : null
             )}
           </div>
         </section>
@@ -1612,12 +1651,6 @@ export function AdaptDashboard() {
             </button>
             {remainingAfterAction < 0 && <p className="mt-3 text-xs font-semibold text-[#b42318]">Add credits before starting this action.</p>}
           </section>
-          {mode === "resize" && (
-            <>
-              <CreativeModeControl placement={activePlacement} value={activeCreativeMode} onChange={(next) => updateCreativeMode(activePlacement.id, next)} />
-              <PreviewMetadataForm metadata={previewMetadata} onChange={setPreviewMetadata} />
-            </>
-          )}
         </aside>
       </form>
 
