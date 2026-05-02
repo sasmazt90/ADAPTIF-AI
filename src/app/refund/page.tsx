@@ -9,6 +9,9 @@ export default function RefundPage() {
       <p className="mt-3 text-sm leading-6 text-[#555555]">
         Contact support with the Stripe receipt, account email and a short explanation. Approved refunds are returned through Stripe to the original payment method.
       </p>
+      <p className="mt-6 text-sm leading-6 text-[#555555]">
+        Refund contact: İbrahim Tolgar ŞAŞMAZ / SASMAZ DIGITAL SOLUTIONS / 81543, Munich Germany / tolgar@sasmaz.digital
+      </p>
     </main>
   );
 }

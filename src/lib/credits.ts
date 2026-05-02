@@ -104,3 +104,30 @@ export async function spendCredits(userId: string, credits: number) {
   writeLedger(ledger);
   return { ok: true, credits: ledger.users[normalized].credits };
 }
+
+export async function listCreditUsers() {
+  if (hasSupabaseServerConfig()) {
+    const supabase = getSupabaseAdmin();
+    const { data, error } = await supabase!
+      .from("credit_accounts")
+      .select("user_id, credits, updated_at")
+      .order("updated_at", { ascending: false })
+      .limit(100);
+
+    if (error) throw new Error(error.message);
+    return (data ?? []).map((item) => ({
+      user_id: normalizeUserId(item.user_id),
+      credits: Number(item.credits ?? 0),
+      updated_at: String(item.updated_at ?? ""),
+    }));
+  }
+
+  const ledger = readLedger();
+  return Object.entries(ledger.users)
+    .map(([user_id, value]) => ({
+      user_id,
+      credits: value.credits,
+      updated_at: value.updatedAt,
+    }))
+    .sort((left, right) => right.updated_at.localeCompare(left.updated_at));
+}

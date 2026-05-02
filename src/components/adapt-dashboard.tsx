@@ -5,6 +5,8 @@ import {
   ArrowRight,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CloudUpload,
   CreditCard,
   Download,
@@ -20,11 +22,13 @@ import {
   Sparkles,
   Type,
   User,
+  XCircle,
 } from "lucide-react";
 import type { User as SupabaseUser } from "@supabase/supabase-js";
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { creditPricing, estimateEditCredits, estimateLocalizeCredits, estimateResizeCredits } from "@/lib/credit-pricing";
 import { languages, outputFormats, Placement, placements } from "@/lib/placements";
+import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata as PlatformPreviewMetadata } from "@/lib/preview-templates";
 import { getSupabaseBrowser, hasSupabaseBrowserConfig } from "@/lib/supabase-client";
 
 type Mode = "adapt" | "resize";
@@ -32,12 +36,31 @@ type AuthMode = "sign-in" | "sign-up";
 type ConsentChoice = "necessary" | "all" | null;
 type Device = "mobile" | "desktop";
 type FitMode = "contain" | "cover" | "fill";
+type CreativeMode = "single" | "carousel";
+type PreviewMetadata = PlatformPreviewMetadata;
+type PipelineOutput = {
+  placement_id?: string | null;
+  filename: string;
+  download_url: string;
+  width: number;
+  height: number;
+  source_name: string;
+  language?: string | null;
+  source_language?: string | null;
+  translated_text?: string;
+  extracted_blocks?: Array<{ text: string; translated_text?: string | null; translate?: boolean }>;
+};
 type PipelineResult = {
   job_id: string;
-  outputs: Array<{ filename: string; download_url: string; width: number; height: number }>;
+  outputs: PipelineOutput[];
   credits_remaining?: number;
 };
 type ReceiptLine = { label: string; formula: string; credits: number };
+type AdminUser = { user_id: string; credits: number; updated_at: string };
+
+function formatCreditText(value: number) {
+  return `${value} credit${value === 1 ? "" : "s"}`;
+}
 
 const platformOrder = ["META", "TIKTOK", "GOOGLE", "SNAPCHAT", "LINKEDIN", "NATIVE/WEB"];
 const sampleCopy = {
@@ -52,6 +75,19 @@ const pricingPacks = [
 
 function cleanCopy(value: string) {
   return value.replaceAll("[BOLD]", "").replaceAll("[/BOLD]", "");
+}
+
+function mergeFiles(current: File[], incoming: File[]) {
+  const seen = new Set(current.map((file) => `${file.name}-${file.size}-${file.lastModified}`));
+  const merged = [...current];
+  for (const file of incoming) {
+    const key = `${file.name}-${file.size}-${file.lastModified}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(file);
+    }
+  }
+  return merged;
 }
 
 function overlaps(zone: Placement["safeZones"][number], box: { x: number; y: number; width: number; height: number }) {
@@ -317,7 +353,11 @@ function LandingPage({
       </section>
 
       <footer className="relative mx-auto flex max-w-[1180px] flex-wrap items-center justify-between gap-3 border-t border-[#151515]/10 px-5 py-5 text-xs text-[#666]">
-        <span>Strictly stateless creative processing / temporary files auto-delete after 24h</span>
+        <div className="space-y-1">
+          <p className="font-semibold text-[#151515]">SASMAZ DIGITAL SOLUTIONS / AdaptifAI - CREATIVE LOCALIZATION AND RESIZING TOOL</p>
+          <p>İbrahim Tolgar ŞAŞMAZ / 81543, Munich Germany / <a href="mailto:tolgar@sasmaz.digital" className="hover:text-[#151515]">tolgar@sasmaz.digital</a></p>
+          <p>Strictly stateless creative processing / temporary files auto-delete after 24h</p>
+        </div>
         <nav className="flex gap-4"><a href="/terms" className="hover:text-[#151515]">Terms</a><a href="/privacy" className="hover:text-[#151515]">Privacy GDPR/KVKK</a><a href="/refund" className="hover:text-[#151515]">Refund</a></nav>
       </footer>
       <ConsentBanner />
@@ -325,24 +365,32 @@ function LandingPage({
   );
 }
 
-function Creative({ placement, copy, mode, x, y, opacity, scale, fit }: { placement: Placement; copy: string; mode: Mode; x: number; y: number; opacity: number; scale: number; fit: FitMode }) {
+function Creative({ placement, copy, mode, x, y, opacity, scale, fit, imageUrl }: { placement: Placement; copy: string; mode: Mode; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string }) {
   const box = placement.ratio === "9:16" ? { x: 10 + x, y: 30 + y, width: 62, height: 18 } : { x: 9 + x, y: 32 + y, width: 58, height: 20 };
   return (
     <div className="relative overflow-hidden bg-[#f0d553]" style={{ aspectRatio: `${placement.width} / ${placement.height}` }}>
-      <div
-        className={["absolute inset-0 bg-[linear-gradient(135deg,#f9f4e8_0%,#f0d553_34%,#38b6a6_68%,#171717_100%)]", fit === "fill" ? "blur-[1px]" : ""].join(" ")}
-        style={{ transform: `scale(${scale / 100})` }}
-      />
-      <div className="absolute left-[8%] top-[12%] h-[18%] w-[28%] rounded-[50%] bg-white/80" />
-      <div className="absolute bottom-[10%] right-[8%] h-[28%] w-[44%] bg-[#ee4d6a]/80" />
-      <div className="absolute left-[12%] top-[22%] h-[24%] w-[58%] rounded bg-[#ff4d4d]/20" style={{ opacity: opacity / 100 }} />
-      <div className="absolute flex flex-col justify-center" style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, minHeight: `${box.height}%` }}>
-        <p className="max-w-full text-[clamp(10px,2.2vw,24px)] font-black uppercase leading-tight text-[#111] [text-shadow:0_1px_0_rgba(255,255,255,0.75)]">{cleanCopy(copy || sampleCopy[mode])}</p>
-        <p className="mt-1 max-w-[72%] text-[clamp(8px,1.1vw,13px)] font-semibold leading-tight text-[#26302d] [text-shadow:0_1px_0_rgba(255,255,255,0.65)]">{mode === "adapt" ? "Localized copy preview" : "Resize-safe preview"}</p>
-      </div>
-      {placement.safeZones.map((zone) => (
-        <span key={zone.id} className="absolute border border-dashed border-[#ff4d4d] bg-[#ff4d4d]/14" style={{ left: `${zone.x}%`, top: `${zone.y}%`, width: `${zone.width}%`, height: `${zone.height}%` }} title={zone.label} />
-      ))}
+      {imageUrl ? (
+        <img
+          src={imageUrl}
+          alt="Generated output"
+          className={["absolute inset-0 h-full w-full", fit === "contain" ? "object-contain bg-[#f7f4ed]" : fit === "fill" ? "object-fill" : "object-cover"].join(" ")}
+          style={{ transform: `scale(${scale / 100})` }}
+        />
+      ) : (
+        <>
+          <div
+            className={["absolute inset-0 bg-[linear-gradient(135deg,#f9f4e8_0%,#f0d553_34%,#38b6a6_68%,#171717_100%)]", fit === "fill" ? "blur-[1px]" : ""].join(" ")}
+            style={{ transform: `scale(${scale / 100})` }}
+          />
+          <div className="absolute left-[8%] top-[12%] h-[18%] w-[28%] rounded-[50%] bg-white/80" />
+          <div className="absolute bottom-[10%] right-[8%] h-[28%] w-[44%] bg-[#ee4d6a]/80" />
+          <div className="absolute left-[12%] top-[22%] h-[24%] w-[58%] rounded bg-[#ff4d4d]/20" style={{ opacity: opacity / 100 }} />
+          <div className="absolute flex flex-col justify-center" style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, minHeight: `${box.height}%` }}>
+            <p className="max-w-full text-[clamp(10px,2.2vw,24px)] font-black uppercase leading-tight text-[#111] [text-shadow:0_1px_0_rgba(255,255,255,0.75)]">{cleanCopy(copy || sampleCopy[mode])}</p>
+            <p className="mt-1 max-w-[72%] text-[clamp(8px,1.1vw,13px)] font-semibold leading-tight text-[#26302d] [text-shadow:0_1px_0_rgba(255,255,255,0.65)]">{mode === "adapt" ? "Localized copy preview" : "Resize-safe preview"}</p>
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -359,74 +407,545 @@ function AdFrame({ placement, children }: { placement: Placement; children: Reac
   );
 }
 
-function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit }: { placement: Placement; mode: Mode; device: Device; copy: string; x: number; y: number; opacity: number; scale: number; fit: FitMode }) {
-  const box = placement.ratio === "9:16" ? { x: 9 + x, y: 28 + y, width: 65, height: 24 } : { x: 8 + x, y: 30 + y, width: 62, height: 26 };
-  const warnings = placement.safeZones.filter((zone) => overlaps(zone, box));
-  const creative = <Creative placement={placement} mode={mode} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} />;
-  const framedCreative = <AdFrame placement={placement}>{creative}</AdFrame>;
-  let shell: ReactNode = null;
+function CarouselAssetSurface({
+  placement,
+  mode,
+  copy,
+  x,
+  y,
+  opacity,
+  scale,
+  fit,
+  imageUrl,
+  carouselAssets,
+  activeSlideIndex = 0,
+}: {
+  placement: Placement;
+  mode: Mode;
+  copy: string;
+  x: number;
+  y: number;
+  opacity: number;
+  scale: number;
+  fit: FitMode;
+  imageUrl?: string;
+  carouselAssets?: string[];
+  activeSlideIndex?: number;
+}) {
+  const slides = carouselAssets?.filter(Boolean) ?? [];
+  const supportsCarousel = Boolean(placement.supportsCarousel);
+  if (!supportsCarousel || slides.length <= 1) {
+    return <Creative placement={placement} mode={mode} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={imageUrl} />;
+  }
 
-  if (placement.platform === "META") shell = (
-    <div className={["mx-auto overflow-hidden rounded-md border bg-white shadow-xl", device === "mobile" ? "w-[190px]" : "w-full max-w-[500px]"].join(" ")}>
-      <div className="flex items-center gap-2 border-b px-3 py-2"><span className="grid h-7 w-7 place-items-center rounded-full bg-[#1877f2] text-xs font-black text-white">f</span><div><p className="text-[11px] font-bold">AdaptifAI Sponsored</p><p className="text-[9px] text-[#666]">{placement.label} placement preview</p></div><button type="button" className="ml-auto rounded-full border px-2 py-1 text-[9px] font-bold text-[#1877f2]">Follow</button></div>
-      <div className="p-2">{framedCreative}</div><div className="flex justify-around border-t px-3 py-2 text-[10px] font-bold text-[#555]"><span>Like</span><span>Comment</span><span>Share</span></div>
-    </div>
-  );
-  else if (placement.platform === "TIKTOK") shell = (
-    <div className="relative mx-auto w-[182px] overflow-hidden rounded-[24px] border-[7px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
-      <div className="relative overflow-hidden rounded-[16px]">{creative}<div className="absolute left-3 top-3 rounded bg-black/45 px-2 py-1 text-[8px] font-bold">Sponsored</div></div>
-      <div className="absolute right-2 top-[33%] grid gap-2 text-center text-[8px] font-bold">{["+", "Like", "Share", "Audio"].map((i) => <span key={i} className="grid h-7 w-7 place-items-center rounded-full bg-black/35 backdrop-blur">{i}</span>)}</div>
-      <div className="absolute bottom-3 left-3 right-10 text-[9px]"><p className="font-bold">@brand</p><p className="text-white/85">Localized campaign copy</p><button className="mt-1 rounded-full bg-white px-2 py-1 text-[8px] font-black text-[#111]" type="button">Shop now</button></div>
-    </div>
-  );
-  else if (placement.overlay === "youtube") shell = (
-    <div className={["mx-auto overflow-hidden rounded-md bg-[#0f0f0f] text-white shadow-xl", device === "mobile" ? "w-[190px]" : "w-full max-w-[500px]"].join(" ")}>
-      <div className="flex justify-between px-3 py-2 text-[10px] font-bold"><span>YouTube</span><span>Ad preview</span></div><div className="px-2">{framedCreative}</div><div className="px-2 py-2"><div className="h-1 rounded bg-white/25"><div className="h-1 w-1/3 rounded bg-[#ff0033]" /></div><div className="mt-2 flex justify-between text-[9px] text-white/75"><span>0:06</span><span>Skip ad</span></div></div>
-    </div>
-  );
-  else if (placement.platform === "LINKEDIN") shell = (
-    <div className={["mx-auto overflow-hidden rounded-md border bg-white shadow-xl", device === "mobile" ? "w-[190px]" : "w-full max-w-[500px]"].join(" ")}>
-      <div className="flex items-center gap-2 border-b px-3 py-2"><span className="grid h-7 w-7 place-items-center rounded bg-[#0a66c2] text-xs font-black text-white">in</span><div><p className="text-[11px] font-bold">AdaptifAI</p><p className="text-[9px] text-[#666]">Promoted</p></div></div><div className="p-2">{framedCreative}</div><div className="flex justify-around border-t px-3 py-2 text-[10px] font-bold text-[#555]"><span>Like</span><span>Comment</span><span>Send</span></div>
-    </div>
-  );
-  else if (placement.platform === "SNAPCHAT") shell = (
-    <div className="relative mx-auto w-[182px] overflow-hidden rounded-[24px] border-[7px] border-[#111] bg-[#fffc00] shadow-2xl"><div className="overflow-hidden rounded-[16px]">{creative}</div><div className="absolute left-4 right-4 top-4 flex justify-between text-[10px] font-bold"><span>Story Ad</span><span>...</span></div><div className="absolute bottom-4 left-6 right-6 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">Swipe up</div></div>
-  );
-  else shell = (
-    <div className={["mx-auto overflow-hidden rounded-md border bg-white shadow-xl", device === "mobile" ? "w-[210px]" : "w-full max-w-[540px]"].join(" ")}>
-      <div className="flex items-center gap-2 border-b bg-[#f7f7f7] px-3 py-2"><span className="h-2.5 w-2.5 rounded-full bg-[#ee4d6a]" /><span className="h-2.5 w-2.5 rounded-full bg-[#f0d553]" /><span className="h-2.5 w-2.5 rounded-full bg-[#38b6a6]" /><span className="ml-2 rounded bg-white px-2 py-1 text-[9px] text-[#666]">news.example/ad-preview</span></div>
-      <div className={["grid gap-3 p-3", device === "desktop" && placement.height > 120 ? "grid-cols-[1fr_220px]" : ""].join(" ")}><div><p className="text-[10px] font-black uppercase text-[#0f766e]">{placement.platform === "GOOGLE" ? "Google Display Network" : "Native publisher"}</p><h3 className="mt-1 text-base font-semibold">{placement.platform === "GOOGLE" ? "Display inventory preview" : "Article layout"}</h3><div className="mt-3 space-y-1.5"><div className="h-2.5 rounded bg-[#ededed]" /><div className="h-2.5 w-5/6 rounded bg-[#ededed]" /><div className="h-2.5 w-2/3 rounded bg-[#ededed]" /></div></div><div><p className="mb-1 text-right text-[9px] font-semibold uppercase text-[#777]">Advertisement</p>{framedCreative}</div></div>
-    </div>
-  );
+  const currentIndex = Math.max(0, Math.min(activeSlideIndex, slides.length - 1));
+  const current = slides[currentIndex] ?? imageUrl;
+  const next = slides[(currentIndex + 1) % slides.length];
+  const showPeek = next && slides.length > 1;
 
   return (
-    <div className="flex min-h-[300px] max-h-[calc(100svh-230px)] flex-col justify-center gap-2 overflow-hidden bg-[#f3f0e8] p-2">
-      {shell}
-      <div className="mx-auto flex w-full max-w-[540px] justify-between rounded-md bg-[#111] px-3 py-2 text-[10px] text-white">
-        <span>{placement.platform} / {placement.label} / {placement.width}x{placement.height}</span>
-        <span className={warnings.length ? "text-[#ffcf4a]" : "text-[#7ee1c6]"}>{warnings.length ? `${warnings.length} safe-zone warning` : "Safe zone clear"}</span>
+    <div className="relative overflow-hidden">
+      <div className="overflow-hidden rounded-[inherit]">
+        <Creative placement={placement} mode={mode} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={current} />
+      </div>
+      {showPeek ? (
+        <>
+          <div className="pointer-events-none absolute inset-y-[8%] right-[4%] w-[26%] overflow-hidden rounded-2xl border border-white/70 bg-white/20 shadow-xl">
+            <div className="h-full w-[180%] -translate-x-[42%]">
+              <Creative placement={placement} mode={mode} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={next} />
+            </div>
+          </div>
+          <div className="pointer-events-none absolute left-3 top-1/2 grid h-9 w-9 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-lg font-bold text-white">‹</div>
+          <div className="pointer-events-none absolute right-3 top-1/2 grid h-9 w-9 -translate-y-1/2 place-items-center rounded-full bg-black/45 text-lg font-bold text-white">›</div>
+          <div className="pointer-events-none absolute inset-x-0 bottom-3 flex items-center justify-center gap-1.5">
+            {slides.map((slide, index) => (
+              <span
+                key={`${slide}-${index}`}
+                className={["h-2.5 rounded-full transition-all", index === currentIndex ? "w-5 bg-white" : "w-2.5 bg-white/50"].join(" ")}
+              />
+            ))}
+          </div>
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+function AssetSurface({
+  placement,
+  mode,
+  copy,
+  x,
+  y,
+  opacity,
+  scale,
+  fit,
+  imageUrl,
+  carouselAssets,
+  activeSlideIndex,
+}: {
+  placement: Placement;
+  mode: Mode;
+  copy: string;
+  x: number;
+  y: number;
+  opacity: number;
+  scale: number;
+  fit: FitMode;
+  imageUrl?: string;
+  carouselAssets?: string[];
+  activeSlideIndex?: number;
+}) {
+  return (
+    <CarouselAssetSurface
+      placement={placement}
+      mode={mode}
+      copy={copy}
+      x={x}
+      y={y}
+      opacity={opacity}
+      scale={scale}
+      fit={fit}
+      imageUrl={imageUrl}
+      carouselAssets={carouselAssets}
+      activeSlideIndex={activeSlideIndex}
+    />
+  );
+}
+
+function PreviewMetadataForm({ metadata, onChange }: { metadata: PreviewMetadata; onChange: (next: PreviewMetadata) => void }) {
+  const update = (key: keyof PreviewMetadata, value: string) => onChange({ ...metadata, [key]: value });
+  return (
+    <div className="grid gap-2 rounded-md border border-[#151515]/10 bg-white p-3">
+      <p className="text-xs font-semibold uppercase text-[#0f766e]">Preview metadata</p>
+      <div className="grid gap-2">
+        <input className="h-9 rounded-md border border-[#151515]/10 px-3 text-xs outline-none focus:border-[#0f766e]" value={metadata.brandName} onChange={(event) => update("brandName", event.target.value)} placeholder="Brand name" />
+        <input className="h-9 rounded-md border border-[#151515]/10 px-3 text-xs outline-none focus:border-[#0f766e]" value={metadata.headline} onChange={(event) => update("headline", event.target.value)} placeholder="Headline" />
+        <textarea className="min-h-20 rounded-md border border-[#151515]/10 px-3 py-2 text-xs outline-none focus:border-[#0f766e]" value={metadata.description} onChange={(event) => update("description", event.target.value)} placeholder="Description" />
+        <div className="grid grid-cols-2 gap-2">
+          <input className="h-9 rounded-md border border-[#151515]/10 px-3 text-xs outline-none focus:border-[#0f766e]" value={metadata.ctaText} onChange={(event) => update("ctaText", event.target.value)} placeholder="CTA" />
+          <input className="h-9 rounded-md border border-[#151515]/10 px-3 text-xs outline-none focus:border-[#0f766e]" value={metadata.price} onChange={(event) => update("price", event.target.value)} placeholder="Price" />
+        </div>
       </div>
     </div>
   );
 }
 
-function LocalizePreview({ imageUrl }: { imageUrl?: string }) {
+function CreativeModeControl({
+  placement,
+  value,
+  onChange,
+}: {
+  placement: Placement;
+  value: CreativeMode;
+  onChange: (next: CreativeMode) => void;
+}) {
+  const supportsCarousel = Boolean(placement.supportsCarousel);
   return (
-    <div className="flex min-h-[360px] max-h-[calc(100svh-220px)] items-center justify-center overflow-hidden bg-[#f3f0e8] p-4">
-      <div className="w-full max-w-[620px] overflow-hidden rounded-md border border-[#151515]/15 bg-white shadow-xl">
-        <div className="flex items-center justify-between border-b border-[#151515]/10 bg-[#faf9f5] px-3 py-2 text-[10px] font-semibold uppercase text-[#666]">
-          <span>Localized creative</span>
-          <span>Original ratio</span>
+    <div className="grid gap-2 rounded-md border border-[#151515]/10 bg-white p-3">
+      <p className="text-xs font-semibold uppercase text-[#0f766e]">Creative mode</p>
+      <select
+        className="h-9 rounded-md border border-[#151515]/10 px-3 text-xs outline-none focus:border-[#0f766e] disabled:bg-[#f4f5f7]"
+        value={supportsCarousel ? value : "single"}
+        onChange={(event) => onChange(event.target.value as CreativeMode)}
+      >
+        <option value="single">Single Image</option>
+        <option value="carousel" disabled={!supportsCarousel}>Carousel</option>
+      </select>
+      <p className="text-[11px] text-[#666]">
+        {supportsCarousel
+          ? "Choose whether this placement should render as a single creative or a carousel preview."
+          : "This placement only supports single-image preview. Carousel stays disabled here."}
+      </p>
+    </div>
+  );
+}
+
+function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, imageUrl, metadata }: { placement: Placement; mode: Mode; device: Device; copy: string; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string; metadata: PreviewMetadata }) {
+  const template = placementPreviewTemplates[placement.id] ?? placementPreviewTemplates["custom-display"];
+  const box = placement.ratio === "9:16" ? { x: 9 + x, y: 28 + y, width: 65, height: 24 } : { x: 8 + x, y: 30 + y, width: 62, height: 26 };
+  const warnings = placement.safeZones.filter((zone) => overlaps(zone, box));
+  const carouselAssets = metadata.carouselAssets?.filter(Boolean) ?? [];
+  const creativeMode = metadata.creativeMode ?? "single";
+  const carouselWarning = template.supportsCarousel && creativeMode === "carousel" && carouselAssets.length < 2;
+  const activeImageUrl = creativeMode === "single" ? (carouselAssets[0] ?? imageUrl) : imageUrl;
+  const asset = (
+    <AssetSurface
+      placement={placement}
+      mode={mode}
+      copy={copy}
+      x={x}
+      y={y}
+      opacity={opacity}
+      scale={scale}
+      fit={fit}
+      imageUrl={activeImageUrl}
+      carouselAssets={creativeMode === "carousel" ? carouselAssets : []}
+      activeSlideIndex={creativeMode === "carousel" ? metadata.activeSlideIndex : 0}
+    />
+  );
+  const framedCreative = <AdFrame placement={placement}>{asset}</AdFrame>;
+  let shell: ReactNode = null;
+
+  if (template.id === "facebook_feed") {
+    shell = (
+      <div className="mx-auto w-full max-w-[440px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-[#eff2f7] px-4 py-3">
+          <div className="flex items-center gap-2">
+            <div className="grid h-9 w-9 place-items-center rounded-full bg-[#1877f2] text-xs font-black text-white">{metadata.brandName.slice(0, 1)}</div>
+            <div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
+          </div>
+          <span className="text-[#666]">•••</span>
         </div>
-        {imageUrl ? (
-          <div
-            aria-label="Localized output"
-            className="min-h-[320px] bg-[#f3f0e8] bg-contain bg-center bg-no-repeat"
-            style={{ backgroundImage: `url(${imageUrl})` }}
-          />
-        ) : (
-          <div className="grid min-h-[320px] place-items-center bg-[linear-gradient(135deg,#f3f0e8_0%,#f8d56b_45%,#38b6a6_100%)]">
-            <div className="h-28 w-28 rounded-full bg-white/55" />
+        <div>{asset}</div>
+        <div className="space-y-2 px-4 py-3">
+          <p className="text-[14px] font-bold">{metadata.headline}</p>
+          <p className="text-[12px] text-[#666]">{metadata.description}</p>
+          <button type="button" className="rounded-full bg-[#1877f2] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+        </div>
+        <div className="flex items-center justify-between border-t border-[#eff2f7] px-4 py-3 text-[11px] text-[#666]">
+          <span>Like</span><span>Comment</span><span>Share</span>
+        </div>
+      </div>
+    );
+  } else if (template.id === "instagram_feed") {
+    shell = (
+      <div className="mx-auto w-full max-w-[420px] overflow-hidden rounded-[28px] border border-[#151515]/10 bg-white shadow-xl">
+        <div className="flex items-center justify-between px-4 py-3">
+          <div className="flex items-center gap-2">
+            <div className="grid h-8 w-8 place-items-center rounded-full bg-[#151515] text-xs font-black text-white">{metadata.brandName.slice(0, 1)}</div>
+            <div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
+          </div>
+          <span className="text-[#666]">•••</span>
+        </div>
+        <div>{asset}</div>
+        <div className="flex items-center gap-4 px-4 py-3 text-[#151515]">
+          <span>♡</span><span>💬</span><span>➤</span><span className="ml-auto">🔖</span>
+        </div>
+        <div className="space-y-1 px-4 pb-4 text-[12px]">
+          <p className="font-semibold">{metadata.likesLabel}</p>
+          <p><span className="font-bold">{metadata.username}</span> {metadata.headline}</p>
+          <p className="text-[#555]">{metadata.description}</p>
+          <p className="text-[#777]">{metadata.commentsLabel}</p>
+          <button type="button" className="mt-2 rounded-full bg-[#2550a8] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+        </div>
+      </div>
+    );
+  } else if (template.id === "instagram_story") {
+    shell = (
+      <div className="relative mx-auto w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl">
+        <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 5 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
+        <div className="absolute left-4 right-4 top-6 z-20 flex items-center justify-between text-white">
+          <div className="flex items-center gap-2"><div className="grid h-8 w-8 place-items-center rounded-full bg-white/20 text-xs font-black">{metadata.brandName.slice(0, 1)}</div><div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-white/70">{metadata.sponsorLabel}</p></div></div>
+          <span className="text-lg">×</span>
+        </div>
+        <div className="relative">{asset}</div>
+        <div className="absolute inset-x-4 bottom-4 z-20 rounded-full bg-white px-4 py-3 text-center text-[12px] font-black text-[#111] shadow-lg">{metadata.ctaText}</div>
+      </div>
+    );
+  } else if (template.id === "instagram_reels") {
+    shell = (
+      <div className="relative mx-auto w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl text-white">
+        <div className="relative">{asset}</div>
+        <div className="absolute right-3 top-[34%] z-20 grid gap-3 text-center text-[9px] font-semibold">
+          {["♥", "💬", "↗", "⋯"].map((item, index) => <span key={`${item}-${index}`} className="grid h-10 w-10 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
+        </div>
+        <div className="absolute bottom-4 left-4 right-16 z-20 space-y-1 text-[11px]">
+          <p className="font-bold">@{metadata.username}</p>
+          <p className="font-semibold">{metadata.headline}</p>
+          <p className="text-white/80">{metadata.description}</p>
+        </div>
+      </div>
+    );
+  } else if (template.id === "facebook_marketplace") {
+    shell = (
+      <div className="mx-auto w-full max-w-[440px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-[#f3f4f8] shadow-xl">
+        <div className="border-b border-[#dde2ec] bg-white px-4 py-3">
+          <p className="text-sm font-black">Marketplace</p>
+          <div className="mt-2 grid grid-cols-3 gap-2 text-[10px] text-[#666]">
+            <span className="rounded-full bg-[#eef1f7] px-2 py-1 text-center">For you</span>
+            <span className="rounded-full bg-[#eef1f7] px-2 py-1 text-center">Local</span>
+            <span className="rounded-full bg-[#eef1f7] px-2 py-1 text-center">Categories</span>
+          </div>
+        </div>
+        <div className="p-4">
+          <div className="overflow-hidden rounded-2xl border border-[#d8dce6] bg-white">
+            <div className="p-2">{asset}</div>
+            <div className="space-y-1 px-3 pb-3 pt-1">
+              <div className="flex items-center justify-between">
+                <p className="text-sm font-black">{metadata.price}</p>
+                <span className="rounded-full bg-[#eef7ff] px-2 py-1 text-[10px] font-bold text-[#2550a8]">{metadata.sponsorLabel}</span>
+              </div>
+              <p className="text-sm font-semibold">{metadata.headline}</p>
+              <p className="text-xs text-[#666]">{metadata.description}</p>
+              <button type="button" className="mt-2 rounded-full bg-[#2550a8] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (template.id === "facebook_right_column") {
+    shell = (
+      <div className="mx-auto w-full max-w-[560px] overflow-hidden rounded-2xl border border-[#dde2ec] bg-white shadow-xl">
+        <div className="border-b border-[#eff2f7] px-4 py-3 text-[12px] font-semibold text-[#666]">facebook.com / Sponsored</div>
+        <div className="p-4">{framedCreative}</div>
+        <div className="border-t border-[#eff2f7] px-4 py-3">
+          <p className="text-[13px] font-black">{metadata.headline}</p>
+          <p className="mt-1 text-[12px] text-[#666]">{metadata.description}</p>
+          <button type="button" className="mt-3 rounded-md bg-[#2550a8] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+        </div>
+      </div>
+    );
+  } else if (template.id === "tiktok_infeed") {
+    shell = (
+      <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
+        <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-6 w-28 -translate-x-1/2 rounded-full bg-black/90" />
+        <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
+        <div className="absolute left-4 top-6 z-20 rounded-full bg-black/40 px-2.5 py-1 text-[10px] font-bold backdrop-blur">{metadata.sponsorLabel}</div>
+        <div className="absolute right-3 top-[28%] z-20 grid gap-3 text-center text-[9px] font-semibold">
+          {["♥", "💬", "↗", "⋯"].map((item, index) => <span key={`${item}-${index}`} className="grid h-9 w-9 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
+        </div>
+        <div className="absolute bottom-4 left-4 right-16 z-20 space-y-1 text-[11px]">
+          <p className="font-bold">@{metadata.username}</p>
+          <p className="font-semibold">{metadata.headline}</p>
+          <p className="text-white/80">{metadata.description}</p>
+          <button type="button" className="mt-2 rounded-full bg-white px-4 py-2 text-[11px] font-black text-[#111]">{metadata.ctaText}</button>
+        </div>
+      </div>
+    );
+  } else if (template.id === "tiktok_topview") {
+    shell = (
+      <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
+        <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-6 w-28 -translate-x-1/2 rounded-full bg-black/90" />
+        <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
+        <div className="absolute left-4 top-6 z-20 rounded-full bg-white px-3 py-1 text-[10px] font-black text-[#111]">TopView</div>
+        <div className="absolute inset-x-4 bottom-24 z-20 rounded-2xl bg-black/45 px-3 py-3 backdrop-blur">
+          <p className="text-[10px] font-semibold uppercase tracking-normal text-white/70">{metadata.sponsorLabel}</p>
+          <p className="mt-1 text-[13px] font-black">{metadata.headline}</p>
+          <p className="mt-1 text-[11px] text-white/80">{metadata.description}</p>
+        </div>
+        <div className="absolute right-3 top-[28%] z-20 grid gap-3 text-center text-[9px] font-semibold">
+          {["♥", "💬", "↗"].map((item, index) => <span key={`${item}-${index}`} className="grid h-9 w-9 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
+        </div>
+        <button type="button" className="absolute bottom-4 left-4 z-20 rounded-full bg-[#f8d948] px-4 py-2 text-[11px] font-black text-[#111]">{metadata.ctaText}</button>
+      </div>
+    );
+  } else if (template.id === "tiktok_branded_content") {
+    shell = (
+      <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
+        <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
+        <div className="absolute left-4 top-6 z-20 rounded-full bg-white/20 px-3 py-1 text-[10px] font-bold backdrop-blur">Branded content</div>
+        <div className="absolute right-3 top-[32%] z-20 grid gap-3 text-center text-[9px] font-semibold">
+          {["♥", "💬", "↗"].map((item) => <span key={item} className="grid h-9 w-9 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
+        </div>
+        <div className="absolute bottom-4 left-4 right-16 z-20 space-y-1 text-[11px]">
+          <p className="font-bold">@{metadata.username}</p>
+          <p className="text-white/80">{metadata.description}</p>
+          <button type="button" className="mt-2 rounded-full bg-white px-4 py-2 text-[11px] font-black text-[#111]">{metadata.ctaText}</button>
+        </div>
+      </div>
+    );
+  } else if (template.id === "youtube_instream") {
+    shell = (
+      <div className="mx-auto w-full max-w-[620px] overflow-hidden rounded-2xl bg-[#0f0f0f] text-white shadow-xl">
+        <div className="relative">{asset}<div className="absolute left-3 top-3 rounded bg-black/70 px-2 py-1 text-[10px] font-bold">Ad 0:06</div><div className="absolute bottom-0 left-0 right-0 h-1 bg-white/15"><div className="h-1 w-1/3 bg-[#ff0033]" /></div></div>
+        <div className="grid gap-2 px-4 py-3">
+          <div className="flex items-center justify-between"><div><p className="font-bold">{metadata.brandName}</p><p className="text-[11px] text-white/70">{metadata.sponsorLabel}</p></div><button type="button" className="rounded-full bg-white px-4 py-2 text-[11px] font-black text-[#111]">{metadata.ctaText}</button></div>
+          <p className="text-[13px] font-semibold">{metadata.headline}</p>
+          <p className="text-[12px] text-white/75">{metadata.description}</p>
+        </div>
+      </div>
+    );
+  } else if (template.id === "youtube_shorts") {
+    shell = (
+      <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
+        <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
+        <div className="absolute right-3 top-[34%] z-20 grid gap-3 text-center text-[9px] font-semibold">
+          {["♥", "💬", "➤"].map((item) => <span key={item} className="grid h-10 w-10 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
+        </div>
+        <div className="absolute bottom-4 left-4 right-16 z-20 space-y-1 text-[11px]">
+          <p className="font-bold">{metadata.brandName}</p>
+          <p className="font-semibold">{metadata.headline}</p>
+          <p className="text-white/80">{metadata.description}</p>
+        </div>
+      </div>
+    );
+  } else if (
+    template.id === "linkedin_single_image_1200x628" ||
+    template.id === "linkedin_single_image_1080x1080" ||
+    template.id === "linkedin_sponsored_content"
+  ) {
+    shell = (
+      <div className="mx-auto w-full max-w-[560px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
+        <div className="flex items-center gap-3 border-b border-[#eff2f7] px-4 py-3">
+          <div className="grid h-9 w-9 place-items-center rounded-full bg-[#0a66c2] text-xs font-black text-white">in</div>
+          <div><p className="text-[12px] font-bold">{metadata.brandName}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
+        </div>
+        <div className="p-3">{framedCreative}</div>
+        <div className="space-y-2 px-4 pb-4">
+          <p className="text-[15px] font-black">{metadata.headline}</p>
+          <p className="text-[12px] text-[#555]">{metadata.description}</p>
+          <div className="flex items-center justify-between rounded-xl border border-[#e4e7ec] bg-[#f8fafc] px-3 py-3">
+            <div><p className="text-[11px] font-semibold text-[#667085]">{metadata.brandName}</p><p className="text-[13px] font-semibold">{metadata.ctaText}</p></div>
+            <button type="button" className="rounded-md bg-[#0a66c2] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (template.id === "snap_top_snap") {
+    shell = (
+      <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
+        <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-5 w-24 -translate-x-1/2 rounded-full bg-black/85" />
+        <div className="overflow-hidden rounded-[28px]">{asset}</div>
+        <div className="absolute left-4 right-4 top-6 z-20 flex justify-between text-[10px] font-bold text-white"><span>{metadata.brandName}</span><span>{metadata.sponsorLabel}</span></div>
+        <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
+      </div>
+    );
+  } else if (template.id === "snap_story_ad") {
+    shell = (
+      <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
+        <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 4 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
+        <div className="overflow-hidden rounded-[28px]">{asset}</div>
+        <div className="absolute left-4 right-4 top-6 z-20 flex justify-between text-[10px] font-bold text-white"><span>{metadata.brandName}</span><span>{metadata.sponsorLabel}</span></div>
+        <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
+      </div>
+    );
+  } else if (template.id === "gdn_300x250") {
+    shell = (
+      <div className="mx-auto w-[300px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-[#eef2f7] bg-[#f7f8fb] px-3 py-2 text-[10px] font-semibold text-[#667085]"><span>Display Ad</span><span>Ad</span></div>
+        <div className="p-2">{framedCreative}</div>
+      </div>
+    );
+  } else if (template.id === "gdn_728x90") {
+    shell = (
+      <div className="mx-auto w-full max-w-[760px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="p-2">{framedCreative}</div>
+      </div>
+    );
+  } else if (template.id === "gdn_160x600") {
+    shell = (
+      <div className="mx-auto w-[184px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="p-2">{framedCreative}</div>
+      </div>
+    );
+  } else if (template.id === "gdn_320x50") {
+    shell = (
+      <div className="mx-auto w-[344px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="p-2">{framedCreative}</div>
+      </div>
+    );
+  } else if (template.id === "gdn_300x600") {
+    shell = (
+      <div className="mx-auto w-[324px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="p-2">{framedCreative}</div>
+      </div>
+    );
+  } else if (template.id.startsWith("gdn_")) {
+    shell = (
+      <div className="mx-auto w-full max-w-[640px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-[#eef2f7] bg-[#f7f8fb] px-3 py-2 text-[10px] font-semibold text-[#667085]">
+          <span>Google Display Network</span>
+          <span>Ad</span>
+        </div>
+        <div className="p-3">{framedCreative}</div>
+      </div>
+    );
+  } else {
+    shell = (
+      <div className="mx-auto w-full max-w-[640px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
+        <div className="flex items-center gap-2 border-b bg-[#f7f7f7] px-3 py-2"><span className="h-2.5 w-2.5 rounded-full bg-[#ee4d6a]" /><span className="h-2.5 w-2.5 rounded-full bg-[#f0d553]" /><span className="h-2.5 w-2.5 rounded-full bg-[#38b6a6]" /><span className="ml-2 rounded bg-white px-2 py-1 text-[9px] text-[#666]">publisher.example/feature</span></div>
+        <div className="grid gap-4 p-4 md:grid-cols-[1fr_260px]">
+          <div className="space-y-3">
+            <p className="text-[10px] font-black uppercase text-[#0f766e]">Native publisher</p>
+            <h3 className="text-xl font-black">{metadata.headline}</h3>
+            <p className="text-sm leading-6 text-[#555]">{metadata.description}</p>
+            <button type="button" className="rounded-full bg-[#151515] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+          </div>
+          <div>
+            <p className="mb-1 text-right text-[9px] font-semibold uppercase text-[#777]">Advertisement</p>
+            {framedCreative}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-[300px] max-h-[calc(100svh-230px)] flex-col justify-center gap-2 overflow-hidden bg-[#f3f0e8] p-2">
+      {shell}
+      <div className="mx-auto flex w-full max-w-[540px] justify-between rounded-md bg-[#111] px-3 py-2 text-[10px] text-white">
+        <span>{template.placementType} / {placement.width}x{placement.height}</span>
+        <span className={warnings.length || carouselWarning ? "text-[#ffcf4a]" : "text-[#7ee1c6]"}>{carouselWarning ? "Carousel assets missing" : warnings.length ? `${warnings.length} safe-zone warning` : "Safe zone clear"}</span>
+      </div>
+    </div>
+  );
+}
+
+function LocalizePreview({
+  originalUrl,
+  localizedUrl,
+  originalLabel,
+  localizedLabel,
+  index,
+  total,
+  onPrevious,
+  onNext,
+}: {
+  originalUrl?: string;
+  localizedUrl?: string;
+  originalLabel: string;
+  localizedLabel: string;
+  index: number;
+  total: number;
+  onPrevious: () => void;
+  onNext: () => void;
+}) {
+  return (
+    <div className="bg-[#f3f0e8] p-4">
+      <div className="mx-auto w-full max-w-[860px] overflow-hidden rounded-md border border-[#151515]/15 bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-[#151515]/10 bg-[#faf9f5] px-4 py-3">
+          <div>
+            <p className="text-lg font-semibold">Localization Preview</p>
+            <p className="text-xs text-[#666]">Compare original and localized creative side by side</p>
+          </div>
+          <div className="flex items-center gap-2 text-xs font-semibold text-[#0f766e]">
+            <Shield className="h-4 w-4" />
+            Show Safe Zones
+          </div>
+        </div>
+        <div className="space-y-4 p-4">
+          <div>
+            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{originalLabel}</p>
+            <div className="overflow-hidden rounded-md border border-[#151515]/10 bg-[#eef5fb]">
+              {originalUrl ? (
+                <img src={originalUrl} alt="Original creative" className="block h-auto w-full object-contain" />
+              ) : (
+                <div className="grid min-h-[220px] place-items-center bg-[linear-gradient(135deg,#edf6ff_0%,#a9d7f7_52%,#f4d28c_100%)]" />
+              )}
+            </div>
+          </div>
+          <div className="flex justify-center">
+            <span className="grid h-12 w-12 place-items-center rounded-full border border-[#d9e5f3] bg-white text-[#2550a8] shadow-sm">
+              <ArrowRight className="h-5 w-5" />
+            </span>
+          </div>
+          <div>
+            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{localizedLabel}</p>
+            <div className="overflow-hidden rounded-md border border-[#151515]/10 bg-[#eef5fb]">
+              {localizedUrl ? (
+                <img src={localizedUrl} alt="Localized creative" className="block h-auto w-full object-contain" />
+              ) : (
+                <div className="grid min-h-[220px] place-items-center bg-[linear-gradient(135deg,#edf6ff_0%,#a9d7f7_52%,#f4d28c_100%)]" />
+              )}
+            </div>
+          </div>
+        </div>
+        {total > 1 && (
+          <div className="flex items-center justify-between border-t border-[#151515]/10 bg-white px-3 py-2 text-xs font-semibold">
+            <button type="button" onClick={onPrevious} className="flex items-center gap-1 rounded-md border border-[#151515]/10 px-3 py-1.5 hover:border-[#0f766e]"><ChevronLeft className="h-4 w-4" />Previous</button>
+            <span>{index + 1} / {total}</span>
+            <button type="button" onClick={onNext} className="flex items-center gap-1 rounded-md border border-[#151515]/10 px-3 py-1.5 hover:border-[#0f766e]">Next<ChevronRight className="h-4 w-4" /></button>
           </div>
         )}
       </div>
@@ -439,9 +958,10 @@ export function AdaptDashboard() {
   const supabaseConfigured = hasSupabaseBrowserConfig();
   const grouped = useMemo(() => platformOrder.map((p) => [p, placements.filter((x) => x.platform === p)] as const), []);
   const [mode, setMode] = useState<Mode>("adapt");
-  const [selectedPlacementIds, setSelectedPlacementIds] = useState(["meta-stories", "tiktok-in-feed", "gdn-300x250"]);
-  const [activePlacementId, setActivePlacementId] = useState("meta-stories");
-  const [selectedLanguages, setSelectedLanguages] = useState(["DE", "TR", "AR"]);
+  const [selectedPlacementIds, setSelectedPlacementIds] = useState<string[]>([]);
+  const [activePlacementId, setActivePlacementId] = useState("instagram-story");
+  const [creativeModesByPlacement, setCreativeModesByPlacement] = useState<Record<string, CreativeMode>>({});
+  const [selectedLanguages, setSelectedLanguages] = useState<string[]>([]);
   const [selectedFormat, setSelectedFormat] = useState("PNG");
   const [files, setFiles] = useState<File[]>([]);
   const [credits, setCredits] = useState(240);
@@ -455,51 +975,118 @@ export function AdaptDashboard() {
   const [authError, setAuthError] = useState<string | null>(null);
   const [authPending, setAuthPending] = useState(false);
   const [showCreditStore, setShowCreditStore] = useState(false);
+  const [showAdminPanel, setShowAdminPanel] = useState(false);
+  const [adminUsers, setAdminUsers] = useState<AdminUser[]>([]);
   const [adminTargetEmail, setAdminTargetEmail] = useState("");
   const [adminAmount, setAdminAmount] = useState(100);
   const [adminAction, setAdminAction] = useState<"add" | "deduct">("add");
   const [adminStatus, setAdminStatus] = useState<string | null>(null);
   const [isAdminUpdating, setIsAdminUpdating] = useState(false);
+  const [preserveBold, setPreserveBold] = useState(true);
+  const [maskCleanup, setMaskCleanup] = useState(true);
+  const [fitBounds, setFitBounds] = useState(true);
   const [copy, setCopy] = useState(sampleCopy.adapt);
   const [x, setX] = useState(0);
   const [y, setY] = useState(0);
   const [opacity, setOpacity] = useState(18);
   const [scale, setScale] = useState(100);
   const [fit, setFit] = useState<FitMode>("cover");
+  const [customWidth, setCustomWidth] = useState(1200);
+  const [customHeight, setCustomHeight] = useState(800);
   const [result, setResult] = useState<PipelineResult | null>(null);
+  const [activeOutputIndex, setActiveOutputIndex] = useState(0);
+  const [activeResizeSource, setActiveResizeSource] = useState<string>("");
   const [isRunning, setIsRunning] = useState(false);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [editStatus, setEditStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const activePlacement = placements.find((p) => p.id === activePlacementId) ?? placements[0];
+  const activePlacement = useMemo(() => {
+    const placement = placements.find((p) => p.id === activePlacementId) ?? placements[0];
+    if (placement.id !== "custom-display") return placement;
+    return {
+      ...placement,
+      width: customWidth,
+      height: customHeight,
+      ratio: `${customWidth}x${customHeight}`,
+    };
+  }, [activePlacementId, customHeight, customWidth]);
   const currentUserEmail = authUser?.email ?? userId;
+  const activeCreativeMode = activePlacement.supportsCarousel ? (creativeModesByPlacement[activePlacement.id] ?? "single") : "single";
   const isAdmin = currentUserEmail.toLowerCase() === (process.env.NEXT_PUBLIC_ADMIN_EMAIL ?? "tolgar@sasmaz.digital").toLowerCase();
+  const filePreviewUrls = useMemo(() => Object.fromEntries(files.map((file) => [file.name, URL.createObjectURL(file)])), [files]);
+  const activeOutput = result?.outputs[activeOutputIndex] ?? null;
+  const activeOriginalUrl = activeOutput ? filePreviewUrls[activeOutput.source_name] : undefined;
+  const resizeSourceNames = useMemo(() => Array.from(new Set((result?.outputs ?? []).map((output) => output.source_name))).filter(Boolean), [result]);
+  const effectiveResizeSource = activeResizeSource || resizeSourceNames[0] || "";
+  const activeResizeOutput = result?.outputs.find((output) => output.placement_id === activePlacementId && output.source_name === effectiveResizeSource)
+    ?? result?.outputs.find((output) => output.source_name === effectiveResizeSource)
+    ?? activeOutput;
+  const carouselPreviewAssets = useMemo(() => {
+    const placementOutputs = (result?.outputs ?? [])
+      .filter((output) => output.placement_id === activePlacementId)
+      .map((output) => output.download_url)
+      .filter(Boolean);
+    if (placementOutputs.length > 1) return placementOutputs.slice(0, 6);
+    return files.map((file) => filePreviewUrls[file.name]).filter(Boolean).slice(0, 6);
+  }, [activePlacementId, filePreviewUrls, files, result?.outputs]);
+  const derivedPreviewMetadata = useMemo(
+    () => {
+      const base = derivePreviewMetadata(activePlacement, activeResizeOutput?.translated_text ?? copy, activeResizeOutput?.source_name, currentUserEmail);
+      const creativeMode = activePlacement.supportsCarousel ? (creativeModesByPlacement[activePlacement.id] ?? "single") : "single";
+      const orderedOutputs = (result?.outputs ?? []).filter((output) => output.placement_id === activePlacementId);
+      const unusedAssets = creativeMode === "single"
+        ? carouselPreviewAssets.slice(1)
+        : [];
+      const carouselActivationSource: PreviewMetadata["carouselActivationSource"] = !activePlacement.supportsCarousel
+        ? "forced_single"
+        : creativeMode === "carousel" && carouselPreviewAssets.length < 2
+          ? "invalid_missing_assets"
+          : "user_selected";
+      return {
+        ...base,
+        carouselAssets: carouselPreviewAssets,
+        carouselAssetsProvided: carouselPreviewAssets.length > 1,
+        activeSlideIndex: creativeMode === "carousel" && activeResizeOutput
+          ? Math.max(0, orderedOutputs.findIndex((output) => output.filename === activeResizeOutput.filename))
+          : 0,
+        creativeMode,
+        carouselActivationSource,
+        unusedAssets,
+      };
+    },
+    [activePlacement, activePlacementId, activeResizeOutput, carouselPreviewAssets, copy, creativeModesByPlacement, currentUserEmail, result?.outputs],
+  );
+  const [previewMetadata, setPreviewMetadata] = useState<PreviewMetadata>(derivedPreviewMetadata);
   const estimatedRunCredits = files.length === 0 ? 0 : mode === "adapt"
     ? estimateLocalizeCredits({ fileCount: files.length, languageCount: selectedLanguages.length, outputFormat: selectedFormat })
     : estimateResizeCredits({ fileCount: files.length, dimensionCount: selectedPlacementIds.length, outputFormat: selectedFormat });
   const editCredits = estimateEditCredits(mode);
   const generatedLocalizeCount = files.length * selectedLanguages.length;
   const outputFormatCost = selectedFormat.toLowerCase() === "pdf";
+  const outputUnitCount = files.length;
   const receiptLines: ReceiptLine[] = result
-    ? [{ label: "Modify edit", formula: `1 x ${editCredits}`, credits: editCredits }]
+    ? [{ label: "Modify edit", formula: `1 x ${formatCreditText(editCredits)}`, credits: editCredits }]
     : mode === "adapt"
       ? [
-        { label: "Files", formula: `${files.length} x ${creditPricing.localizeImage}`, credits: files.length * creditPricing.localizeImage },
-        { label: "Languages", formula: `${generatedLocalizeCount} x ${creditPricing.localizeLanguagePerGeneratedImage}`, credits: generatedLocalizeCount * creditPricing.localizeLanguagePerGeneratedImage },
-        { label: "Placements", formula: "Not used", credits: 0 },
-        { label: "Output", formula: outputFormatCost ? `${generatedLocalizeCount} x ${creditPricing.localizePdfOutput}` : `1 x ${creditPricing.localizeOutputFormat}`, credits: files.length === 0 ? 0 : outputFormatCost ? generatedLocalizeCount * creditPricing.localizePdfOutput : creditPricing.localizeOutputFormat },
+        { label: "Files", formula: `${files.length} x ${formatCreditText(creditPricing.localizeImage)}`, credits: files.length * creditPricing.localizeImage },
+        { label: "Languages", formula: `${generatedLocalizeCount} x ${formatCreditText(creditPricing.localizeLanguagePerGeneratedImage)}`, credits: generatedLocalizeCount * creditPricing.localizeLanguagePerGeneratedImage },
+        { label: "Output", formula: outputFormatCost ? `${outputUnitCount} x ${formatCreditText(creditPricing.localizePdfOutput)}` : `${outputUnitCount} x ${formatCreditText(creditPricing.localizeOutputFormat)}`, credits: files.length === 0 ? 0 : outputFormatCost ? outputUnitCount * creditPricing.localizePdfOutput : outputUnitCount * creditPricing.localizeOutputFormat },
       ]
       : [
-        { label: "Files", formula: `${files.length} x ${creditPricing.resizeImage}`, credits: files.length * creditPricing.resizeImage },
-        { label: "Placements", formula: `${selectedPlacementIds.length} x ${creditPricing.resizeDimension}`, credits: files.length === 0 ? 0 : selectedPlacementIds.length * creditPricing.resizeDimension },
-        { label: "Output", formula: outputFormatCost ? `${selectedPlacementIds.length} x ${creditPricing.resizePdfOutput}` : `1 x ${creditPricing.resizeOutputFormat}`, credits: files.length === 0 ? 0 : outputFormatCost ? selectedPlacementIds.length * creditPricing.resizePdfOutput : creditPricing.resizeOutputFormat },
+        { label: "Files", formula: `${files.length} x ${formatCreditText(creditPricing.resizeImage)}`, credits: files.length * creditPricing.resizeImage },
+        { label: "Placements", formula: `${selectedPlacementIds.length} x ${formatCreditText(creditPricing.resizeDimension)}`, credits: files.length === 0 ? 0 : selectedPlacementIds.length * creditPricing.resizeDimension },
+        { label: "Output", formula: outputFormatCost ? `${outputUnitCount} x ${formatCreditText(creditPricing.resizePdfOutput)}` : `${outputUnitCount} x ${formatCreditText(creditPricing.resizeOutputFormat)}`, credits: files.length === 0 ? 0 : outputFormatCost ? outputUnitCount * creditPricing.resizePdfOutput : outputUnitCount * creditPricing.resizeOutputFormat },
       ];
   const actionCredits = result ? editCredits : receiptLines.reduce((sum, line) => sum + line.credits, 0);
   const remainingAfterAction = credits - actionCredits;
   const canRun = files.length > 0 && (mode === "adapt" || selectedPlacementIds.length > 0) && (mode !== "adapt" || selectedLanguages.length > 0) && credits >= estimatedRunCredits;
-  const canApplyCurrentEdit = Boolean(result) && credits >= editCredits;
+  const canApplyCurrentEdit = Boolean(result && activeOutput) && credits >= editCredits;
   const previewDevice = activePlacement.device === "desktop" ? "desktop" : "mobile";
+
+  useEffect(() => () => {
+    Object.values(filePreviewUrls).forEach((url) => URL.revokeObjectURL(url));
+  }, [filePreviewUrls]);
 
   useEffect(() => {
     if (!supabase) return;
@@ -527,6 +1114,10 @@ export function AdaptDashboard() {
   }, [currentUserEmail, sessionToken, supabaseConfigured]);
 
   useEffect(() => {
+    setPreviewMetadata(derivedPreviewMetadata);
+  }, [derivedPreviewMetadata]);
+
+  useEffect(() => {
     const canvas = canvasRef.current;
     const ctx = canvas?.getContext("2d");
     if (!canvas || !ctx) return;
@@ -542,12 +1133,36 @@ export function AdaptDashboard() {
     setActivePlacementId(id);
   };
 
+  const updateCreativeMode = (placementId: string, mode: CreativeMode) => {
+    setCreativeModesByPlacement((current) => ({ ...current, [placementId]: mode }));
+  };
+
+  const removeFile = (name: string, size: number) => {
+    setFiles((current) => current.filter((file) => !(file.name === name && file.size === size)));
+    setResult(null);
+    setActiveOutputIndex(0);
+    setActiveResizeSource("");
+    setError(null);
+  };
+
   const switchMode = (next: Mode) => {
     setMode(next);
+    setShowAdminPanel(false);
     setCopy(sampleCopy[next]);
     setResult(null);
+    setActiveOutputIndex(0);
     setEditStatus(null);
     setError(null);
+  };
+
+  const selectOutput = (index: number) => {
+    if (!result?.outputs.length) return;
+    const nextIndex = (index + result.outputs.length) % result.outputs.length;
+    const output = result.outputs[nextIndex];
+    setActiveOutputIndex(nextIndex);
+    if (output.placement_id) setActivePlacementId(output.placement_id);
+    if (output.source_name) setActiveResizeSource(output.source_name);
+    if (mode === "adapt" && output.translated_text) setCopy(output.translated_text);
   };
 
   const runProcess = async (event: FormEvent<HTMLFormElement>) => {
@@ -562,14 +1177,34 @@ export function AdaptDashboard() {
     const formData = new FormData();
     files.forEach((file) => formData.append("files", file));
     formData.append("user_id", currentUserEmail);
+    formData.append("mode", mode === "adapt" ? "localize" : "resize");
     formData.append("target_languages", mode === "adapt" ? selectedLanguages.join(",") : "EN");
     formData.append("output_format", selectedFormat);
-    formData.append("placements", mode === "adapt" ? "native-custom" : selectedPlacementIds.join(","));
+    formData.append("placements", mode === "adapt" ? "custom-display" : selectedPlacementIds.join(","));
+    if (mode === "resize") {
+      const creativeModes = Object.fromEntries(
+        selectedPlacementIds.map((placementId) => [
+          placementId,
+          (placements.find((item) => item.id === placementId)?.supportsCarousel
+            ? creativeModesByPlacement[placementId] ?? "single"
+            : "single"),
+        ]),
+      );
+      formData.append("creative_modes", JSON.stringify(creativeModes));
+    }
+    if (mode === "resize" && selectedPlacementIds.includes("custom-display")) {
+      formData.append("custom_width", String(customWidth));
+      formData.append("custom_height", String(customHeight));
+    }
     try {
       const response = await fetch("/api/adapt", { method: "POST", body: formData, headers: sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error ?? "Pipeline failed.");
       setResult(payload);
+      if (payload.outputs?.[0]?.placement_id) setActivePlacementId(payload.outputs[0].placement_id);
+      if (payload.outputs?.[0]?.source_name) setActiveResizeSource(payload.outputs[0].source_name);
+      setActiveOutputIndex(0);
+      setCopy(payload.outputs?.[0]?.translated_text ?? sampleCopy[mode]);
       setCredits(Number(payload.credits_remaining ?? credits));
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Pipeline failed.");
@@ -586,10 +1221,29 @@ export function AdaptDashboard() {
       const response = await fetch("/api/edit", {
         method: "POST",
         headers: { "content-type": "application/json", ...(sessionToken ? { authorization: `Bearer ${sessionToken}` } : {}) },
-        body: JSON.stringify({ mode, credits: editCredits }),
+        body: JSON.stringify({
+          job_id: result?.job_id,
+          filename: activeOutput?.filename,
+          mode,
+          copy,
+          x,
+          y,
+          opacity,
+          scale,
+          fit,
+          preserve_bold: preserveBold,
+          mask_cleanup: maskCleanup,
+          fit_bounds: fitBounds,
+        }),
       });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error ?? "Unable to apply edit.");
+      if (payload.output && result) {
+        setResult({
+          ...result,
+          outputs: result.outputs.map((output) => output.filename === payload.output.filename ? payload.output : output),
+        });
+      }
       setCredits(Number(payload.credits_remaining ?? credits));
       setEditStatus(`${mode === "adapt" ? "Translation edit" : "Resize edit"} applied. ${editCredits} credits used.`);
     } catch (caught) {
@@ -650,10 +1304,29 @@ export function AdaptDashboard() {
       if (!response.ok) throw new Error(payload.error ?? "Unable to adjust credits.");
       setAdminStatus(`${payload.user_id} balance: ${payload.credits} credits`);
       if (payload.user_id === currentUserEmail.toLowerCase()) setCredits(Number(payload.credits));
+      setAdminUsers((current) => {
+        const next = current.filter((user) => user.user_id !== payload.user_id);
+        return [{ user_id: payload.user_id, credits: Number(payload.credits), updated_at: new Date().toISOString() }, ...next];
+      });
     } catch (caught) {
       setAdminStatus(caught instanceof Error ? caught.message : "Unable to adjust credits.");
     } finally {
       setIsAdminUpdating(false);
+    }
+  };
+
+  const openAdminPanel = async () => {
+    if (!isAdmin) return;
+    setShowCreditStore(false);
+    setShowAdminPanel(true);
+    setAdminStatus(null);
+    try {
+      const response = await fetch("/api/admin/users", { headers: sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error ?? "Unable to load users.");
+      setAdminUsers(payload.users ?? []);
+    } catch (caught) {
+      setAdminStatus(caught instanceof Error ? caught.message : "Unable to load users.");
     }
   };
 
@@ -662,6 +1335,57 @@ export function AdaptDashboard() {
   if (supabaseConfigured && !authUser) {
     return (
       <LandingPage authMode={authMode} setAuthMode={setAuthMode} authEmail={authEmail} setAuthEmail={setAuthEmail} authPassword={authPassword} setAuthPassword={setAuthPassword} authError={authError} authPending={authPending} submitAuth={submitAuth} />
+    );
+  }
+
+  if (showAdminPanel) {
+    return (
+      <main className="min-h-screen bg-[#faf9f5] text-[#151515]">
+        <header className="sticky top-0 z-20 border-b border-[#151515]/10 bg-[#faf9f5]/95 backdrop-blur">
+          <div className="mx-auto flex max-w-[1180px] flex-wrap items-center justify-between gap-3 px-4 py-4">
+            <Brand />
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold"><Sparkles className="h-4 w-4 text-[#0f766e]" />{credits} credits</div>
+              <button type="button" onClick={() => setShowAdminPanel(false)} className="h-10 rounded-md border border-[#151515]/15 bg-white px-4 text-sm font-semibold">Back to workspace</button>
+            </div>
+          </div>
+        </header>
+        <section className="mx-auto grid max-w-[1180px] gap-5 px-4 py-8 lg:grid-cols-[1.2fr_0.8fr]">
+          <section className="rounded-md border border-[#151515]/10 bg-white p-5">
+            <div className="flex items-center justify-between">
+              <div>
+                <p className="text-xs font-black uppercase text-[#0f766e]">Admin</p>
+                <h1 className="text-3xl font-black">Credit management</h1>
+              </div>
+              <Shield className="h-5 w-5 text-[#0f766e]" />
+            </div>
+            {adminStatus && <p className="mt-4 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{adminStatus}</p>}
+            <div className="mt-5 overflow-hidden rounded-md border border-[#151515]/10">
+              <div className="grid grid-cols-[1fr_auto_auto] gap-3 bg-[#faf9f5] px-4 py-2 text-xs font-semibold uppercase text-[#666]">
+                <span>User</span><span>Credits</span><span>Updated</span>
+              </div>
+              <div className="max-h-[460px] overflow-auto">
+                {adminUsers.map((user) => (
+                  <button key={user.user_id} type="button" onClick={() => setAdminTargetEmail(user.user_id)} className="grid w-full grid-cols-[1fr_auto_auto] gap-3 border-t border-[#151515]/10 px-4 py-3 text-left text-sm hover:bg-[#faf9f5]">
+                    <span className="truncate">{user.user_id}</span>
+                    <span className="font-semibold">{user.credits}</span>
+                    <span className="text-xs text-[#666]">{user.updated_at ? new Date(user.updated_at).toLocaleDateString() : "-"}</span>
+                  </button>
+                ))}
+                {adminUsers.length === 0 && <div className="px-4 py-6 text-sm text-[#666]">No users found yet.</div>}
+              </div>
+            </div>
+          </section>
+          <section className="rounded-md border border-[#151515]/10 bg-white p-5">
+            <p className="text-xs font-black uppercase text-[#0f766e]">Manual adjustment</p>
+            <h2 className="mt-2 text-2xl font-black">Add or deduct credits</h2>
+            <label className="mt-5 block text-sm font-semibold">User email<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="email" value={adminTargetEmail} onChange={(e) => setAdminTargetEmail(e.target.value)} /></label>
+            <label className="mt-4 block text-sm font-semibold">Credits<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="number" min="1" value={adminAmount} onChange={(e) => setAdminAmount(Number(e.target.value))} /></label>
+            <div className="mt-4 grid grid-cols-2 gap-1 rounded-md bg-[#f1eee6] p-1">{(["add", "deduct"] as const).map((action) => <button key={action} type="button" onClick={() => setAdminAction(action)} className={["h-10 rounded text-sm font-semibold capitalize", adminAction === action ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{action}</button>)}</div>
+            <button type="button" onClick={adjustCredits} disabled={isAdminUpdating} className="mt-5 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#0f766e] text-sm font-semibold text-white disabled:bg-[#d6d0c4]">{isAdminUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />}Apply credit change</button>
+          </section>
+        </section>
+      </main>
     );
   }
 
@@ -709,7 +1433,7 @@ export function AdaptDashboard() {
           <div className="flex items-center gap-3">
             <div className="flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold"><Sparkles className="h-4 w-4 text-[#0f766e]" />{credits} credits</div>
             <button type="button" onClick={() => setShowCreditStore(true)} className="flex h-10 items-center gap-2 rounded-md bg-[#151515] px-4 text-sm font-semibold text-white"><CreditCard className="h-4 w-4" />Buy credits</button>
-            <div className="flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold"><User className="h-4 w-4 text-[#0f766e]" /><span className="hidden max-w-[190px] truncate md:block">{currentUserEmail}</span></div>
+            <button type="button" onClick={openAdminPanel} className={["flex h-10 items-center gap-2 rounded-md border border-[#151515]/15 bg-white px-3 text-sm font-semibold", isAdmin ? "hover:border-[#0f766e]" : "cursor-default"].join(" ")}><User className="h-4 w-4 text-[#0f766e]" /><span className="hidden max-w-[190px] truncate md:block">{currentUserEmail}</span></button>
             {supabaseConfigured && <button type="button" onClick={() => supabase?.auth.signOut()} className="grid h-10 w-10 place-items-center rounded-md border border-[#151515]/15 bg-white" aria-label="Sign out"><LogOut className="h-4 w-4 text-[#0f766e]" /></button>}
           </div>
         </div>
@@ -729,18 +1453,37 @@ export function AdaptDashboard() {
               {mode === "adapt" ? (
                 <>
                   <textarea className="min-h-32 w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]" value={copy} onChange={(e) => setCopy(e.target.value)} aria-label="Manual translation override" />
-                  <div className="mt-3 grid grid-cols-2 gap-2">{[["Preserve bold", Type], ["Move text", Move], ["Mask cleanup", Scissors], ["Fit bounds", Frame]].map(([label, Icon]) => <button key={String(label)} type="button" className="flex h-11 items-center gap-2 rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 text-sm font-semibold"><Icon className="h-4 w-4 text-[#0f766e]" />{String(label)}</button>)}</div>
+                  {(() => {
+                    const actions: Array<{ label: string; icon: typeof Type; active: boolean; onClick: () => void }> = [
+                      { label: "Preserve bold", icon: Type, active: preserveBold, onClick: () => setPreserveBold((value) => !value) },
+                      { label: "Move text", icon: Move, active: true, onClick: () => { setX((value) => Math.min(24, value + 4)); setY((value) => Math.min(24, value + 4)); } },
+                      { label: "Mask cleanup", icon: Scissors, active: maskCleanup, onClick: () => setMaskCleanup((value) => !value) },
+                      { label: "Fit bounds", icon: Frame, active: fitBounds, onClick: () => setFitBounds((value) => !value) },
+                    ];
+                    return (
+                  <div className="mt-3 grid grid-cols-2 gap-2">
+                    {actions.map(({ label, icon: Icon, active, onClick }) => (
+                      <button key={label} type="button" onClick={onClick} className={["flex h-11 items-center gap-2 rounded-md border px-3 text-sm font-semibold", active ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5]"].join(" ")}>
+                        <Icon className="h-4 w-4 text-[#0f766e]" />{label}
+                      </button>
+                    ))}
+                  </div>
+                    );
+                  })()}
                 </>
               ) : (
                 <>
-                  <div className="grid grid-cols-3 gap-1 rounded-md bg-[#f1eee6] p-1">{(["contain", "cover", "fill"] as const).map((item) => <button key={item} type="button" onClick={() => setFit(item)} className={["h-9 rounded text-xs font-semibold capitalize", fit === item ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{item}</button>)}</div>
+                  <div className="rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3">
+                    <p className="text-xs font-semibold uppercase text-[#0f766e]">Frame mode</p>
+                    <div className="mt-2 grid grid-cols-3 gap-1 rounded-md bg-[#f1eee6] p-1">{(["contain", "cover", "fill"] as const).map((item) => <button key={item} type="button" onClick={() => setFit(item)} className={["h-9 rounded text-xs font-semibold capitalize", fit === item ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{item}</button>)}</div>
+                  </div>
                   <div className="mt-3 space-y-2 text-xs font-semibold text-[#555]"><label className="block">Creative scale<input className="w-full accent-[#0f766e]" type="range" min="70" max="140" value={scale} onChange={(e) => setScale(Number(e.target.value))} /></label></div>
                 </>
               )}
               <div className="mt-3 space-y-2 text-xs font-semibold text-[#555]">
-                <label className="block">Text X<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} /></label>
-                <label className="block">Text Y<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} /></label>
-                <label className="block">Mask opacity<input className="w-full accent-[#ee4d6a]" type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /></label>
+                <label className="block">{mode === "adapt" ? "Text X" : "Horizontal position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} /></label>
+                <label className="block">{mode === "adapt" ? "Text Y" : "Vertical position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} /></label>
+                {mode === "adapt" && <label className="block">Cleanup blend<input className="w-full accent-[#ee4d6a]" type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /></label>}
               </div>
               <canvas ref={canvasRef} width={300} height={150} className="mt-3 h-auto w-full rounded-md border border-[#151515]/10" />
               {editStatus && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{editStatus}</p>}
@@ -750,8 +1493,22 @@ export function AdaptDashboard() {
             <>
               <section className="rounded-md border border-[#151515]/10 bg-white p-4">
                 <div className="mb-4 flex items-center justify-between"><h2 className="font-semibold">Upload</h2><FileArchive className="h-4 w-4 text-[#0f766e]" /></div>
-                <label className="flex min-h-36 cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-[#151515]/30 bg-[#f6f1e7] p-4 text-center hover:border-[#0f766e]"><CloudUpload className="mb-3 h-8 w-8 text-[#0f766e]" /><span className="text-sm font-semibold">Upload PNG, WebP, JPG, JPEG, PDF or ZIP</span><span className="mt-1 text-xs text-[#595959]">Multiple files supported</span><input className="sr-only" multiple accept=".png,.webp,.jpg,.jpeg,.pdf,.zip" type="file" onChange={(e) => setFiles(Array.from(e.target.files ?? []))} /></label>
-                <div className="mt-3 space-y-2">{(files.length ? files : [{ name: "No files selected", size: 0 } as File]).map((file) => <div key={`${file.name}-${file.size}`} className="flex items-center justify-between rounded-md bg-[#faf9f5] px-3 py-2 text-xs"><span className="max-w-[220px] truncate">{file.name}</span><span>{file.size ? `${Math.ceil(file.size / 1024)} KB` : ""}</span></div>)}</div>
+                <label className="flex min-h-36 cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-[#151515]/30 bg-[#f6f1e7] p-4 text-center hover:border-[#0f766e]"><CloudUpload className="mb-3 h-8 w-8 text-[#0f766e]" /><span className="text-sm font-semibold">Upload PNG, WebP, JPG, JPEG, PDF or ZIP</span><span className="mt-1 text-xs text-[#595959]">Multiple files supported</span><input className="sr-only" multiple accept=".png,.webp,.jpg,.jpeg,.pdf,.zip" type="file" onChange={(e) => setFiles((current) => mergeFiles(current, Array.from(e.target.files ?? [])))} /></label>
+                <div className="mt-3 space-y-2">
+                  {(files.length ? files : [{ name: "No files selected", size: 0 } as File]).map((file) => (
+                    <div key={`${file.name}-${file.size}`} className="flex items-center justify-between rounded-md bg-[#faf9f5] px-3 py-2 text-xs">
+                      <span className="max-w-[190px] truncate">{file.name}</span>
+                      <div className="ml-3 flex items-center gap-2">
+                        <span>{file.size ? `${Math.ceil(file.size / 1024)} KB` : ""}</span>
+                        {file.size ? (
+                          <button type="button" onClick={() => removeFile(file.name, file.size)} className="rounded-full text-[#777] hover:text-[#ee4d6a]" aria-label={`${file.name} remove`}>
+                            <XCircle className="h-4 w-4" />
+                          </button>
+                        ) : null}
+                      </div>
+                    </div>
+                  ))}
+                </div>
               </section>
 
               {mode === "adapt" ? (
@@ -766,7 +1523,18 @@ export function AdaptDashboard() {
               ) : (
                 <>
                   <Collapsible title="Dimensions" icon={<Frame className="h-4 w-4 text-[#0f766e]" />}>
-                    <div className="max-h-[500px] space-y-4 overflow-auto pr-1">{grouped.map(([platform, items]) => <div key={platform}><p className="mb-2 text-xs font-semibold uppercase text-[#777]">{platform}</p><div className="space-y-2">{items.map((placement) => { const selected = selectedPlacementIds.includes(placement.id); return <label key={placement.id} className={["flex cursor-pointer items-center gap-3 rounded-md border px-3 py-2 text-sm", selected ? "border-[#0f766e] bg-[#e8f7f1]" : "border-[#151515]/10 bg-[#faf9f5]"].join(" ")}><input type="checkbox" className="h-4 w-4 accent-[#0f766e]" checked={selected} onChange={() => togglePlacement(placement.id)} /><span className="min-w-0 flex-1"><span className="block font-semibold">{placement.label}</span><span className="text-xs text-[#666]">{placement.ratio} / {placement.width}x{placement.height}</span></span></label>; })}</div></div>)}</div>
+                    <div className="max-h-[500px] space-y-4 overflow-auto pr-1">
+                      {grouped.map(([platform, items]) => <div key={platform}><p className="mb-2 text-xs font-semibold uppercase text-[#777]">{platform}</p><div className="space-y-2">{items.map((placement) => { const selected = selectedPlacementIds.includes(placement.id); return <label key={placement.id} className={["flex cursor-pointer items-center gap-3 rounded-md border px-3 py-2 text-sm", selected ? "border-[#0f766e] bg-[#e8f7f1]" : "border-[#151515]/10 bg-[#faf9f5]"].join(" ")}><input type="checkbox" className="h-4 w-4 accent-[#0f766e]" checked={selected} onChange={() => togglePlacement(placement.id)} /><span className="min-w-0 flex-1"><span className="block font-semibold">{placement.label}</span><span className="text-xs text-[#666]">{placement.id === "custom-display" ? `${placement.ratio} / ${customWidth}x${customHeight}` : `${placement.ratio} / ${placement.width}x${placement.height}`}</span></span></label>; })}</div></div>)}
+                      {selectedPlacementIds.includes("custom-display") && (
+                        <div className="rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3">
+                          <p className="text-xs font-semibold uppercase text-[#0f766e]">Custom aspect ratio</p>
+                          <div className="mt-3 grid grid-cols-2 gap-2">
+                            <label className="text-xs font-semibold text-[#555]">Width<input className="mt-1 h-10 w-full rounded-md border border-[#151515]/10 bg-white px-3 outline-none focus:border-[#0f766e]" type="number" min="64" value={customWidth} onChange={(e) => setCustomWidth(Number(e.target.value))} /></label>
+                            <label className="text-xs font-semibold text-[#555]">Height<input className="mt-1 h-10 w-full rounded-md border border-[#151515]/10 bg-white px-3 outline-none focus:border-[#0f766e]" type="number" min="64" value={customHeight} onChange={(e) => setCustomHeight(Number(e.target.value))} /></label>
+                          </div>
+                        </div>
+                      )}
+                    </div>
                   </Collapsible>
                   <Collapsible title="Output Format" icon={<Download className="h-4 w-4 text-[#0f766e]" />}>
                     <div className="grid grid-cols-5 gap-1 rounded-md bg-[#f1eee6] p-1">{outputFormats.map((format) => <button key={format} type="button" onClick={() => setSelectedFormat(format)} className={["h-9 rounded text-xs font-semibold", selectedFormat === format ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{format}</button>)}</div>
@@ -781,22 +1549,38 @@ export function AdaptDashboard() {
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#151515]/10 px-4 py-3">
             <div><h2 className="font-semibold">{mode === "adapt" ? "Localize Result" : "Resize Result"}</h2><p className="text-xs text-[#666]">{mode === "adapt" ? "Localized creative preview without platform template chrome" : "Selected placement rendered inside platform UI with safe-zone masks"}</p></div>
             {mode === "resize" && (
-              <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={activePlacementId} onChange={(e) => setActivePlacementId(e.target.value)}>
-                {(selectedPlacementIds.length ? placements.filter((placement) => selectedPlacementIds.includes(placement.id)) : placements).map((placement) => <option key={placement.id} value={placement.id}>{placement.platform} / {placement.label} / {placement.width}x{placement.height}</option>)}
-              </select>
+              <div className="flex flex-wrap items-center gap-2">
+                {resizeSourceNames.length > 1 && (
+                  <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={effectiveResizeSource} onChange={(e) => setActiveResizeSource(e.target.value)}>
+                    {resizeSourceNames.map((sourceName) => <option key={sourceName} value={sourceName}>{sourceName}</option>)}
+                  </select>
+                )}
+                <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={activePlacementId} onChange={(e) => setActivePlacementId(e.target.value)}>
+                  {(selectedPlacementIds.length ? placements.filter((placement) => selectedPlacementIds.includes(placement.id)) : placements).map((placement) => <option key={placement.id} value={placement.id}>{placement.platform} / {placement.label} / {placement.id === "custom-display" ? `${customWidth}x${customHeight}` : `${placement.width}x${placement.height}`}</option>)}
+                </select>
+              </div>
             )}
           </div>
           {mode === "adapt" ? (
-            <LocalizePreview imageUrl={result?.outputs[0]?.download_url} />
+            <LocalizePreview
+              originalUrl={activeOriginalUrl}
+              localizedUrl={activeOutput?.download_url}
+              originalLabel={activeOutput ? `ORIGINAL (${activeOutput.source_language ?? "Source"})` : "ORIGINAL"}
+              localizedLabel={activeOutput ? `LOCALIZED (${activeOutput.language ?? "Target"})` : "LOCALIZED"}
+              index={activeOutputIndex}
+              total={result?.outputs.length ?? 0}
+              onPrevious={() => selectOutput(activeOutputIndex - 1)}
+              onNext={() => selectOutput(activeOutputIndex + 1)}
+            />
           ) : (
-            <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} />
+            <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
           )}
           <div className="border-t border-[#151515]/10 p-4">
             {error && <div className="mb-3 flex gap-2 rounded-md bg-[#fff0d8] p-3 text-sm text-[#6b3b00]"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}
             {result ? (
               <div className="space-y-3 text-sm">
                 <div className="rounded-md bg-[#e8f7f1] p-3">Job {result.job_id} completed / {result.outputs.length} exports</div>
-                <div className="grid gap-2 sm:grid-cols-2">{result.outputs.slice(0, 6).map((output) => <a key={output.filename} href={output.download_url} className="flex items-center justify-between rounded-md border border-[#151515]/10 px-3 py-2 hover:border-[#0f766e]"><span className="truncate">{output.filename}</span><Download className="h-4 w-4 text-[#0f766e]" /></a>)}</div>
+                <div className="grid gap-2 sm:grid-cols-2">{result.outputs.map((output, index) => <div key={output.filename} className={["flex items-center justify-between rounded-md border px-3 py-2", activeOutput?.filename === output.filename ? "border-[#0f766e] bg-[#e8f7f1]" : "border-[#151515]/10"].join(" ")}><button type="button" onClick={() => selectOutput(index)} className="min-w-0 flex-1 text-left"><span className="block truncate font-semibold">{output.filename}</span><span className="text-[11px] text-[#666]">{output.source_name}{output.language ? ` / ${output.language}` : ""}</span></button><a href={output.download_url} className="ml-3 shrink-0 rounded-md border border-[#151515]/10 p-2 hover:border-[#0f766e]"><Download className="h-4 w-4 text-[#0f766e]" /></a></div>)}</div>
               </div>
             ) : (
               <p className="text-sm text-[#666]">{mode === "adapt" ? "Localized image output will appear here after translation and background restoration." : "Selected dimension exports and platform-specific previews will appear here."}</p>
@@ -811,16 +1595,16 @@ export function AdaptDashboard() {
               <div className="flex justify-between gap-3"><span>Operation</span><span className="font-semibold">{result ? "Modify result" : mode === "adapt" ? "Localize" : "Resize"}</span></div>
             </div>
             <div className="mt-3 space-y-2 text-sm">
-              {receiptLines.map((line) => (
+              {receiptLines.filter((line) => !(mode === "adapt" && line.label === "Placements")).map((line) => (
                 <div key={line.label} className="grid grid-cols-[1fr_auto] gap-3 rounded-md bg-[#faf9f5] px-3 py-2">
                   <span><span className="block font-semibold">{line.label}</span><span className="text-[11px] text-[#666]">{line.formula}</span></span>
-                  <span className="font-black">{line.credits}</span>
+                  <span className="font-black">{formatCreditText(line.credits)}</span>
                 </div>
               ))}
             </div>
             <div className="mt-3 border-t border-[#151515]/10 pt-3 text-sm">
-              <div className="flex justify-between gap-3 font-black"><span>Total Credits</span><span>{actionCredits}</span></div>
-              <div className={["mt-2 flex justify-between gap-3 font-semibold", remainingAfterAction < 0 ? "text-[#b42318]" : "text-[#0f766e]"].join(" ")}><span>Remaining Credits</span><span>{remainingAfterAction}</span></div>
+              <div className="flex justify-between gap-3 font-black"><span>Total Credits</span><span>{formatCreditText(actionCredits)}</span></div>
+              <div className={["mt-2 flex justify-between gap-3 font-semibold", remainingAfterAction < 0 ? "text-[#b42318]" : "text-[#0f766e]"].join(" ")}><span>Remaining Credits</span><span>{formatCreditText(remainingAfterAction)}</span></div>
             </div>
             <button type={result ? "button" : "submit"} onClick={result ? applyManualEdit : undefined} disabled={result ? isApplyingEdit || !canApplyCurrentEdit : isRunning || !canRun} className="mt-4 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#ee4d6a] text-sm font-semibold text-white disabled:bg-[#d6d0c4]">
               {result ? (isApplyingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />) : isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
@@ -828,23 +1612,22 @@ export function AdaptDashboard() {
             </button>
             {remainingAfterAction < 0 && <p className="mt-3 text-xs font-semibold text-[#b42318]">Add credits before starting this action.</p>}
           </section>
-
-          {isAdmin && (
-            <section className="rounded-md border border-[#151515]/10 bg-white p-4">
-              <div className="mb-3 flex items-center justify-between"><h2 className="font-semibold">Admin Credits</h2><Shield className="h-4 w-4 text-[#0f766e]" /></div>
-              <label className="block text-sm font-semibold">User email<input className="mt-1 h-10 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="email" value={adminTargetEmail} onChange={(e) => setAdminTargetEmail(e.target.value)} /></label>
-              <label className="mt-3 block text-sm font-semibold">Credits<input className="mt-1 h-10 w-full rounded-md border border-[#151515]/10 bg-[#faf9f5] px-3 outline-none focus:border-[#0f766e]" type="number" min="1" value={adminAmount} onChange={(e) => setAdminAmount(Number(e.target.value))} /></label>
-              <div className="mt-3 grid grid-cols-2 gap-1 rounded-md bg-[#f1eee6] p-1">{(["add", "deduct"] as const).map((action) => <button key={action} type="button" onClick={() => setAdminAction(action)} className={["h-9 rounded text-xs font-semibold capitalize", adminAction === action ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{action}</button>)}</div>
-              <button type="button" onClick={adjustCredits} disabled={isAdminUpdating} className="mt-3 flex h-10 w-full items-center justify-center gap-2 rounded-md bg-[#0f766e] text-sm font-semibold text-white disabled:bg-[#d6d0c4]">{isAdminUpdating ? <Loader2 className="h-4 w-4 animate-spin" /> : <Shield className="h-4 w-4" />}Apply credit change</button>
-              {adminStatus && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{adminStatus}</p>}
-            </section>
+          {mode === "resize" && (
+            <>
+              <CreativeModeControl placement={activePlacement} value={activeCreativeMode} onChange={(next) => updateCreativeMode(activePlacement.id, next)} />
+              <PreviewMetadataForm metadata={previewMetadata} onChange={setPreviewMetadata} />
+            </>
           )}
         </aside>
       </form>
 
       <footer className="mx-auto flex max-w-[1560px] flex-wrap items-center justify-between gap-3 border-t border-[#151515]/10 px-5 py-5 text-xs text-[#666]">
-        <span>Strictly stateless creative processing / temporary files auto-delete after 24h</span>
-        <nav className="flex gap-4"><a href="/terms" className="hover:text-[#151515]">Terms of Service</a><a href="/privacy" className="hover:text-[#151515]">Privacy GDPR/KVKK</a><a href="/refund" className="hover:text-[#151515]">Refund Policy</a><a href="mailto:support@adaptif.ai" className="hover:text-[#151515]">Support</a></nav>
+        <div className="space-y-1">
+          <p className="font-semibold text-[#151515]">SASMAZ DIGITAL SOLUTIONS / AdaptifAI - CREATIVE LOCALIZATION AND RESIZING TOOL</p>
+          <p>İbrahim Tolgar ŞAŞMAZ / 81543, Munich Germany / <a href="mailto:tolgar@sasmaz.digital" className="hover:text-[#151515]">tolgar@sasmaz.digital</a></p>
+          <p>Strictly stateless creative processing / temporary files auto-delete after 24h</p>
+        </div>
+        <nav className="flex gap-4"><a href="/terms" className="hover:text-[#151515]">Terms of Service</a><a href="/privacy" className="hover:text-[#151515]">Privacy GDPR/KVKK</a><a href="/refund" className="hover:text-[#151515]">Refund Policy</a><a href="mailto:tolgar@sasmaz.digital" className="hover:text-[#151515]">Support</a></nav>
       </footer>
       <ConsentBanner />
     </main>

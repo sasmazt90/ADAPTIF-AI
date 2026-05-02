@@ -6,11 +6,12 @@ import { getCredits, spendCredits } from "@/lib/credits";
 export const runtime = "nodejs";
 
 function estimateCredits(formData: FormData) {
-  const fileCount = Math.max(1, formData.getAll("files").length);
+  const fileCount = formData.getAll("files").length;
   const languages = String(formData.get("target_languages") ?? "EN").split(",").filter(Boolean);
   const placements = String(formData.get("placements") ?? "meta-stories").split(",").filter(Boolean);
   const outputFormat = String(formData.get("output_format") ?? "PNG");
-  const isLocalize = placements.length === 1 && placements[0] === "native-custom";
+  const mode = String(formData.get("mode") ?? "").toLowerCase();
+  const isLocalize = mode === "localize" || (placements.length === 1 && placements[0] === "native-custom");
 
   return isLocalize
     ? estimateLocalizeCredits({ fileCount, languageCount: languages.length, outputFormat })
