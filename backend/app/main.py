@@ -28,33 +28,49 @@ from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from pydantic import BaseModel, Field
 
-from app.localization_protocol import (
-    LocalizationStatus,
-    RiskLevel,
-    classify_creative_risk,
-    build_segmentation_masks,
-    analyze_depth_layering,
-    route_cleanup_providers,
-    determine_inpaint_strategy,
-    run_quality_gate,
-    run_provider_bakeoff,
-    compute_candidate_score,
-    iterative_copy_fit,
-    decide_render_strategy,
-    should_proceed_to_preview,
-    propagate_status,
-    run_localization_protocol,
-    CreativeRiskReport,
-    SegmentationMasks,
-    DepthLayeringReport,
-    QualityGateReport,
-    ProviderBakeoffReport,
-    CleanupCandidate,
-    PipelineResult,
-    CopyFitResult,
-    InpaintStrategy,
-    ProviderRoute,
-)
+try:
+    from app.localization_protocol import (
+        LocalizationStatus,
+        RiskLevel,
+        classify_creative_risk,
+        build_segmentation_masks,
+        analyze_depth_layering,
+        route_cleanup_providers,
+        determine_inpaint_strategy,
+        run_quality_gate,
+        run_provider_bakeoff,
+        compute_candidate_score,
+        iterative_copy_fit,
+        decide_render_strategy,
+        should_proceed_to_preview,
+        propagate_status,
+        run_localization_protocol,
+        CreativeRiskReport,
+        SegmentationMasks,
+        DepthLayeringReport,
+        QualityGateReport,
+        ProviderBakeoffReport,
+        CleanupCandidate,
+        PipelineResult,
+        CopyFitResult,
+        InpaintStrategy,
+        ProviderRoute,
+    )
+    _PROTOCOL_AVAILABLE = True
+except ImportError:
+    _PROTOCOL_AVAILABLE = False
+    # Stub fallbacks so the rest of main.py compiles without the protocol module
+    class RiskLevel:  # type: ignore[no-redef]
+        LOW = "LOW"; MEDIUM = "MEDIUM"; HIGH = "HIGH"
+        UNSUPPORTED_AUTO_CLEANUP = "UNSUPPORTED_AUTO_CLEANUP"
+        REJECT_LOW_CONFIDENCE = "REJECT_LOW_CONFIDENCE"
+        PACKAGING_PROTECTION_RISK = "PACKAGING_PROTECTION_RISK"
+    def route_cleanup_providers(risk_level, block=None, image_size=(0, 0)):  # type: ignore[no-redef]
+        return []
+    def run_localization_protocol(*a, **kw):  # type: ignore[no-redef]
+        return None
+    def run_quality_gate(*a, **kw):  # type: ignore[no-redef]
+        return None
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -8110,60 +8126,61 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             gated_background, cleanup_gate = enforce_localize_cleanup_gate(source_image, background, translated_blocks, cleanup_debug)
 
             # ─── Localization Protocol V2.2 ───
-            protocol_foreground_bbox = detect_foreground_bbox(source_image)
-            protocol_protected_mask = cleanup_debug.get("protectedRegionMaskImage")
-            protocol_result = run_localization_protocol(
-                image=source_image,
-                blocks=translated_blocks,
-                protected_region_mask=protocol_protected_mask if isinstance(protocol_protected_mask, Image.Image) else None,
-                foreground_bbox=protocol_foreground_bbox,
-                ocr_confidence=1.0,
-                cleanup_fn=None,  # Cleanup already executed above
-                ocr_fn=None,
-                job_dir=job_dir,
-            )
-            # Inject cleaned image into protocol for quality gate evaluation
-            if protocol_result.risk_report and protocol_result.risk_report.risk_level not in (
-                RiskLevel.REJECT_LOW_CONFIDENCE,
-                RiskLevel.UNSUPPORTED_AUTO_CLEANUP,
-                RiskLevel.PACKAGING_PROTECTION_RISK,
-            ):
-                protocol_result.cleaned_image = gated_background
-                # Run enhanced quality gate on the already-cleaned image
-                seg_masks = protocol_result.segmentation_masks
-                if seg_masks is not None:
-                    cleanup_mask_v2 = seg_masks.compute_cleanup_mask(source_image.size)
-                    source_words = []
-                    for blk in translated_blocks:
-                        if blk.translate and blk.surface == "overlay":
-                            source_words.extend(w.strip() for w in blk.text.split() if len(w.strip()) > 2)
-                    quality_gate_v2 = run_quality_gate(
-                        source_image=source_image,
-                        cleaned_image=gated_background,
+            if _PROTOCOL_AVAILABLE:
+                try:
+                    protocol_foreground_bbox = detect_foreground_bbox(source_image)
+                    protocol_protected_mask = cleanup_debug.get("protectedRegionMaskImage")
+                    protocol_result = run_localization_protocol(
+                        image=source_image,
                         blocks=translated_blocks,
-                        segmentation_masks=seg_masks,
-                        cleanup_mask=cleanup_mask_v2,
-                        source_words=source_words,
+                        protected_region_mask=protocol_protected_mask if isinstance(protocol_protected_mask, Image.Image) else None,
+                        foreground_bbox=protocol_foreground_bbox,
+                        ocr_confidence=1.0,
+                        cleanup_fn=None,
                         ocr_fn=None,
+                        job_dir=job_dir,
                     )
-                    protocol_result.quality_report = quality_gate_v2
-                    # Write enhanced reports
-                    try:
-                        (job_dir / "creativeRiskReport.json").write_text(
-                            json.dumps(protocol_result.risk_report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-                        )
-                        (job_dir / "qualityGateReport.json").write_text(
-                            json.dumps(quality_gate_v2.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-                        )
-                        if protocol_result.depth_report:
-                            (job_dir / "depthLayeringReport.json").write_text(
-                                json.dumps(protocol_result.depth_report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+                    if protocol_result is not None and protocol_result.risk_report and protocol_result.risk_report.risk_level not in (
+                        RiskLevel.REJECT_LOW_CONFIDENCE,
+                        RiskLevel.UNSUPPORTED_AUTO_CLEANUP,
+                        RiskLevel.PACKAGING_PROTECTION_RISK,
+                    ):
+                        protocol_result.cleaned_image = gated_background
+                        seg_masks = protocol_result.segmentation_masks
+                        if seg_masks is not None:
+                            cleanup_mask_v2 = seg_masks.compute_cleanup_mask(source_image.size)
+                            source_words = []
+                            for blk in translated_blocks:
+                                if blk.translate and blk.surface == "overlay":
+                                    source_words.extend(w.strip() for w in blk.text.split() if len(w.strip()) > 2)
+                            quality_gate_v2 = run_quality_gate(
+                                source_image=source_image,
+                                cleaned_image=gated_background,
+                                blocks=translated_blocks,
+                                segmentation_masks=seg_masks,
+                                cleanup_mask=cleanup_mask_v2,
+                                source_words=source_words,
+                                ocr_fn=None,
                             )
-                        (job_dir / "pipelineProtocolReport.json").write_text(
-                            json.dumps(protocol_result.to_reports_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
-                        )
-                    except Exception:
-                        pass
+                            protocol_result.quality_report = quality_gate_v2
+                            try:
+                                (job_dir / "creativeRiskReport.json").write_text(
+                                    json.dumps(protocol_result.risk_report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+                                )
+                                (job_dir / "qualityGateReport.json").write_text(
+                                    json.dumps(quality_gate_v2.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+                                )
+                                if protocol_result.depth_report:
+                                    (job_dir / "depthLayeringReport.json").write_text(
+                                        json.dumps(protocol_result.depth_report.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+                                    )
+                                (job_dir / "pipelineProtocolReport.json").write_text(
+                                    json.dumps(protocol_result.to_reports_dict(), ensure_ascii=False, indent=2), encoding="utf-8"
+                                )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             # ─── End Protocol V2.2 ───
 
             foreground_bbox = detect_foreground_bbox(source_image)
