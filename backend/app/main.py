@@ -212,6 +212,11 @@ class EditRequest(BaseModel):
     scale: int = 100
     fit: str = "cover"
     preserve_bold: bool = True
+    text_color: str = ""
+    font_size_scale: int = 100
+    text_italic: bool = False
+    text_underline: bool = False
+    text_strike: bool = False
     mask_cleanup: bool = True
     fit_bounds: bool = True
 
@@ -8881,6 +8886,59 @@ def split_editor_copy(copy: str, expected_count: int) -> list[str]:
     return parts[:expected_count]
 
 
+def _apply_style_overrides(blocks: list[TextBlock], edit: EditRequest) -> list[TextBlock]:
+    """Apply editor-level style overrides (color, font size scale) to translate blocks."""
+    overridden = []
+    for block in blocks:
+        if not block.translate:
+            overridden.append(block)
+            continue
+        updates: dict[str, Any] = {}
+        # Color override — only apply when a non-default colour was chosen
+        if edit.text_color and edit.text_color != "#111111":
+            updates["color"] = edit.text_color
+        # Font size scale (100 = no change)
+        if edit.font_size_scale != 100:
+            scale_factor = max(0.5, min(3.0, edit.font_size_scale / 100.0))
+            updates["font_size_estimate"] = max(8, int(round(block.font_size_estimate * scale_factor)))
+            updates["line_height_estimate"] = max(9, int(round(block.line_height_estimate * scale_factor)))
+        # Bold weight override
+        if edit.preserve_bold:
+            updates["font_weight"] = max(block.font_weight, 700)
+        overridden.append(block.model_copy(update=updates) if updates else block)
+    return overridden
+
+
+def _draw_text_decoration(
+    image: Image.Image,
+    blocks: list[TextBlock],
+    underline: bool,
+    strikethrough: bool,
+    x_offset: int = 0,
+    y_offset: int = 0,
+) -> Image.Image:
+    """Draw underline / strikethrough lines on top of rendered text."""
+    if not underline and not strikethrough:
+        return image
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    for block in blocks:
+        if not block.translate or not text_changed(block.text, block.translated_text):
+            continue
+        bx1, by1, bx2, by2 = block.bbox
+        bx1 += x_offset; bx2 += x_offset
+        by1 += y_offset; by2 += y_offset
+        fill = block.color if block.color.startswith("#") else "#111111"
+        lw = max(1, int(round((by2 - by1) * 0.05)))
+        if underline:
+            uy = by2 - lw
+            draw.rectangle((bx1, uy, bx2, uy + lw), fill=fill)
+        if strikethrough:
+            my = (by1 + by2) // 2
+            draw.rectangle((bx1, my, bx2, my + lw), fill=fill)
+    return out
+
+
 def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: EditRequest) -> OutputAsset:
     source_image = Image.open(asset_meta["source_path"]).convert("RGB")
     stored_blocks = [TextBlock.model_validate(block) for block in asset_meta.get("blocks", [])]
@@ -8901,10 +8959,12 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
         updated_blocks = stored_blocks
         editor_parts = [block.translated_text or block.text for block in stored_blocks if block.translate]
 
-    base = build_clean_background(source_image, updated_blocks, cleanup_strength=100 - max(0, min(90, edit.opacity)))
+    styled_blocks = _apply_style_overrides(updated_blocks, edit)
+    base = build_clean_background(source_image, styled_blocks, cleanup_strength=100 - max(0, min(90, edit.opacity)))
     if not edit.mask_cleanup:
         base = source_image
-    rendered = render_translated_text(base, updated_blocks, edit.x, edit.y, edit.preserve_bold, edit.fit_bounds)
+    rendered = render_translated_text(base, styled_blocks, edit.x, edit.y, edit.preserve_bold, edit.fit_bounds)
+    rendered = _draw_text_decoration(rendered, styled_blocks, edit.text_underline, edit.text_strike, edit.x, edit.y)
     output_path = job_dir / asset_meta["filename"]
     save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
     asset_meta["translated_text"] = "\n\n".join(editor_parts)

@@ -21,6 +21,11 @@ export async function POST(request: Request) {
       preserve_bold?: boolean;
       mask_cleanup?: boolean;
       fit_bounds?: boolean;
+      text_color?: string;
+      font_size_scale?: number;
+      text_italic?: boolean;
+      text_underline?: boolean;
+      text_strike?: boolean;
     };
 
     const mode = body.mode === "resize" ? "resize" : "adapt";
@@ -46,6 +51,11 @@ export async function POST(request: Request) {
         preserve_bold: body.preserve_bold ?? true,
         mask_cleanup: body.mask_cleanup ?? true,
         fit_bounds: body.fit_bounds ?? true,
+        text_color: body.text_color ?? "",
+        font_size_scale: Math.trunc(Number(body.font_size_scale ?? 100)),
+        text_italic: body.text_italic ?? false,
+        text_underline: body.text_underline ?? false,
+        text_strike: body.text_strike ?? false,
       }),
     });
 

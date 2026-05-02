@@ -16,7 +16,6 @@ import {
   Loader2,
   LogIn,
   LogOut,
-  Move,
   Scissors,
   Settings2,
   Shield,
@@ -26,7 +25,7 @@ import {
   XCircle,
 } from "lucide-react";
 import type { User as SupabaseUser } from "@supabase/supabase-js";
-import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useMemo, useState } from "react";
 import { creditPricing, estimateEditCredits, estimateLocalizeCredits, estimateResizeCredits } from "@/lib/credit-pricing";
 import { languages, outputFormats, Placement, placements } from "@/lib/placements";
 import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata as PlatformPreviewMetadata } from "@/lib/preview-templates";
@@ -991,6 +990,11 @@ export function AdaptDashboard() {
   const [y, setY] = useState(0);
   const [opacity, setOpacity] = useState(18);
   const [scale, setScale] = useState(100);
+  const [textColor, setTextColor] = useState("#111111");
+  const [fontSizeScale, setFontSizeScale] = useState(100);
+  const [textItalic, setTextItalic] = useState(false);
+  const [textUnderline, setTextUnderline] = useState(false);
+  const [textStrike, setTextStrike] = useState(false);
   const [fit, setFit] = useState<FitMode>("cover");
   const [customWidth, setCustomWidth] = useState(1200);
   const [customHeight, setCustomHeight] = useState(800);
@@ -1001,7 +1005,6 @@ export function AdaptDashboard() {
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [editStatus, setEditStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
   const activePlacement = useMemo(() => {
     const placement = placements.find((p) => p.id === activePlacementId) ?? placements[0];
     if (placement.id !== "custom-display") return placement;
@@ -1119,17 +1122,6 @@ export function AdaptDashboard() {
     setPreviewMetadata(derivedPreviewMetadata);
   }, [derivedPreviewMetadata]);
 
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext("2d");
-    if (!canvas || !ctx) return;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#f0d553"; ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = "#38b6a6"; ctx.fillRect(156, 0, 144, 150);
-    ctx.fillStyle = `rgba(255,77,77,${opacity / 100})`; ctx.fillRect(54, 38, 162, 42);
-    ctx.fillStyle = "#111"; ctx.font = "700 16px Arial"; ctx.fillText(cleanCopy(copy).slice(0, 28), 30 + x, 70 + y);
-  }, [copy, x, y, opacity]);
-
   const togglePlacement = (id: string) => {
     setSelectedPlacementIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
     setActivePlacementId(id);
@@ -1236,6 +1228,11 @@ export function AdaptDashboard() {
           preserve_bold: preserveBold,
           mask_cleanup: maskCleanup,
           fit_bounds: fitBounds,
+          text_color: textColor,
+          font_size_scale: fontSizeScale,
+          text_italic: textItalic,
+          text_underline: textUnderline,
+          text_strike: textStrike,
         }),
       });
       const payload = await response.json();
@@ -1462,45 +1459,119 @@ export function AdaptDashboard() {
 
           {result ? (
             <section className="rounded-md border border-[#151515]/10 bg-white p-4">
-              <div className="mb-3 flex items-center justify-between"><h2 className="font-semibold">{mode === "adapt" ? "Translation Editor" : "Resize Modifier"}</h2>{mode === "adapt" ? <Type className="h-4 w-4 text-[#0f766e]" /> : <Frame className="h-4 w-4 text-[#0f766e]" />}</div>
+              <div className="mb-4 flex items-center justify-between">
+                <h2 className="font-semibold">{mode === "adapt" ? "Text Editor" : "Resize Controls"}</h2>
+                {mode === "adapt" ? <Type className="h-4 w-4 text-[#0f766e]" /> : <Frame className="h-4 w-4 text-[#0f766e]" />}
+              </div>
+
               {mode === "adapt" ? (
                 <>
-                  <textarea className="min-h-32 w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]" value={copy} onChange={(e) => setCopy(e.target.value)} placeholder="Translated text will appear here after localization runs." aria-label="Manual translation override" />
-                  {(() => {
-                    const actions: Array<{ label: string; icon: typeof Type; active: boolean; onClick: () => void }> = [
-                      { label: "Preserve bold", icon: Type, active: preserveBold, onClick: () => setPreserveBold((value) => !value) },
-                      { label: "Move text", icon: Move, active: true, onClick: () => { setX((value) => Math.min(24, value + 4)); setY((value) => Math.min(24, value + 4)); } },
-                      { label: "Mask cleanup", icon: Scissors, active: maskCleanup, onClick: () => setMaskCleanup((value) => !value) },
-                      { label: "Fit bounds", icon: Frame, active: fitBounds, onClick: () => setFitBounds((value) => !value) },
-                    ];
-                    return (
-                  <div className="mt-3 grid grid-cols-2 gap-2">
-                    {actions.map(({ label, icon: Icon, active, onClick }) => (
-                      <button key={label} type="button" onClick={onClick} className={["flex h-11 items-center gap-2 rounded-md border px-3 text-sm font-semibold", active ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5]"].join(" ")}>
-                        <Icon className="h-4 w-4 text-[#0f766e]" />{label}
-                      </button>
-                    ))}
+                  {/* Translated text */}
+                  <textarea
+                    className="min-h-[88px] w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]"
+                    value={copy}
+                    onChange={(e) => setCopy(e.target.value)}
+                    placeholder="Translated text will appear here after localization runs."
+                    aria-label="Manual translation override"
+                  />
+
+                  {/* Typography */}
+                  <div className="mt-4">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Typography</p>
+                    <div className="flex items-center gap-1">
+                      <button type="button" title="Bold" onClick={() => setPreserveBold((v) => !v)} className={["h-8 w-8 rounded-md border text-sm font-black", preserveBold ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}>B</button>
+                      <button type="button" title="Italic" onClick={() => setTextItalic((v) => !v)} className={["h-8 w-8 rounded-md border text-sm italic font-semibold", textItalic ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}>I</button>
+                      <button type="button" title="Underline" onClick={() => setTextUnderline((v) => !v)} className={["h-8 w-8 rounded-md border text-sm font-semibold underline", textUnderline ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}>U</button>
+                      <button type="button" title="Strikethrough" onClick={() => setTextStrike((v) => !v)} className={["h-8 w-8 rounded-md border text-sm font-semibold line-through", textStrike ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}>S</button>
+                      <label title="Text color" className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-md border border-[#151515]/10 bg-[#faf9f5]">
+                        <input type="color" className="sr-only" value={textColor} onChange={(e) => setTextColor(e.target.value)} />
+                        <span className="h-4 w-4 rounded-sm border border-[#151515]/15 shadow-sm" style={{ background: textColor }} />
+                      </label>
+                      <div className="ml-auto flex items-center gap-1">
+                        <button type="button" onClick={() => setFontSizeScale((v) => Math.max(60, v - 10))} className="h-8 w-8 rounded-md border border-[#151515]/10 bg-[#faf9f5] text-base font-bold text-[#555]">−</button>
+                        <span className="w-10 text-center text-[11px] font-semibold text-[#555]">{fontSizeScale}%</span>
+                        <button type="button" onClick={() => setFontSizeScale((v) => Math.min(180, v + 10))} className="h-8 w-8 rounded-md border border-[#151515]/10 bg-[#faf9f5] text-base font-bold text-[#555]">+</button>
+                      </div>
+                    </div>
                   </div>
-                    );
-                  })()}
+
+                  {/* Text position */}
+                  <div className="mt-4">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Text position</p>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-3 shrink-0 text-[11px] font-bold text-[#555]">X</span>
+                        <input type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} className="flex-1 accent-[#0f766e]" />
+                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{x > 0 ? `+${x}` : x}px</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-3 shrink-0 text-[11px] font-bold text-[#555]">Y</span>
+                        <input type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} className="flex-1 accent-[#0f766e]" />
+                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{y > 0 ? `+${y}` : y}px</span>
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Cleanup options */}
+                  <div className="mt-4">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Cleanup</p>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-3 shrink-0 text-[10px] font-bold text-[#555]">α</span>
+                        <input type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} className="flex-1 accent-[#ee4d6a]" />
+                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{opacity}%</span>
+                      </div>
+                      <div className="flex gap-2">
+                        <button type="button" onClick={() => setMaskCleanup((v) => !v)} className={["flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-xs font-semibold", maskCleanup ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}><Scissors className="h-3 w-3" />Mask</button>
+                        <button type="button" onClick={() => setFitBounds((v) => !v)} className={["flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-xs font-semibold", fitBounds ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}><Frame className="h-3 w-3" />Fit bounds</button>
+                      </div>
+                    </div>
+                  </div>
                 </>
               ) : (
                 <>
-                  <div className="rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3">
-                    <p className="text-xs font-semibold uppercase text-[#0f766e]">Frame mode</p>
-                    <div className="mt-2 grid grid-cols-3 gap-1 rounded-md bg-[#f1eee6] p-1">{(["contain", "cover", "fill"] as const).map((item) => <button key={item} type="button" onClick={() => setFit(item)} className={["h-9 rounded text-xs font-semibold capitalize", fit === item ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{item}</button>)}</div>
+                  {/* Frame mode */}
+                  <div>
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Frame mode</p>
+                    <div className="grid grid-cols-3 gap-1 rounded-md bg-[#f1eee6] p-1">
+                      {(["contain", "cover", "fill"] as const).map((item) => (
+                        <button key={item} type="button" onClick={() => setFit(item)} className={["h-9 rounded text-xs font-semibold capitalize transition", fit === item ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}>{item}</button>
+                      ))}
+                    </div>
                   </div>
-                  <div className="mt-3 space-y-2 text-xs font-semibold text-[#555]"><label className="block">Creative scale<input className="w-full accent-[#0f766e]" type="range" min="70" max="140" value={scale} onChange={(e) => setScale(Number(e.target.value))} /></label></div>
+
+                  {/* Scale */}
+                  <div className="mt-4">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Content scale</p>
+                    <div className="flex items-center gap-2">
+                      <input type="range" min="70" max="140" value={scale} onChange={(e) => setScale(Number(e.target.value))} className="flex-1 accent-[#0f766e]" />
+                      <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{scale}%</span>
+                    </div>
+                  </div>
+
+                  {/* Content position */}
+                  <div className="mt-4">
+                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Content position</p>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="w-3 shrink-0 text-[11px] font-bold text-[#555]">X</span>
+                        <input type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} className="flex-1 accent-[#0f766e]" />
+                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{x > 0 ? `+${x}` : x}px</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="w-3 shrink-0 text-[11px] font-bold text-[#555]">Y</span>
+                        <input type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} className="flex-1 accent-[#0f766e]" />
+                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{y > 0 ? `+${y}` : y}px</span>
+                      </div>
+                    </div>
+                  </div>
                 </>
               )}
-              <div className="mt-3 space-y-2 text-xs font-semibold text-[#555]">
-                <label className="block">{mode === "adapt" ? "Text X offset" : "Horizontal position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{x > 0 ? `+${x}` : x}px</span></label>
-                <label className="block">{mode === "adapt" ? "Text Y offset" : "Vertical position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{y > 0 ? `+${y}` : y}px</span></label>
-                {mode === "adapt" && <label className="block">Cleanup blend<input className="w-full accent-[#ee4d6a]" type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{opacity}%</span></label>}
-              </div>
+
+              {/* Live preview */}
               {activeOutput?.download_url && (
-                <div className="mt-3 overflow-hidden rounded-md border border-[#151515]/10">
-                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase text-[#666]">Live preview</p>
+                <div className="mt-4 overflow-hidden rounded-md border border-[#151515]/10">
+                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#666]">Current output</p>
                   <div className="relative overflow-hidden bg-[#f6f1e7]" style={{ aspectRatio: "4/3" }}>
                     <img
                       src={activeOutput.download_url}
@@ -1511,8 +1582,9 @@ export function AdaptDashboard() {
                   </div>
                 </div>
               )}
+
               {editStatus && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{editStatus}</p>}
-              <p className="mt-3 text-[11px] text-[#999]">Adjust the sliders above, then click <span className="font-semibold text-[#555]">Apply edit</span> in the Action panel to regenerate the output.</p>
+              <p className="mt-3 text-[11px] text-[#999]">Adjust settings above, then click <span className="font-semibold text-[#555]">Apply edit</span> in the Action panel to regenerate.</p>
               <button type="button" onClick={() => { setResult(null); setEditStatus(null); setError(null); }} className="mt-3 h-10 w-full rounded-md border border-[#151515]/15 bg-white text-sm font-semibold">{mode === "adapt" ? "Localize another creative" : "Resize another creative"}</button>
             </section>
           ) : (
