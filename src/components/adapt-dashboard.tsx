@@ -1494,12 +1494,25 @@ export function AdaptDashboard() {
                 </>
               )}
               <div className="mt-3 space-y-2 text-xs font-semibold text-[#555]">
-                <label className="block">{mode === "adapt" ? "Text X" : "Horizontal position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} /></label>
-                <label className="block">{mode === "adapt" ? "Text Y" : "Vertical position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} /></label>
-                {mode === "adapt" && <label className="block">Cleanup blend<input className="w-full accent-[#ee4d6a]" type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /></label>}
+                <label className="block">{mode === "adapt" ? "Text X offset" : "Horizontal position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={x} onChange={(e) => setX(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{x > 0 ? `+${x}` : x}px</span></label>
+                <label className="block">{mode === "adapt" ? "Text Y offset" : "Vertical position"}<input className="w-full accent-[#0f766e]" type="range" min="-24" max="24" value={y} onChange={(e) => setY(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{y > 0 ? `+${y}` : y}px</span></label>
+                {mode === "adapt" && <label className="block">Cleanup blend<input className="w-full accent-[#ee4d6a]" type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} /><span className="text-[10px] font-normal text-[#999]">{opacity}%</span></label>}
               </div>
-              <canvas ref={canvasRef} width={300} height={150} className="mt-3 h-auto w-full rounded-md border border-[#151515]/10" />
+              {activeOutput?.download_url && (
+                <div className="mt-3 overflow-hidden rounded-md border border-[#151515]/10">
+                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase text-[#666]">Live preview</p>
+                  <div className="relative overflow-hidden bg-[#f6f1e7]" style={{ aspectRatio: "4/3" }}>
+                    <img
+                      src={activeOutput.download_url}
+                      alt="Output preview"
+                      className="h-full w-full object-contain transition-transform duration-150"
+                      style={{ transform: `translate(${x}px, ${y}px) scale(${mode === "resize" ? scale / 100 : 1})`, opacity: mode === "adapt" ? 1 - opacity / 200 : 1 }}
+                    />
+                  </div>
+                </div>
+              )}
               {editStatus && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{editStatus}</p>}
+              <p className="mt-3 text-[11px] text-[#999]">Adjust the sliders above, then click <span className="font-semibold text-[#555]">Apply edit</span> in the Action panel to regenerate the output.</p>
               <button type="button" onClick={() => { setResult(null); setEditStatus(null); setError(null); }} className="mt-3 h-10 w-full rounded-md border border-[#151515]/15 bg-white text-sm font-semibold">{mode === "adapt" ? "Localize another creative" : "Resize another creative"}</button>
             </section>
           ) : (
