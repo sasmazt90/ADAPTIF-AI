@@ -4206,6 +4206,60 @@ def build_openai_edit_mask(editable_mask: Image.Image) -> Image.Image:
     return rgba_mask
 
 
+def _sanitize_inpaint_result(
+    source: Image.Image,
+    composited: Image.Image,
+    mask: Image.Image,
+    divergence_threshold: float = 60.0,
+) -> Image.Image:
+    """
+    Detect and suppress AI hallucination in inpainted regions.
+
+    Compares the color distribution of the inpainted area (masked region in
+    `composited`) to the surrounding border pixels in `source`. When the
+    inpainted result diverges dramatically (hallucinated imagery, wrong product
+    content, etc.) it blends the inpainted region back toward the local median
+    background colour, suppressing the artifact while keeping clean inpaints
+    unchanged.
+    """
+    try:
+        mask_arr = np.array(mask.convert("L"))
+        mask_bool = mask_arr > 16
+        if not np.any(mask_bool):
+            return composited
+
+        src_arr = np.array(source, dtype=np.float32)
+        comp_arr = np.array(composited, dtype=np.float32)
+
+        # Dilate the mask to get a thin border strip in the source (non-masked)
+        border_dilated = np.array(
+            mask.filter(ImageFilter.MaxFilter(31)).convert("L")
+        ) > 16
+        border_only = border_dilated & ~mask_bool
+
+        if not np.any(border_only):
+            return composited
+
+        border_colors = src_arr[border_only]
+        border_median = np.median(border_colors, axis=0)
+
+        inpainted_colors = comp_arr[mask_bool]
+        inpainted_mean = np.mean(inpainted_colors, axis=0)
+        divergence = float(np.linalg.norm(inpainted_mean - border_median))
+
+        if divergence <= divergence_threshold:
+            return composited
+
+        # Blend inpainted region back toward border median; stronger blend the
+        # greater the divergence, capped at 0.85 to leave some inpaint detail.
+        blend = min(0.85, (divergence - divergence_threshold) / 80.0)
+        fill = np.full_like(comp_arr, border_median)
+        comp_arr[mask_bool] = (1.0 - blend) * comp_arr[mask_bool] + blend * fill[mask_bool]
+        return Image.fromarray(comp_arr.clip(0, 255).astype(np.uint8))
+    except Exception:
+        return composited
+
+
 def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image, prompt: str) -> dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
         return {"success": False, "provider": "openai", "failureReason": "openai_not_configured"}
@@ -4241,6 +4295,9 @@ def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image
                     result = result.resize(image.size, Image.Resampling.LANCZOS)
                 feather = editable_mask.convert("L")
                 composited = Image.composite(result, image.convert("RGB"), feather)
+                # Hallucination safeguard: if AI result diverges dramatically from surrounding
+                # background in the masked region, blend back toward a local median fill.
+                composited = _sanitize_inpaint_result(image.convert("RGB"), composited, feather)
                 return {
                     "success": True,
                     "provider": "openai",
@@ -5040,9 +5097,10 @@ def attempt_block_level_generative_cleanup(
         }
 
     prompt = (
-        "Remove all visible headline text inside the transparent mask. Reconstruct the original background naturally as if the text was never there. "
-        "Preserve the person, product, shoe, packaging, lighting, shadows, fabric, curtain texture and all non-text details. "
-        "Do not add any text. Do not blur or overlay panels. Return only the clean background."
+        "Remove only the visible text inside the transparent mask area. "
+        "Fill it with the exact same background colour and texture that borders the mask — do NOT generate new images, products, labels, or patterns. "
+        "Preserve everything outside the mask exactly as-is. "
+        "Do not add text. Do not blur. Return only the clean continuation of the existing background."
     )
     original_crop = image.crop(region["expanded_box"]).convert("RGB")
     local_mask = region["mask"].convert("L")
@@ -5215,10 +5273,12 @@ def apply_large_block_primary_cleanup(
         }
 
     prompt = (
-        "Remove all text from the masked region and reconstruct the background naturally. "
-        "Do not blur, do not create patches, do not leave any text artifacts. "
-        "Preserve all objects, people, product, lighting, and textures exactly. "
-        "The result must look like the text was never there."
+        "Remove only the text from the masked region and fill it with the exact same "
+        "background colour, texture and pattern that immediately surrounds that area. "
+        "Do NOT generate new imagery, products, labels, patterns, or objects. "
+        "Do NOT change anything outside the masked area. "
+        "Do not blur, smear, or leave ghosting. "
+        "The result must look like the text was never there — only the background visible."
     )
     dilation_attempts = sorted({max(8, base_dilation_px - 3), base_dilation_px, min(24, base_dilation_px + 3)})
     attempt_summaries: list[dict[str, Any]] = []

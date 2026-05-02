@@ -1019,7 +1019,7 @@ export function AdaptDashboard() {
   }, [activePlacementId, customHeight, customWidth]);
   const currentUserEmail = authUser?.email ?? userId;
   const activeCreativeMode = activePlacement.supportsCarousel ? (creativeModesByPlacement[activePlacement.id] ?? "single") : "single";
-  const isAdmin = currentUserEmail.toLowerCase() === (process.env.NEXT_PUBLIC_ADMIN_EMAIL ?? "tolgar@sasmaz.digital").toLowerCase();
+  const isAdmin = currentUserEmail.trim().toLowerCase() === (process.env.NEXT_PUBLIC_ADMIN_EMAIL ?? "tolgar@sasmaz.digital").trim().toLowerCase();
   const filePreviewUrls = useMemo(() => Object.fromEntries(files.map((file) => [file.name, URL.createObjectURL(file)])), [files]);
   const activeOutput = result?.outputs[activeOutputIndex] ?? null;
   const activeOriginalUrl = activeOutput ? filePreviewUrls[activeOutput.source_name] : undefined;
@@ -1696,9 +1696,7 @@ export function AdaptDashboard() {
           ) : (
             <div className="flex items-center justify-center py-6">
               {result ? (
-                <div style={{ transform: "scale(0.72)", transformOrigin: "top center" }} className="w-full">
-                  <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
-                </div>
+                <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
               ) : (
                 <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
                   <Frame className="h-12 w-12 opacity-30" />
