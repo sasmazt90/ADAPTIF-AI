@@ -7777,30 +7777,24 @@ def smart_resize_image(
                 has_translatable = any(b.translate for b in text_blocks)
 
         # ── Step 3: Detect foreground / subject region ───────────────────
-        # Use the visual-subject-only bbox (colour distance from border) rather
-        # than the union of text + subject.  For landscape ads with text on the
-        # right, the union covers the full image; the visual subject bbox keeps
-        # the foreground crop tight around the product / person.
+        # Use the visual-subject-only bbox (colour distance from border).
+        # build_resize_focus_bbox includes the union of text + subject, which
+        # causes the entire image to be treated as "foreground" in landscape ads
+        # with text on the right — and that text ends up visible in the result.
         subject_bbox = detect_foreground_bbox(working_source)
         if subject_bbox is None:
             subject_bbox = (0, 0, working_source.width, working_source.height)
-        # If text blocks overlap with the subject bbox, shrink the subject bbox
-        # to exclude text-only regions where possible.
-        if text_blocks:
-            text_union = union_bbox([b.bbox for b in text_blocks if b.translate])
-            if text_union is not None:
-                tx0, ty0, tx1, ty1 = text_union
-                sx0, sy0, sx1, sy1 = subject_bbox
-                # If text is mostly on the right half, shrink right edge
-                mid_x = working_source.width // 2
-                if tx0 > mid_x and tx0 < sx1:
-                    subject_bbox = (sx0, sy0, min(sx1, tx0), sy1)
-                # If text is mostly on the left half, shrink left edge
-                elif tx1 < mid_x and tx1 > sx0:
-                    subject_bbox = (max(sx0, tx1), sy0, sx1, sy1)
-            # Ensure minimum 10% of image width
-            if subject_bbox[2] - subject_bbox[0] < working_source.width * 0.10:
-                subject_bbox = (0, 0, working_source.width, working_source.height)
+        # Pad the subject bbox modestly (already done in build_resize_focus_bbox
+        # but we skip that here; add a smaller padding to avoid clipping edges).
+        _sbx0, _sby0, _sbx1, _sby1 = subject_bbox
+        _pad_x = max(16, int((_sbx1 - _sbx0) * 0.08))
+        _pad_y = max(16, int((_sby1 - _sby0) * 0.08))
+        subject_bbox = (
+            max(0, _sbx0 - _pad_x),
+            max(0, _sby0 - _pad_y),
+            min(working_source.width, _sbx1 + _pad_x),
+            min(working_source.height, _sby1 + _pad_y),
+        )
         focus_bbox = subject_bbox
         fx0, fy0, fx1, fy1 = focus_bbox
         fg_w = fx1 - fx0
@@ -7856,7 +7850,9 @@ def smart_resize_image(
         # Hard cap: don't upscale beyond 2.2× (avoids extreme pixellation)
         fg_scale = min(fg_scale, 2.2)
 
-        fg_crop = working_source.crop(focus_bbox)
+        # Crop from bg_base (text removed) rather than working_source so that
+        # text in the foreground area doesn't reappear after the paste.
+        fg_crop = bg_base.crop(focus_bbox)
         new_fg_w = max(1, int(fg_w * fg_scale))
         new_fg_h = max(1, int(fg_h * fg_scale))
         fg_resized = fg_crop.resize((new_fg_w, new_fg_h), Image.Resampling.LANCZOS)
