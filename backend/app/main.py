@@ -7074,6 +7074,35 @@ def render_translated_text(
             overlay_bbox = bbox
             output = build_overlay_backdrop(output, overlay_bbox, style=overlay_style or {"type": "overlay_panel"})
             draw = ImageDraw.Draw(output)
+        # When background cleanup failed (confidence near 0), paint a local
+        # background-matched patch before rendering text so the translated
+        # text is not drawn on top of the original un-cleaned text.
+        if block.cleanup_confidence < 0.10:
+            try:
+                bx0, by0, bx1, by1 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
+                img_w, img_h = output.size
+                # Expand patch slightly to cover nearby design elements (brackets etc.)
+                pad = max(12, int(min(bx1 - bx0, by1 - by0) * 0.18))
+                px0 = max(0, bx0 - pad)
+                py0 = max(0, by0 - pad)
+                px1 = min(img_w, bx1 + pad)
+                py1 = min(img_h, by1 + pad)
+                # Sample a border ring around the patch for median background colour
+                arr = np.array(output.convert("RGB"), dtype=np.float32)
+                ring_w = max(4, pad)
+                ring_mask = np.zeros((img_h, img_w), dtype=bool)
+                # top/bottom/left/right strips outside the patch
+                ring_mask[max(0, py0 - ring_w):py0, px0:px1] = True
+                ring_mask[py1:min(img_h, py1 + ring_w), px0:px1] = True
+                ring_mask[py0:py1, max(0, px0 - ring_w):px0] = True
+                ring_mask[py0:py1, px1:min(img_w, px1 + ring_w)] = True
+                if np.any(ring_mask):
+                    bg_color = tuple(int(v) for v in np.median(arr[ring_mask], axis=0))
+                else:
+                    bg_color = (255, 255, 255)
+                draw.rectangle([px0, py0, px1, py1], fill=bg_color)
+            except Exception:
+                pass
         candidate_choice = select_translation_candidate_for_layout(draw, block, bbox)
         selected_text = candidate_choice["text"]
         selected_spans = candidate_choice["spans"]
