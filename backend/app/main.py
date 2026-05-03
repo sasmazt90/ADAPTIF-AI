@@ -4227,12 +4227,14 @@ def _sanitize_inpaint_result(
     """
     Detect and suppress AI hallucination in inpainted regions.
 
-    Compares the color distribution of the inpainted area (masked region in
-    `composited`) to the surrounding border pixels in `source`. When the
-    inpainted result diverges dramatically (hallucinated imagery, wrong product
-    content, etc.) it blends the inpainted region back toward the local median
-    background colour, suppressing the artifact while keeping clean inpaints
-    unchanged.
+    Uses two independent signals:
+    1. Color divergence: inpainted mean color vs surrounding border median.
+    2. Edge-density ratio: if the inpainted region has significantly more
+       edges/structure than the surrounding source area, the model hallucinated
+       new imagery (icons, objects, text) — suppressed even when colours match.
+
+    When either signal triggers, the inpainted region is blended back toward
+    the local median background color.
     """
     try:
         mask_arr = np.array(mask.convert("L"))
@@ -4257,14 +4259,34 @@ def _sanitize_inpaint_result(
 
         inpainted_colors = comp_arr[mask_bool]
         inpainted_mean = np.mean(inpainted_colors, axis=0)
-        divergence = float(np.linalg.norm(inpainted_mean - border_median))
+        color_divergence = float(np.linalg.norm(inpainted_mean - border_median))
 
-        if divergence <= divergence_threshold:
+        # ── Edge-density hallucination detection ─────────────────────────────
+        # Compute per-channel gradient magnitude (Sobel-like) for both the
+        # composited inpainted region and the source border ring.
+        def _edge_density(arr_f32: np.ndarray, region_bool: np.ndarray) -> float:
+            gray = arr_f32[..., 0] * 0.299 + arr_f32[..., 1] * 0.587 + arr_f32[..., 2] * 0.114
+            gy = np.abs(np.diff(gray, axis=0, prepend=gray[:1, :]))
+            gx = np.abs(np.diff(gray, axis=1, prepend=gray[:, :1]))
+            grad = np.sqrt(gy ** 2 + gx ** 2)
+            vals = grad[region_bool]
+            return float(vals.mean()) if vals.size > 0 else 0.0
+
+        inpaint_edge = _edge_density(comp_arr, mask_bool)
+        border_edge = _edge_density(src_arr, border_only)
+        # Ratio > 2.5 means the inpainted area has 2.5× more structure than
+        # the surrounding area — a strong hallucination signal.
+        edge_ratio = inpaint_edge / max(border_edge, 1.0)
+        structural_hallucination = edge_ratio > 2.5 and inpaint_edge > 8.0
+
+        if color_divergence <= divergence_threshold and not structural_hallucination:
             return composited
 
-        # Blend inpainted region back toward border median; stronger blend the
-        # greater the divergence, capped at 0.85 to leave some inpaint detail.
-        blend = min(0.85, (divergence - divergence_threshold) / 80.0)
+        # Determine blend strength from the dominant signal
+        color_blend = (color_divergence - divergence_threshold) / 80.0 if color_divergence > divergence_threshold else 0.0
+        edge_blend = min(0.90, (edge_ratio - 2.5) / 4.0) if structural_hallucination else 0.0
+        blend = min(0.92, max(color_blend, edge_blend))
+
         fill = np.full_like(comp_arr, border_median)
         comp_arr[mask_bool] = (1.0 - blend) * comp_arr[mask_bool] + blend * fill[mask_bool]
         return Image.fromarray(comp_arr.clip(0, 255).astype(np.uint8))
@@ -7726,7 +7748,31 @@ def smart_resize_image(
                 has_translatable = any(b.translate for b in text_blocks)
 
         # ── Step 3: Detect foreground / subject region ───────────────────
-        focus_bbox = build_resize_focus_bbox(working_source)
+        # Use the visual-subject-only bbox (colour distance from border) rather
+        # than the union of text + subject.  For landscape ads with text on the
+        # right, the union covers the full image; the visual subject bbox keeps
+        # the foreground crop tight around the product / person.
+        subject_bbox = detect_foreground_bbox(working_source)
+        if subject_bbox is None:
+            subject_bbox = (0, 0, working_source.width, working_source.height)
+        # If text blocks overlap with the subject bbox, shrink the subject bbox
+        # to exclude text-only regions where possible.
+        if text_blocks:
+            text_union = union_bbox([b.bbox for b in text_blocks if b.translate])
+            if text_union is not None:
+                tx0, ty0, tx1, ty1 = text_union
+                sx0, sy0, sx1, sy1 = subject_bbox
+                # If text is mostly on the right half, shrink right edge
+                mid_x = working_source.width // 2
+                if tx0 > mid_x and tx0 < sx1:
+                    subject_bbox = (sx0, sy0, min(sx1, tx0), sy1)
+                # If text is mostly on the left half, shrink left edge
+                elif tx1 < mid_x and tx1 > sx0:
+                    subject_bbox = (max(sx0, tx1), sy0, sx1, sy1)
+            # Ensure minimum 10% of image width
+            if subject_bbox[2] - subject_bbox[0] < working_source.width * 0.10:
+                subject_bbox = (0, 0, working_source.width, working_source.height)
+        focus_bbox = subject_bbox
         fx0, fy0, fx1, fy1 = focus_bbox
         fg_w = fx1 - fx0
         fg_h = fy1 - fy0
