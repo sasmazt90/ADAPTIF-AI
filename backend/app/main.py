@@ -7811,6 +7811,30 @@ def smart_resize_image(
         else:
             bg_base = working_source
 
+        # ── Step 4a: Fast OpenCV inpaint fallback if bg_base is still the
+        #            original (cleanup pipeline failed or was skipped) ────────
+        # Even if no translatable blocks were found by the full pipeline, we
+        # still want to remove any text OCR detected so it doesn't appear in
+        # the scaled background or foreground crop.
+        if bg_base is working_source and text_blocks:
+            try:
+                import cv2
+                arr = np.array(working_source.convert("RGB"))
+                mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
+                for blk in text_blocks:
+                    bx0, by0, bx1, by1 = [int(v) for v in blk.bbox]
+                    pad = max(6, int(min(bx1 - bx0, by1 - by0) * 0.12))
+                    mask[
+                        max(0, by0 - pad):min(arr.shape[0], by1 + pad),
+                        max(0, bx0 - pad):min(arr.shape[1], bx1 + pad),
+                    ] = 255
+                if mask.any():
+                    inpainted = cv2.inpaint(arr, mask, inpaintRadius=16, flags=cv2.INPAINT_TELEA)
+                    bg_base = Image.fromarray(inpainted)
+                    print(f"[smart_resize_image] fast-inpaint fallback: removed {mask.any(1).sum()} rows of text", flush=True)
+            except Exception as _e:
+                print(f"[smart_resize_image] fast-inpaint fallback failed: {_e}", flush=True)
+
         # ── Step 4b: Scale background to COVER the target canvas ─────────
         bg_color = _sample_edge_color(bg_base)
         canvas = Image.new("RGB", (tgt_w, tgt_h), bg_color)
