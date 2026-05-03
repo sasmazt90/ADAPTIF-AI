@@ -7074,10 +7074,10 @@ def render_translated_text(
             overlay_bbox = bbox
             output = build_overlay_backdrop(output, overlay_bbox, style=overlay_style or {"type": "overlay_panel"})
             draw = ImageDraw.Draw(output)
-        # When background cleanup failed (confidence near 0), paint a local
-        # background-matched patch before rendering text so the translated
-        # text is not drawn on top of the original un-cleaned text.
-        if block.cleanup_confidence < 0.10:
+        # When background cleanup was incomplete (confidence below threshold),
+        # paint a local background-matched patch before rendering text so the
+        # translated text is not drawn on top of residual original text.
+        if block.cleanup_confidence < 0.70:
             try:
                 bx0, by0, bx1, by1 = int(bbox[0]), int(bbox[1]), int(bbox[2]), int(bbox[3])
                 img_w, img_h = output.size
