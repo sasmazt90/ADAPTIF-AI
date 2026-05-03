@@ -633,7 +633,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
     );
   } else if (template.id === "instagram_story") {
     shell = (
-      <div className="relative mx-auto w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl">
+      <div className="relative mx-auto w-full max-w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl">
         <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 5 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
         <div className="absolute left-4 right-4 top-6 z-20 flex items-center justify-between text-white">
           <div className="flex items-center gap-2"><div className="grid h-8 w-8 place-items-center rounded-full bg-white/20 text-xs font-black">{metadata.brandName.slice(0, 1)}</div><div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-white/70">{metadata.sponsorLabel}</p></div></div>
@@ -645,7 +645,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
     );
   } else if (template.id === "instagram_reels") {
     shell = (
-      <div className="relative mx-auto w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl text-white">
+      <div className="relative mx-auto w-full max-w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl text-white">
         <div className="relative">{asset}</div>
         <div className="absolute right-3 top-[34%] z-20 grid gap-3 text-center text-[9px] font-semibold">
           {["♥", "💬", "↗", "⋯"].map((item, index) => <span key={`${item}-${index}`} className="grid h-10 w-10 place-items-center rounded-full bg-black/38 backdrop-blur">{item}</span>)}
@@ -1694,7 +1694,7 @@ export function AdaptDashboard() {
               onNext={() => selectOutput(activeOutputIndex + 1)}
             />
           ) : (
-            <div className="flex items-center justify-center py-6">
+            <div className="flex items-center justify-center overflow-x-auto py-6">
               {result ? (
                 <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
               ) : (

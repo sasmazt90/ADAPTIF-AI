@@ -353,12 +353,24 @@ def get_huggingface_cleanup_session() -> requests.Session:
 
 async def persist_uploads(files: list[UploadFile], job_dir: Path) -> list[Path]:
     saved: list[Path] = []
+    seen_names: set[str] = set()
     for upload in files:
         suffix = Path(upload.filename or "").suffix.lower()
         if suffix not in SUPPORTED_UPLOAD_EXTENSIONS:
             raise HTTPException(status_code=400, detail=f"Unsupported file type: {upload.filename}")
 
-        target = job_dir / f"{uuid4().hex}{suffix}"
+        # Preserve the original filename (sanitised) so source_name matches the
+        # frontend file.name and output filenames are human-readable.
+        original_stem = Path(upload.filename or "upload").stem
+        safe_stem = re.sub(r"[^a-zA-Z0-9._-]", "-", original_stem).strip("-")[:80] or "upload"
+        candidate = f"{safe_stem}{suffix}"
+        # Avoid collisions when multiple files share the same name
+        counter = 1
+        while candidate in seen_names or (job_dir / candidate).exists():
+            candidate = f"{safe_stem}-{counter}{suffix}"
+            counter += 1
+        seen_names.add(candidate)
+        target = job_dir / candidate
         with target.open("wb") as handle:
             while chunk := await upload.read(1024 * 1024):
                 handle.write(chunk)
@@ -8465,12 +8477,12 @@ def source_suffix(path: Path) -> str:
 
 def localize_filename(source_path: Path, language: str, output_format: str) -> str:
     extension = normalize_output_format(output_format, source_path)
-    return f"{sanitize_stem(source_path)}-{source_suffix(source_path)}-{language.lower()}.{extension}"
+    return f"{sanitize_stem(source_path)}-{language.lower()}.{extension}"
 
 
 def resize_filename(source_path: Path, placement_id: str, output_format: str) -> str:
     extension = normalize_output_format(output_format, source_path)
-    return f"{sanitize_stem(source_path)}-{source_suffix(source_path)}-{placement_id}.{extension}"
+    return f"{sanitize_stem(source_path)}-{placement_id}.{extension}"
 
 
 def build_localize_assets(paths: list[Path], languages: list[str], output_format: str, job_dir: Path) -> tuple[list[OutputAsset], dict[str, list[str]], list[dict[str, Any]]]:
@@ -8573,18 +8585,22 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                 for block in translated_blocks
             ]
             rendered: Image.Image | None = None
-            if cleanup_gate["cleanupStatus"] == "passed":
-                rendered = render_translated_text(gated_background, translated_blocks, render_plan=render_plan_map)
-            else:
-                # Fallback: cleanup gate failed (no GPU / inpainting unavailable).
-                # Still produce a useful output by rendering translated text onto
-                # the gated_background (which may be partially cleaned) or the
-                # original image so the user always gets something back.
+            render_base = gated_background if gated_background is not None else source_image
+            try:
+                rendered = render_translated_text(render_base, translated_blocks, render_plan=render_plan_map)
+            except Exception:
+                rendered = None
+            # Safety net: if render produced nothing useful (exception or all blocks
+            # suppressed and output identical to base), retry without render_plan so
+            # filter_render_blocks operates in raw mode without any suppression hints.
+            if rendered is None or (
+                rendered is not None
+                and np.array_equal(np.array(rendered), np.array(render_base))
+            ):
                 try:
-                    fallback_base = gated_background if gated_background is not None else source_image
-                    rendered = render_translated_text(fallback_base, translated_blocks, render_plan=render_plan_map)
+                    rendered = render_translated_text(render_base, translated_blocks, render_plan=None)
                 except Exception:
-                    rendered = source_image.copy()
+                    rendered = render_base.copy()
             token_masks = collect_token_masks(source_image, translated_blocks)
             mask_preview = build_text_mask(source_image, translated_blocks)
             mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-mask.png"
