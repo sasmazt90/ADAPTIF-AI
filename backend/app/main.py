@@ -7856,13 +7856,13 @@ def smart_resize_image(
                 arr = np.array(bg_base.convert("RGB"))
                 mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
                 for bx0, by0, bx1, by1 in all_bboxes:
-                    pad = max(6, int(min(bx1 - bx0, by1 - by0) * 0.14))
+                    pad = max(3, int(min(bx1 - bx0, by1 - by0) * 0.06))
                     mask[
                         max(0, by0 - pad):min(arr.shape[0], by1 + pad),
                         max(0, bx0 - pad):min(arr.shape[1], bx1 + pad),
                     ] = 255
                 if mask.any():
-                    inpainted = cv2.inpaint(arr, mask, inpaintRadius=18, flags=cv2.INPAINT_TELEA)
+                    inpainted = cv2.inpaint(arr, mask, inpaintRadius=8, flags=cv2.INPAINT_TELEA)
                     bg_base = Image.fromarray(inpainted)
                     print(f"[smart_resize_image] inpaint: masked {mask.any(1).sum()} rows from {len(all_bboxes)} bboxes", flush=True)
             except Exception as _e:
