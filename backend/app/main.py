@@ -7765,6 +7765,8 @@ def smart_resize_image(
         except Exception as _ocr_exc:
             print(f"[smart_resize_image] build_localize_blocks failed: {_ocr_exc}", flush=True)
             text_blocks = []
+        finally:
+            tmp_path.unlink(missing_ok=True)
 
         # Fallback: use raw EasyOCR bboxes if the full pipeline returned nothing
         raw_text_bboxes: list[tuple[int, int, int, int]] = []
@@ -7793,8 +7795,6 @@ def smart_resize_image(
                 print(f"[smart_resize_image] raw OCR fallback: {len(raw_text_bboxes)} bboxes", flush=True)
             except Exception as _raw_ocr_exc:
                 print(f"[smart_resize_image] raw OCR fallback failed: {_raw_ocr_exc}", flush=True)
-        finally:
-            tmp_path.unlink(missing_ok=True)
 
         has_translatable = any(b.translate for b in text_blocks)
 
