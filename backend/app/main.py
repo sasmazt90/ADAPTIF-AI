@@ -7754,13 +7754,45 @@ def smart_resize_image(
         tgt_w, tgt_h = width, height
 
         # ── Step 1: OCR ───────────────────────────────────────────────────
+        # Use raw EasyOCR (not the full build_localize_blocks pipeline) to get
+        # lightweight text-region bboxes for inpainting.  The full pipeline
+        # can fail silently or be slow; raw OCR is fast and reliable on CPU.
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         source.save(tmp_path, "PNG")
         try:
             text_blocks = build_localize_blocks(tmp_path, source)
-        except Exception:
+        except Exception as _ocr_exc:
+            print(f"[smart_resize_image] build_localize_blocks failed: {_ocr_exc}", flush=True)
             text_blocks = []
+
+        # Fallback: use raw EasyOCR bboxes if the full pipeline returned nothing
+        raw_text_bboxes: list[tuple[int, int, int, int]] = []
+        if not text_blocks:
+            try:
+                detector = load_ocr_detector()
+                ocr_image, ocr_scale = fit_for_ocr(source)
+                raw_results = detector.readtext(
+                    np.array(ocr_image),
+                    detail=1,
+                    paragraph=False,
+                    batch_size=1,
+                    decoder="greedy",
+                )
+                for points, _txt, conf in raw_results:
+                    if conf < 0.20:
+                        continue
+                    xs = [int(p[0] / ocr_scale) for p in points]
+                    ys = [int(p[1] / ocr_scale) for p in points]
+                    raw_text_bboxes.append((
+                        max(0, min(xs)),
+                        max(0, min(ys)),
+                        min(source.width, max(xs)),
+                        min(source.height, max(ys)),
+                    ))
+                print(f"[smart_resize_image] raw OCR fallback: {len(raw_text_bboxes)} bboxes", flush=True)
+            except Exception as _raw_ocr_exc:
+                print(f"[smart_resize_image] raw OCR fallback failed: {_raw_ocr_exc}", flush=True)
         finally:
             tmp_path.unlink(missing_ok=True)
 
@@ -7811,29 +7843,30 @@ def smart_resize_image(
         else:
             bg_base = working_source
 
-        # ── Step 4a: Fast OpenCV inpaint fallback if bg_base is still the
-        #            original (cleanup pipeline failed or was skipped) ────────
-        # Even if no translatable blocks were found by the full pipeline, we
-        # still want to remove any text OCR detected so it doesn't appear in
-        # the scaled background or foreground crop.
-        if bg_base is working_source and text_blocks:
+        # ── Step 4a: Fast OpenCV inpaint — remove text from background ───────
+        # Run regardless of whether the full cleanup pipeline succeeded, using
+        # whichever text source is available (full blocks or raw bboxes).
+        # This ensures background text is gone before the cover-scale step.
+        all_bboxes: list[tuple[int, int, int, int]] = (
+            [b.bbox for b in text_blocks] if text_blocks else raw_text_bboxes
+        )
+        if all_bboxes:
             try:
                 import cv2
-                arr = np.array(working_source.convert("RGB"))
+                arr = np.array(bg_base.convert("RGB"))
                 mask = np.zeros((arr.shape[0], arr.shape[1]), dtype=np.uint8)
-                for blk in text_blocks:
-                    bx0, by0, bx1, by1 = [int(v) for v in blk.bbox]
-                    pad = max(6, int(min(bx1 - bx0, by1 - by0) * 0.12))
+                for bx0, by0, bx1, by1 in all_bboxes:
+                    pad = max(6, int(min(bx1 - bx0, by1 - by0) * 0.14))
                     mask[
                         max(0, by0 - pad):min(arr.shape[0], by1 + pad),
                         max(0, bx0 - pad):min(arr.shape[1], bx1 + pad),
                     ] = 255
                 if mask.any():
-                    inpainted = cv2.inpaint(arr, mask, inpaintRadius=16, flags=cv2.INPAINT_TELEA)
+                    inpainted = cv2.inpaint(arr, mask, inpaintRadius=18, flags=cv2.INPAINT_TELEA)
                     bg_base = Image.fromarray(inpainted)
-                    print(f"[smart_resize_image] fast-inpaint fallback: removed {mask.any(1).sum()} rows of text", flush=True)
+                    print(f"[smart_resize_image] inpaint: masked {mask.any(1).sum()} rows from {len(all_bboxes)} bboxes", flush=True)
             except Exception as _e:
-                print(f"[smart_resize_image] fast-inpaint fallback failed: {_e}", flush=True)
+                print(f"[smart_resize_image] inpaint step failed: {_e}", flush=True)
 
         # ── Step 4b: Scale background to COVER the target canvas ─────────
         bg_color = _sample_edge_color(bg_base)
