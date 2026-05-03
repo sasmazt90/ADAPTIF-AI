@@ -916,10 +916,10 @@ function LocalizePreview({
         </div>
         <div className="space-y-4 p-4">
           <div>
-            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{originalLabel}</p>
+            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{localizedLabel}</p>
             <div className="overflow-hidden rounded-md border border-[#151515]/10 bg-[#eef5fb]">
-              {originalUrl ? (
-                <img src={originalUrl} alt="Original creative" className="block h-auto w-full object-contain" />
+              {localizedUrl ? (
+                <img src={localizedUrl} alt="Localized creative" className="block h-auto w-full object-contain" />
               ) : (
                 <div className="grid min-h-[220px] place-items-center bg-[linear-gradient(135deg,#edf6ff_0%,#a9d7f7_52%,#f4d28c_100%)]" />
               )}
@@ -927,14 +927,14 @@ function LocalizePreview({
           </div>
           <div className="flex justify-center">
             <span className="grid h-12 w-12 place-items-center rounded-full border border-[#d9e5f3] bg-white text-[#2550a8] shadow-sm">
-              <ArrowRight className="h-5 w-5" />
+              <ArrowRight className="h-5 w-5 rotate-90" />
             </span>
           </div>
           <div>
-            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{localizedLabel}</p>
+            <p className="mb-2 text-xs font-bold uppercase text-[#444]">{originalLabel}</p>
             <div className="overflow-hidden rounded-md border border-[#151515]/10 bg-[#eef5fb]">
-              {localizedUrl ? (
-                <img src={localizedUrl} alt="Localized creative" className="block h-auto w-full object-contain" />
+              {originalUrl ? (
+                <img src={originalUrl} alt="Original creative" className="block h-auto w-full object-contain" />
               ) : (
                 <div className="grid min-h-[220px] place-items-center bg-[linear-gradient(135deg,#edf6ff_0%,#a9d7f7_52%,#f4d28c_100%)]" />
               )}
@@ -1468,7 +1468,20 @@ export function AdaptDashboard() {
 
               {mode === "adapt" ? (
                 <>
-                  {/* Translated text */}
+                  {/* Original text (read-only) */}
+                  {activeOutput?.extracted_blocks && activeOutput.extracted_blocks.some((b) => b.translate) && (
+                    <div className="mb-3">
+                      <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Original ({activeOutput.source_language ?? "Source"})</p>
+                      <div className="rounded-md border border-[#151515]/10 bg-[#f6f1e7] p-3 text-sm text-[#666]">
+                        {activeOutput.extracted_blocks.filter((b) => b.translate).map((b, i) => (
+                          <p key={i} className="leading-snug">{b.text}</p>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Translated text (editable) */}
+                  <p className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Translated ({activeOutput?.language ?? "Target"})</p>
                   <textarea
                     className="min-h-[88px] w-full resize-none rounded-md border border-[#151515]/10 bg-[#faf9f5] p-3 text-sm outline-none focus:border-[#0f766e]"
                     value={copy}
@@ -1513,22 +1526,6 @@ export function AdaptDashboard() {
                       </div>
                     </div>
                   </div>
-
-                  {/* Cleanup options */}
-                  <div className="mt-4">
-                    <p className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-[#999]">Cleanup</p>
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2">
-                        <span className="w-3 shrink-0 text-[10px] font-bold text-[#555]">α</span>
-                        <input type="range" min="0" max="70" value={opacity} onChange={(e) => setOpacity(Number(e.target.value))} className="flex-1 accent-[#ee4d6a]" />
-                        <span className="w-9 text-right text-[11px] font-semibold tabular-nums text-[#555]">{opacity}%</span>
-                      </div>
-                      <div className="flex gap-2">
-                        <button type="button" onClick={() => setMaskCleanup((v) => !v)} className={["flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-xs font-semibold", maskCleanup ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}><Scissors className="h-3 w-3" />Mask</button>
-                        <button type="button" onClick={() => setFitBounds((v) => !v)} className={["flex h-8 flex-1 items-center justify-center gap-1.5 rounded-md border text-xs font-semibold", fitBounds ? "border-[#0f766e] bg-[#e8f7f1] text-[#064e46]" : "border-[#151515]/10 bg-[#faf9f5] text-[#555]"].join(" ")}><Frame className="h-3 w-3" />Fit bounds</button>
-                      </div>
-                    </div>
-                  </div>
                 </>
               ) : (
                 <>
@@ -1568,42 +1565,6 @@ export function AdaptDashboard() {
                     </div>
                   </div>
                 </>
-              )}
-
-              {/* Live preview — draggable to adjust x/y offset */}
-              {activeOutput?.download_url && (
-                <div className="mt-4 overflow-hidden rounded-md border border-[#151515]/10">
-                  <p className="border-b border-[#151515]/10 bg-[#faf9f5] px-2 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#666]">
-                    Current output
-                    <span className="ml-2 font-normal normal-case text-[#aaa]">drag to reposition</span>
-                  </p>
-                  <div
-                    className={["relative overflow-hidden bg-[#f6f1e7] select-none", isDraggingPreview ? "cursor-grabbing" : "cursor-grab"].join(" ")}
-                    style={{ aspectRatio: "4/3" }}
-                    onMouseDown={(e) => {
-                      setIsDraggingPreview(true);
-                      previewDragRef.current = { mouseX: e.clientX, mouseY: e.clientY, startX: x, startY: y };
-                      e.preventDefault();
-                    }}
-                    onMouseMove={(e) => {
-                      if (!isDraggingPreview || !previewDragRef.current) return;
-                      const dx = e.clientX - previewDragRef.current.mouseX;
-                      const dy = e.clientY - previewDragRef.current.mouseY;
-                      setX(Math.max(-24, Math.min(24, previewDragRef.current.startX + dx)));
-                      setY(Math.max(-24, Math.min(24, previewDragRef.current.startY + dy)));
-                    }}
-                    onMouseUp={() => { setIsDraggingPreview(false); previewDragRef.current = null; }}
-                    onMouseLeave={() => { setIsDraggingPreview(false); previewDragRef.current = null; }}
-                  >
-                    <img
-                      src={activeOutput.download_url}
-                      alt="Output preview"
-                      draggable={false}
-                      className="h-full w-full object-contain"
-                      style={{ transform: `translate(${x}px, ${y}px) scale(${mode === "resize" ? scale / 100 : 1})`, opacity: mode === "adapt" ? 1 - opacity / 200 : 1, transition: isDraggingPreview ? "none" : "transform 0.15s" }}
-                    />
-                  </div>
-                </div>
               )}
 
               {editStatus && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{editStatus}</p>}

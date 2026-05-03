@@ -6870,29 +6870,13 @@ def decide_block_render_strategy(
     panel_color = sample_panel_color(image, block.bbox)
     safe_areas = find_safe_area_candidates(image, block, foreground_bbox)
 
+    # Always use clean_replace — overlay/panel fallbacks produce visible boxes
+    # that look wrong to the user. Render the translated text directly at the
+    # original position regardless of cleanup confidence.
     strategy = "clean_replace"
     overlay_style: dict[str, Any] | str = "none"
     final_text_box = list(block.bbox)
-    reason = "clean_replace chosen because cleanupConfidence high"
-
-    if cleanup_confidence < 0.34 and (residual_risk > 0.48 or warning_penalty >= 0.16):
-        if mean_overlap > 0.18 and safe_areas and safe_areas[0]["score"] >= 1.15:
-            strategy = "reposition_to_safe_area"
-            overlay_style = build_overlay_style_config(image, tuple(safe_areas[0]["bbox"]), strategy="reposition_to_safe_area", block=block, dominant_color=panel_color)
-            final_text_box = safe_areas[0]["bbox"]
-            reason = "reposition_to_safe_area chosen as last resort because natural cleanup failed"
-        elif complexity > 90 or residual_risk > 0.58:
-            strategy = "gradient_overlay"
-            overlay_style = build_overlay_style_config(image, tuple(final_text_box), strategy="gradient_overlay", block=block, dominant_color=panel_color)
-            reason = "gradient_overlay chosen as last resort because natural cleanup failed"
-        elif mean_overlap > 0.12:
-            strategy = "soft_blur_panel"
-            overlay_style = build_overlay_style_config(image, tuple(final_text_box), strategy="soft_blur_panel", block=block, dominant_color=panel_color)
-            reason = "soft_blur_panel chosen as last resort because natural cleanup failed"
-        else:
-            strategy = "overlay_panel"
-            overlay_style = build_overlay_style_config(image, tuple(final_text_box), strategy="overlay_panel", block=block, dominant_color=panel_color)
-            reason = "overlay_panel chosen as last resort because natural cleanup failed"
+    reason = "clean_replace (overlay fallbacks disabled)"
 
     return {
         "id": block.id,
@@ -7841,14 +7825,15 @@ def smart_resize_image(
                     })
                     scaled_blocks.append(scaled_block)
                 if scaled_blocks:
-                    canvas = render_translated_text(canvas, scaled_blocks, render_plan={})
+                    canvas = render_translated_text(canvas, scaled_blocks, render_plan=None)
             except Exception:
                 pass
 
         return canvas
 
-    except Exception:
-        # Full fallback: focus-aware cover crop
+    except Exception as _smart_resize_exc:
+        import traceback as _tb
+        print(f"[smart_resize_image] fallback triggered ({width}x{height}): {_smart_resize_exc}\n{_tb.format_exc()}", flush=True)
         focus = build_resize_focus_bbox(source)
         return render_resize_image(source, width, height, fit="cover", focus_bbox=focus)
 
@@ -8955,7 +8940,7 @@ def build_preview_template_parity_report(placement_ids: list[str]) -> dict[str, 
 def build_resize_assets(paths: list[Path], placement_ids: list[str], output_format: str, custom_width: int | None, custom_height: int | None, job_dir: Path, creative_modes: dict[str, str] | None = None) -> tuple[list[OutputAsset], list[dict[str, Any]]]:
     outputs: list[OutputAsset] = []
     manifest_assets: list[dict[str, Any]] = []
-    canonical_placement_ids = [canonical_placement_id(item) for item in placement_ids]
+    canonical_placement_ids = list(dict.fromkeys(canonical_placement_id(item) for item in placement_ids))
     resolved_creative_modes = {canonical_placement_id(key): value for key, value in (creative_modes or {}).items()}
     resize_mode = os.getenv("ADAPTIFAI_RESIZE_FIT", "cover")
     parity_report = build_preview_template_parity_report(canonical_placement_ids)
