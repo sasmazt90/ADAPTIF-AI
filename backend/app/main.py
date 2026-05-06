@@ -8265,6 +8265,24 @@ def classify_resize_background(source: Image.Image) -> BackgroundStyle:
     )
 
 
+def sample_marketing_text_color(source: Image.Image, bbox: tuple[int, int, int, int], fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    left, top, right, bottom = bbox
+    crop = source.crop((max(0, left), max(0, top), min(source.width, right), min(source.height, bottom))).convert("RGB")
+    if crop.width <= 0 or crop.height <= 0:
+        return fallback
+    arr = np.array(crop, dtype=np.float32).reshape(-1, 3)
+    luma = arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    chroma = arr.max(axis=1) - arr.min(axis=1)
+    dark_threshold = min(150.0, float(np.percentile(luma, 38)))
+    mask = (luma <= dark_threshold) & (chroma >= 18)
+    if int(mask.sum()) < 16:
+        mask = luma <= dark_threshold
+    if int(mask.sum()) < 16:
+        return fallback
+    color = np.median(arr[mask], axis=0)
+    return tuple(int(max(0, min(255, value))) for value in color)
+
+
 def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None) -> VisualAnalysis:
     product_box = focus_bbox or detect_foreground_bbox(source) or (0, 0, source.width, source.height)
     product_layer = ProductLayer(
@@ -8281,6 +8299,11 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
     try:
         source.save(temp_path, "PNG")
         for index, block in enumerate(marketing_filter(run_trocr_ocr_on_image(temp_path))[:6]):
+            sampled_color = sample_marketing_text_color(
+                source,
+                block.bbox,
+                hex_to_rgb(block.color if block.color.startswith("#") else "#111111"),
+            )
             text_layers.append(
                 TextLayer(
                     id=f"text-{index + 1}",
@@ -8292,7 +8315,7 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
                     translated_text=block.translated_text or block.text,
                     translate=True,
                     text_style=TextStyle(
-                        color_rgb=RGBColor.from_list(hex_to_rgb(block.color if block.color.startswith("#") else "#111111")),
+                        color_rgb=RGBColor.from_list(sampled_color),
                         is_bold=block.font_weight >= 700,
                         font_type="sans-serif",
                         estimated_font_size=block.font_size_estimate,
@@ -8317,67 +8340,51 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
 
 
 def render_hybrid_banner_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> Image.Image:
-    bg = analysis.background.dominant_color_rgb.as_tuple() if analysis.background.dominant_color_rgb else _sample_edge_color(source)
-    canvas = Image.new("RGB", (width, height), bg)
+    product_box = relayout_product_box(source, analysis)
+    canvas, mapped_product, _crop_meta = build_content_aware_reframe_canvas(source, width, height, product_box)
+    copy_width = max(int(width * 0.50), min(int(width * 0.68), mapped_product[0] - max(8, int(width * 0.02))))
+    if copy_width <= int(width * 0.34):
+        copy_width = int(width * 0.58)
+    blurred = canvas.filter(ImageFilter.GaussianBlur(radius=max(3, height // 8)))
+    left_sample = np.array(blurred.crop((0, 0, max(1, min(width, copy_width)), height)).convert("RGB"), dtype=np.float32)
+    tint = tuple(int(value) for value in np.percentile(left_sample.reshape(-1, 3), 76, axis=0))
+    wash = Image.new("RGB", canvas.size, tint)
+    softened = Image.blend(blurred, wash, 0.68)
+    mask = Image.new("L", canvas.size, 0)
+    mask_draw = ImageDraw.Draw(mask)
+    fade_end = min(width, copy_width + max(20, int(width * 0.08)))
+    for x in range(fade_end):
+        alpha = 185 if x <= copy_width else int(185 * (1 - (x - copy_width) / max(1, fade_end - copy_width)) ** 2)
+        mask_draw.line((x, 0, x, height), fill=alpha)
+    canvas = Image.composite(softened, canvas, mask)
     draw = ImageDraw.Draw(canvas)
-    if analysis.background.type in {BackgroundType.GRADIENT, BackgroundType.SOFT_BLUR, BackgroundType.PHOTOGRAPHIC}:
-        lighter = tuple(min(255, int(channel * 1.18 + 10)) for channel in bg)
-        darker = tuple(max(0, int(channel * 0.84)) for channel in bg)
-        for x in range(width):
-            t = x / max(1, width - 1)
-            color = tuple(int(lighter[i] * (1 - t) + darker[i] * t) for i in range(3))
-            draw.line((x, 0, x, height), fill=color)
-
-    product_layer = analysis.product_layers[0] if analysis.product_layers else None
-    product_box = product_layer.bbox.to_pixel_box(source.width, source.height) if product_layer else (0, 0, source.width, source.height)
-    product = source.crop(product_box).convert("RGBA")
-    product_max_w = max(1, int(width * 0.28))
-    product_max_h = max(1, int(height * 0.88))
-    product_scale = min(product_max_w / max(1, product.width), product_max_h / max(1, product.height))
-    product_size = (max(1, int(product.width * product_scale)), max(1, int(product.height * product_scale)))
-    product = product.resize(product_size, Image.Resampling.LANCZOS)
-    product_x = width - product.width - max(4, int(width * 0.02))
-    product_y = (height - product.height) // 2
-    canvas.paste(product.convert("RGB"), (product_x, product_y), product)
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:2]).strip()
     if text:
-        text_area_w = max(1, product_x - max(10, int(width * 0.05)))
-        font_size = max(9, min(int(height * 0.48), int(text_area_w / max(8, min(len(text), 28)) * 1.9)))
-        font = get_font(font_size, bold=True)
+        text_area_w = max(1, copy_width - max(10, int(width * 0.05)))
+        text_area_h = max(1, height - max(8, int(height * 0.14)))
         fill = (18, 28, 45)
         first_style = text_candidates[0].text_style if text_candidates else None
         if first_style:
             fill = first_style.color_rgb.as_tuple()
-        words = text.upper().split()
-        lines: list[str] = []
-        current = ""
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            try:
-                bbox = draw.textbbox((0, 0), candidate, font=font)
-                candidate_width = bbox[2] - bbox[0]
-            except Exception:
-                candidate_width = len(candidate) * font_size
-            if current and candidate_width > text_area_w:
-                lines.append(current)
-                current = word
-            else:
-                current = candidate
-        if current:
-            lines.append(current)
-        lines = lines[:2]
-        line_height = int(font_size * 1.05)
+        display_text = text.upper() if first_style and first_style.uppercase else text
+        lines, font_size, line_height, _overflow = fit_plain_text_to_box(
+            draw,
+            display_text,
+            text_area_w,
+            text_area_h,
+            max_font_size=max(10, min(38, int(height * 0.52))),
+            min_font_size=8,
+            bold=True if first_style is None else first_style.is_bold,
+        )
+        font = get_font(font_size, bold=True if first_style is None else first_style.is_bold)
         total_h = max(1, len(lines) * line_height)
         y = max(2, (height - total_h) // 2)
         x = max(6, int(width * 0.035))
         for line in lines:
-            draw.text((x, y), line, fill=fill, font=font)
+            draw.text((x, y), line, fill=fill, font=font, stroke_width=1, stroke_fill=(232, 238, 244))
             y += line_height
-    else:
-        fallback = render_blurred_fit_resize(source, width, height)
-        canvas.paste(fallback.crop((0, 0, int(width * 0.72), height)), (0, 0))
 
     return canvas
 
@@ -8450,44 +8457,149 @@ def fit_plain_text_to_box(
     return lines, min_font_size, line_height, overflow
 
 
-def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
-    bg = analysis.background.dominant_color_rgb.as_tuple() if analysis.background.dominant_color_rgb else _sample_edge_color(source)
-    canvas = Image.new("RGB", (width, height), bg)
-    draw = ImageDraw.Draw(canvas)
-    lighter = tuple(min(255, int(channel * 1.12 + 8)) for channel in bg)
-    darker = tuple(max(0, int(channel * 0.82)) for channel in bg)
-    for y in range(height):
-        t = y / max(1, height - 1)
-        color = tuple(int(lighter[i] * (1 - t) + darker[i] * t) for i in range(3))
-        draw.line((0, y, width, y), fill=color)
+def clamp_int(value: float, lower: int, upper: int) -> int:
+    return max(lower, min(upper, int(round(value))))
 
-    margin_x = max(10, int(width * 0.08))
-    top_margin = max(18, int(height * 0.055))
-    bottom_margin = max(14, int(height * 0.035))
+
+def build_content_aware_reframe_canvas(
+    source: Image.Image,
+    width: int,
+    height: int,
+    product_box: tuple[int, int, int, int],
+) -> tuple[Image.Image, tuple[int, int, int, int], dict[str, Any]]:
+    source = source.convert("RGB")
+    target_ratio = width / max(1, height)
+    source_ratio = source.width / max(1, source.height)
+    product_left, product_top, product_right, product_bottom = product_box
+    product_center_x = (product_left + product_right) / 2
+    product_center_y = (product_top + product_bottom) / 2
+
+    if source_ratio > target_ratio:
+        crop_h = source.height
+        crop_w = max(1, min(source.width, int(round(crop_h * target_ratio))))
+        if target_ratio < 0.55:
+            focus_x = product_left * 0.65 + product_center_x * 0.35
+        else:
+            focus_x = product_center_x
+        crop_left = clamp_int(focus_x - crop_w * 0.5, 0, source.width - crop_w)
+        crop_top = 0
+    else:
+        crop_w = source.width
+        crop_h = max(1, min(source.height, int(round(crop_w / max(0.01, target_ratio)))))
+        if target_ratio > 3:
+            focus_y = product_top * 0.65 + product_center_y * 0.35
+        else:
+            focus_y = product_center_y
+        crop_left = 0
+        crop_top = clamp_int(focus_y - crop_h * 0.5, 0, source.height - crop_h)
+
+    crop_box = (crop_left, crop_top, crop_left + crop_w, crop_top + crop_h)
+    cropped = source.crop(crop_box)
+    canvas = cropped.resize((width, height), Image.Resampling.LANCZOS)
+    scale_x = width / max(1, crop_w)
+    scale_y = height / max(1, crop_h)
+    mapped_product = (
+        clamp_int((product_left - crop_left) * scale_x, 0, width),
+        clamp_int((product_top - crop_top) * scale_y, 0, height),
+        clamp_int((product_right - crop_left) * scale_x, 0, width),
+        clamp_int((product_bottom - crop_top) * scale_y, 0, height),
+    )
+    return canvas, mapped_product, {
+        "sourceCropBox": list(crop_box),
+        "mappedProductBox": list(mapped_product),
+        "sourceScaleX": round(scale_x, 4),
+        "sourceScaleY": round(scale_y, 4),
+    }
+
+
+def apply_copy_area_feather(
+    canvas: Image.Image,
+    *,
+    copy_bottom: int,
+    strength: int = 205,
+    blur_radius: int = 12,
+) -> Image.Image:
+    def cool_ad_tint(values: np.ndarray) -> np.ndarray:
+        adjusted = values.astype(np.float32).copy()
+        adjusted[0] = adjusted[0] * 0.96 + 4
+        adjusted[1] = adjusted[1] * 1.02 + 6
+        adjusted[2] = adjusted[2] * 1.08 + 10
+        return np.clip(adjusted, 0, 255)
+
+    copy_bottom = max(1, min(canvas.height, copy_bottom))
+    blurred = canvas.filter(ImageFilter.GaussianBlur(radius=max(blur_radius, 18)))
+    top_sample = np.array(blurred.crop((0, 0, canvas.width, max(1, min(canvas.height, copy_bottom)))).convert("RGB"), dtype=np.float32)
+    top_tint = cool_ad_tint(np.percentile(top_sample.reshape(-1, 3), 82, axis=0))
+    bottom_start = max(0, copy_bottom - max(8, canvas.height // 14))
+    bottom_sample = np.array(blurred.crop((0, bottom_start, canvas.width, copy_bottom)).convert("RGB"), dtype=np.float32)
+    bottom_tint = cool_ad_tint(np.percentile(bottom_sample.reshape(-1, 3), 76, axis=0))
+    wash = Image.new("RGB", canvas.size, tuple(int(value) for value in top_tint))
+    wash_draw = ImageDraw.Draw(wash)
+    for y in range(canvas.height):
+        t = min(1.0, y / max(1, copy_bottom))
+        color = tuple(int(top_tint[index] * (1 - t) + bottom_tint[index] * t) for index in range(3))
+        wash_draw.line((0, y, canvas.width, y), fill=color)
+    softened = wash
+    mask = Image.new("L", canvas.size, 0)
+    draw_mask = ImageDraw.Draw(mask)
+    fade_end = min(canvas.height, copy_bottom + max(32, int(canvas.height * 0.08)))
+    for y in range(fade_end):
+        if y <= copy_bottom:
+            alpha = 255
+        else:
+            t = (y - copy_bottom) / max(1, fade_end - copy_bottom)
+            alpha = int(strength * (1 - t) ** 2)
+        draw_mask.line((0, y, canvas.width, y), fill=max(0, min(255, alpha)))
+    return Image.composite(softened, canvas, mask)
+
+
+def relayout_product_box(source: Image.Image, analysis: VisualAnalysis) -> tuple[int, int, int, int]:
     product_layer = analysis.product_layers[0] if analysis.product_layers else None
     product_box = product_layer.bbox.to_pixel_box(source.width, source.height) if product_layer else (0, 0, source.width, source.height)
-    product = source.crop(product_box).convert("RGBA")
-    product_max_w = max(1, width - margin_x * 2)
-    product_max_h = max(1, int(height * 0.42))
-    product_scale = min(product_max_w / max(1, product.width), product_max_h / max(1, product.height))
-    product = product.resize((max(1, int(product.width * product_scale)), max(1, int(product.height * product_scale))), Image.Resampling.LANCZOS)
-    product_x = (width - product.width) // 2
-    product_y = height - bottom_margin - product.height
-    shadow = Image.new("RGBA", product.size, (0, 0, 0, 0))
-    shadow_alpha = product.getchannel("A").filter(ImageFilter.GaussianBlur(radius=max(2, width // 45)))
-    shadow.putalpha(shadow_alpha.point(lambda value: int(value * 0.22)))
-    canvas.paste(shadow.convert("RGB"), (product_x + max(1, width // 80), product_y + max(2, height // 160)), shadow)
-    canvas.paste(product.convert("RGB"), (product_x, product_y), product)
+    box_area = max(1, product_box[2] - product_box[0]) * max(1, product_box[3] - product_box[1])
+    image_area = max(1, source.width * source.height)
+    if box_area / image_area <= 0.72:
+        return product_box
+
+    text_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
+    if text_boxes:
+        text_bottom = max(box[3] for box in text_boxes)
+        return (
+            int(source.width * 0.38),
+            min(source.height - 1, text_bottom + int(source.height * 0.045)),
+            source.width,
+            source.height,
+        )
+    return (
+        int(source.width * 0.20),
+        int(source.height * 0.42),
+        source.width,
+        source.height,
+    )
+
+
+def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    margin_x = max(10, int(width * 0.08))
+    top_margin = max(18, int(height * 0.055))
+    product_box = relayout_product_box(source, analysis)
+    canvas, mapped_product, crop_meta = build_content_aware_reframe_canvas(source, width, height, product_box)
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
     text_meta = {"textOverflow": False, "lineCount": 0, "fontSize": 0}
     if text:
         text_top = top_margin
-        text_bottom = max(text_top + 1, product_y - max(14, int(height * 0.035)))
+        text_bottom = max(text_top + 1, min(int(height * 0.52), mapped_product[1] - max(10, int(height * 0.025))))
+        canvas = apply_copy_area_feather(
+            canvas,
+            copy_bottom=text_bottom + max(12, int(height * 0.035)),
+            strength=250 if width <= 180 else 235,
+            blur_radius=max(7, min(18, width // 11)),
+        )
+        draw = ImageDraw.Draw(canvas)
         text_area_w = max(1, width - margin_x * 2)
         text_area_h = max(1, text_bottom - text_top)
-        max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.18)))
+        max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.22)))
         first_style = text_candidates[0].text_style if text_candidates else None
         fill = first_style.color_rgb.as_tuple() if first_style else (18, 28, 45)
         is_bold = True if first_style is None else first_style.is_bold
@@ -8507,13 +8619,15 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
         for line in lines:
             line_w = text_width(draw, line, font)
             x = margin_x + max(0, int((text_area_w - line_w) / 2))
-            draw.text((x, y), line, fill=fill, font=font)
+            draw.text((x, y), line, fill=fill, font=font, stroke_width=1, stroke_fill=(232, 238, 244))
             y += line_height
         text_meta = {"textOverflow": overflow, "lineCount": len(lines), "fontSize": font_size}
 
     return canvas, {
         "provider": "local",
         "strategy": "large_rectangle_relayout",
+        "backgroundMode": "content_aware_source_crop_feather",
+        **crop_meta,
         **text_meta,
     }
 
