@@ -72,6 +72,35 @@ except ImportError:
     def run_quality_gate(*a, **kw):  # type: ignore[no-redef]
         return None
 
+try:
+    from app.smart_reframe import (
+        BackgroundStyle,
+        BackgroundType,
+        BBox1000,
+        ExpansionStrategy,
+        LogicBucket,
+        ProductLayer,
+        RGBColor,
+        SmartReframe,
+        TextLayer,
+        TextStyle,
+        VisualAnalysis,
+    )
+except ImportError:
+    from backend.app.smart_reframe import (  # type: ignore[no-redef]
+        BackgroundStyle,
+        BackgroundType,
+        BBox1000,
+        ExpansionStrategy,
+        LogicBucket,
+        ProductLayer,
+        RGBColor,
+        SmartReframe,
+        TextLayer,
+        TextStyle,
+        VisualAnalysis,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / ".env.local")
@@ -7434,6 +7463,183 @@ def save_image_output(image: Image.Image, target: Path, extension: str) -> None:
         image.save(target, "PNG")
 
 
+def image_to_png_bytes(image: Image.Image) -> io.BytesIO:
+    buffer = io.BytesIO()
+    image.convert("RGB").save(buffer, format="PNG")
+    buffer.seek(0)
+    return buffer
+
+
+def build_openai_edit_mask(image: Image.Image, blocks: list[TextBlock]) -> Image.Image:
+    edit_luma = build_text_mask(image, blocks, padding=34)
+    alpha = ImageChops.invert(edit_luma).point(lambda value: 0 if value < 18 else value)
+    mask = Image.new("RGBA", image.size, (255, 255, 255, 255))
+    mask.putalpha(alpha)
+    return mask
+
+
+def openai_output_format_for(extension: str) -> str:
+    normalized = extension.lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpeg"
+    if normalized == "webp":
+        return "webp"
+    return "png"
+
+
+def nearest_openai_edit_size(width: int, height: int) -> str:
+    ratio = width / max(1, height)
+    candidates = {
+        "1024x1024": 1.0,
+        "1024x1536": 1024 / 1536,
+        "1536x1024": 1536 / 1024,
+    }
+    return min(candidates, key=lambda key: abs(candidates[key] - ratio))
+
+
+def decode_openai_image_response(response: Any) -> Image.Image:
+    item = response.data[0] if getattr(response, "data", None) else None
+    if item is None:
+        raise RuntimeError("OpenAI image edit returned no image data.")
+    encoded = getattr(item, "b64_json", None)
+    if encoded:
+        return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+    url = getattr(item, "url", None)
+    if url:
+        response = requests.get(url, timeout=30)
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content)).convert("RGB")
+    raise RuntimeError("OpenAI image edit returned neither base64 nor URL image data.")
+
+
+def create_openai_image_edit_with_fallback(
+    client: OpenAI,
+    base_kwargs: dict[str, Any],
+    streams: list[io.BytesIO],
+    *,
+    output_format: str | None,
+    size: str,
+    width: int,
+    height: int,
+) -> tuple[Any, dict[str, Any]]:
+    variants: list[dict[str, Any]] = [
+        {"size": size, "output_format": output_format, "response_format": "b64_json"},
+        {"size": size, "output_format": output_format},
+        {"size": size},
+    ]
+    fallback_size = nearest_openai_edit_size(width, height)
+    if size != fallback_size:
+        variants.append({"size": fallback_size})
+
+    last_error: Exception | None = None
+    for variant in variants:
+        request_kwargs = dict(base_kwargs)
+        request_kwargs.update({key: value for key, value in variant.items() if value is not None})
+        for stream in streams:
+            stream.seek(0)
+        try:
+            return client.images.edit(**request_kwargs), variant
+        except Exception as exc:
+            last_error = exc
+            message = str(exc).lower()
+            if any(fragment in message for fragment in ["unknown parameter", "unsupported", "invalid size", "must be one of"]):
+                continue
+            raise
+    raise RuntimeError(f"OpenAI image edit failed after compatible retries: {last_error}") from last_error
+
+
+def build_openai_localize_prompt(
+    blocks: list[TextBlock],
+    target_language: str,
+    source_language: str,
+) -> str:
+    source_items: list[dict[str, Any]] = []
+    for block in blocks:
+        if not block.translate or not text_changed(block.text, block.translated_text):
+            continue
+        source_items.append(
+            {
+                "source_text": block.text,
+                "replacement_text": block.translated_text or block.text,
+                "bbox": list(block.bbox),
+                "style": {
+                    "font_weight": block.font_weight,
+                    "font_size_estimate": block.font_size_estimate,
+                    "color": block.color,
+                    "alignment": block.align,
+                    "uppercase": block.text.isupper(),
+                },
+            }
+        )
+
+    return (
+        "Edit the provided ad creative for marketing text localization.\n"
+        f"Source language: {source_language}. Target language: {LANGUAGE_NAMES.get(target_language.upper(), target_language)} ({target_language}).\n"
+        "Replace only the source marketing text listed below with its replacement text.\n"
+        "Preserve the same visual design: font style, approximate weight, color, casing, line spacing, alignment, and placement.\n"
+        "Keep the product, packaging, person, objects, background, lighting, shadows, composition, and all non-marketing text unchanged.\n"
+        "Do not translate, redraw, blur, or alter any product label, ingredient text, logo text, brand mark, QR code, UI chrome, or small packaging text.\n"
+        "Use the mask only as guidance for the editable marketing text region; avoid edits outside that region.\n"
+        "Do not add new logos, watermarks, badges, or extra copy.\n"
+        "Return a finished localized image only.\n"
+        f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}"
+    )
+
+
+def render_localize_with_openai_image_edit(
+    source_image: Image.Image,
+    translated_blocks: list[TextBlock],
+    target_language: str,
+    source_language: str,
+    output_format: str,
+) -> tuple[Image.Image, dict[str, Any]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI image localization.")
+
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
+    if quality not in {"low", "medium", "high", "auto"}:
+        quality = "medium"
+
+    extension = normalize_output_format(output_format)
+    prompt = build_openai_localize_prompt(translated_blocks, target_language, source_language)
+    mask_image = build_openai_edit_mask(source_image, translated_blocks)
+    image_file = image_to_png_bytes(source_image)
+    mask_file = io.BytesIO()
+    mask_image.save(mask_file, format="PNG")
+    mask_file.seek(0)
+
+    client = OpenAI(api_key=api_key)
+    response, api_variant = create_openai_image_edit_with_fallback(
+        client,
+        {
+            "model": model,
+            "image": ("creative.png", image_file, "image/png"),
+            "mask": ("marketing-text-mask.png", mask_file, "image/png"),
+            "prompt": prompt,
+            "quality": quality,
+        },
+        [image_file, mask_file],
+        output_format=openai_output_format_for(extension),
+        size="auto",
+        width=source_image.width,
+        height=source_image.height,
+    )
+    rendered = decode_openai_image_response(response)
+    if rendered.size != source_image.size:
+        rendered = rendered.resize(source_image.size, Image.Resampling.LANCZOS)
+
+    return rendered, {
+        "provider": "openai",
+        "model": model,
+        "quality": quality,
+        "apiVariant": api_variant,
+        "maskedBlocks": len([block for block in translated_blocks if block.translate and text_changed(block.text, block.translated_text)]),
+        "outputFormat": openai_output_format_for(extension),
+    }
+
+
 def union_bbox(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
     if not boxes:
         return None
@@ -7979,6 +8185,438 @@ def _sample_edge_color(image: Image.Image) -> tuple[int, int, int]:
                               left.reshape(-1, 3), right.reshape(-1, 3)], axis=0)
     mean = sample.mean(axis=0).astype(int)
     return (int(mean[0]), int(mean[1]), int(mean[2]))
+
+
+def render_blurred_fit_resize(source: Image.Image, width: int, height: int) -> Image.Image:
+    """
+    Production resize for ad creatives.
+
+    Preserve the full source creative without stretching or artificial subject
+    recomposition. Fill any ratio mismatch with a blurred cover version of the
+    same image, then place the source on top with contain fit.
+    """
+    source = source.convert("RGB")
+    if source.width <= 0 or source.height <= 0:
+        return Image.new("RGB", (width, height), (250, 249, 245))
+
+    cover_scale = max(width / source.width, height / source.height)
+    cover_size = (
+        max(1, int(round(source.width * cover_scale))),
+        max(1, int(round(source.height * cover_scale))),
+    )
+    cover = source.resize(cover_size, Image.Resampling.LANCZOS)
+    crop_left = max(0, (cover.width - width) // 2)
+    crop_top = max(0, (cover.height - height) // 2)
+    background = cover.crop((crop_left, crop_top, crop_left + width, crop_top + height))
+    blur_radius = max(12, min(width, height) // 28)
+    background = background.filter(ImageFilter.GaussianBlur(radius=blur_radius))
+    background = ImageEnhance.Brightness(background).enhance(0.92)
+    background = ImageEnhance.Contrast(background).enhance(0.88)
+
+    contain_scale = min(width / source.width, height / source.height)
+    foreground_size = (
+        max(1, int(round(source.width * contain_scale))),
+        max(1, int(round(source.height * contain_scale))),
+    )
+    foreground = source.resize(foreground_size, Image.Resampling.LANCZOS)
+    paste_x = (width - foreground.width) // 2
+    paste_y = (height - foreground.height) // 2
+    background.paste(foreground, (paste_x, paste_y))
+    return background
+
+
+def bbox1000_from_pixel_box(box: tuple[int, int, int, int], image_width: int, image_height: int) -> BBox1000:
+    left, top, right, bottom = box
+    return BBox1000(
+        ymin=max(0, min(1000, round(top / max(1, image_height) * 1000))),
+        xmin=max(0, min(1000, round(left / max(1, image_width) * 1000))),
+        ymax=max(0, min(1000, round(bottom / max(1, image_height) * 1000))),
+        xmax=max(0, min(1000, round(right / max(1, image_width) * 1000))),
+    )
+
+
+def estimate_resize_texture_complexity(source: Image.Image) -> float:
+    gray = source.convert("L")
+    if gray.width > 512 or gray.height > 512:
+        scale = 512 / max(gray.width, gray.height)
+        gray = gray.resize((max(1, int(gray.width * scale)), max(1, int(gray.height * scale))), Image.Resampling.LANCZOS)
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    arr = np.array(edges, dtype=np.float32) / 255.0
+    return float(max(0.0, min(1.0, arr.mean() * 4.0)))
+
+
+def classify_resize_background(source: Image.Image) -> BackgroundStyle:
+    texture = estimate_resize_texture_complexity(source)
+    edge_color = _sample_edge_color(source)
+    if texture < 0.16:
+        bg_type = BackgroundType.SOLID
+    elif texture < 0.30:
+        bg_type = BackgroundType.GRADIENT
+    elif texture < 0.48:
+        bg_type = BackgroundType.SOFT_BLUR
+    else:
+        bg_type = BackgroundType.PHOTOGRAPHIC
+    return BackgroundStyle(
+        type=bg_type,
+        dominant_color_rgb=RGBColor(r=edge_color[0], g=edge_color[1], b=edge_color[2]),
+        is_gradient=bg_type == BackgroundType.GRADIENT,
+        texture_complexity=texture,
+        can_extend_without_ai=texture < 0.34,
+    )
+
+
+def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None) -> VisualAnalysis:
+    product_box = focus_bbox or detect_foreground_bbox(source) or (0, 0, source.width, source.height)
+    product_layer = ProductLayer(
+        id="product-1",
+        bbox=bbox1000_from_pixel_box(product_box, source.width, source.height),
+        confidence=0.66 if focus_bbox else 0.45,
+        saliency=0.82,
+        protected=True,
+        mask_quality="bbox_only",
+        needs_shadow=True,
+    )
+    text_layers: list[TextLayer] = []
+    temp_path = temp_root() / f"{uuid4().hex}-resize-analysis.png"
+    try:
+        source.save(temp_path, "PNG")
+        for index, block in enumerate(marketing_filter(run_trocr_ocr_on_image(temp_path))[:6]):
+            text_layers.append(
+                TextLayer(
+                    id=f"text-{index + 1}",
+                    bbox=bbox1000_from_pixel_box(block.bbox, source.width, source.height),
+                    confidence=0.58,
+                    saliency=0.62,
+                    protected=True,
+                    original_text=block.text,
+                    translated_text=block.translated_text or block.text,
+                    translate=True,
+                    text_style=TextStyle(
+                        color_rgb=RGBColor.from_list(hex_to_rgb(block.color if block.color.startswith("#") else "#111111")),
+                        is_bold=block.font_weight >= 700,
+                        font_type="sans-serif",
+                        estimated_font_size=block.font_size_estimate,
+                        uppercase=block.text.isupper(),
+                        alignment=block.align if block.align in {"left", "center", "right"} else "unknown",
+                    ),
+                )
+            )
+    except Exception:
+        text_layers = []
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+    return VisualAnalysis(
+        source_width=source.width,
+        source_height=source.height,
+        background=classify_resize_background(source),
+        product_layers=[product_layer],
+        text_layers=text_layers,
+        saliency_summary="Heuristic resize analysis: foreground focus bbox, marketing OCR boxes, and background texture estimate.",
+    )
+
+
+def render_hybrid_banner_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> Image.Image:
+    bg = analysis.background.dominant_color_rgb.as_tuple() if analysis.background.dominant_color_rgb else _sample_edge_color(source)
+    canvas = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(canvas)
+    if analysis.background.type in {BackgroundType.GRADIENT, BackgroundType.SOFT_BLUR, BackgroundType.PHOTOGRAPHIC}:
+        lighter = tuple(min(255, int(channel * 1.18 + 10)) for channel in bg)
+        darker = tuple(max(0, int(channel * 0.84)) for channel in bg)
+        for x in range(width):
+            t = x / max(1, width - 1)
+            color = tuple(int(lighter[i] * (1 - t) + darker[i] * t) for i in range(3))
+            draw.line((x, 0, x, height), fill=color)
+
+    product_layer = analysis.product_layers[0] if analysis.product_layers else None
+    product_box = product_layer.bbox.to_pixel_box(source.width, source.height) if product_layer else (0, 0, source.width, source.height)
+    product = source.crop(product_box).convert("RGBA")
+    product_max_w = max(1, int(width * 0.28))
+    product_max_h = max(1, int(height * 0.88))
+    product_scale = min(product_max_w / max(1, product.width), product_max_h / max(1, product.height))
+    product_size = (max(1, int(product.width * product_scale)), max(1, int(product.height * product_scale)))
+    product = product.resize(product_size, Image.Resampling.LANCZOS)
+    product_x = width - product.width - max(4, int(width * 0.02))
+    product_y = (height - product.height) // 2
+    canvas.paste(product.convert("RGB"), (product_x, product_y), product)
+
+    text_candidates = analysis.marketing_text_layers or analysis.text_layers
+    text = " ".join(layer.original_text for layer in text_candidates[:2]).strip()
+    if text:
+        text_area_w = max(1, product_x - max(10, int(width * 0.05)))
+        font_size = max(9, min(int(height * 0.48), int(text_area_w / max(8, min(len(text), 28)) * 1.9)))
+        font = get_font(font_size, bold=True)
+        fill = (18, 28, 45)
+        first_style = text_candidates[0].text_style if text_candidates else None
+        if first_style:
+            fill = first_style.color_rgb.as_tuple()
+        words = text.upper().split()
+        lines: list[str] = []
+        current = ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            try:
+                bbox = draw.textbbox((0, 0), candidate, font=font)
+                candidate_width = bbox[2] - bbox[0]
+            except Exception:
+                candidate_width = len(candidate) * font_size
+            if current and candidate_width > text_area_w:
+                lines.append(current)
+                current = word
+            else:
+                current = candidate
+        if current:
+            lines.append(current)
+        lines = lines[:2]
+        line_height = int(font_size * 1.05)
+        total_h = max(1, len(lines) * line_height)
+        y = max(2, (height - total_h) // 2)
+        x = max(6, int(width * 0.035))
+        for line in lines:
+            draw.text((x, y), line, fill=fill, font=font)
+            y += line_height
+    else:
+        fallback = render_blurred_fit_resize(source, width, height)
+        canvas.paste(fallback.crop((0, 0, int(width * 0.72), height)), (0, 0))
+
+    return canvas
+
+
+def wrap_plain_text_to_width(draw: ImageDraw.ImageDraw, text: str, font: Any, max_width: int) -> list[str]:
+    lines: list[str] = []
+    paragraphs = [part.strip() for part in text.replace("\r", "\n").split("\n")]
+    for paragraph in paragraphs:
+        if not paragraph:
+            continue
+        current = ""
+        for word in paragraph.split():
+            candidate = f"{current} {word}".strip()
+            if text_width(draw, candidate, font) <= max_width:
+                current = candidate
+                continue
+            if current:
+                lines.append(current)
+                current = ""
+            if text_width(draw, word, font) <= max_width:
+                current = word
+                continue
+            chunk = ""
+            for char in word:
+                candidate_chunk = f"{chunk}{char}"
+                if chunk and text_width(draw, candidate_chunk, font) > max_width:
+                    lines.append(chunk)
+                    chunk = char
+                else:
+                    chunk = candidate_chunk
+            current = chunk
+        if current:
+            lines.append(current)
+    return lines
+
+
+def fit_plain_text_to_box(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    max_width: int,
+    max_height: int,
+    *,
+    max_font_size: int,
+    min_font_size: int = 8,
+    bold: bool = True,
+) -> tuple[list[str], int, int, bool]:
+    text = " ".join(text.split())
+    if not text:
+        return [], min_font_size, int(min_font_size * 1.12), False
+
+    for font_size in range(max_font_size, min_font_size - 1, -1):
+        font = get_font(font_size, bold=bold)
+        line_height = max(9, int(font_size * 1.12))
+        words_fit = all(text_width(draw, word, font) <= max_width for word in text.split())
+        lines = wrap_plain_text_to_width(draw, text, font, max_width)
+        if lines and words_fit and len(lines) * line_height <= max_height:
+            return lines, font_size, line_height, False
+
+    font = get_font(min_font_size, bold=bold)
+    line_height = max(9, int(min_font_size * 1.12))
+    lines = wrap_plain_text_to_width(draw, text, font, max_width)
+    max_lines = max(1, max_height // line_height)
+    overflow = len(lines) > max_lines
+    lines = lines[:max_lines]
+    if overflow and lines:
+        suffix = "..."
+        while lines[-1] and text_width(draw, f"{lines[-1]}{suffix}", font) > max_width:
+            lines[-1] = lines[-1][:-1].rstrip()
+        lines[-1] = f"{lines[-1]}{suffix}" if lines[-1] else suffix
+    return lines, min_font_size, line_height, overflow
+
+
+def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    bg = analysis.background.dominant_color_rgb.as_tuple() if analysis.background.dominant_color_rgb else _sample_edge_color(source)
+    canvas = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(canvas)
+    lighter = tuple(min(255, int(channel * 1.12 + 8)) for channel in bg)
+    darker = tuple(max(0, int(channel * 0.82)) for channel in bg)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = tuple(int(lighter[i] * (1 - t) + darker[i] * t) for i in range(3))
+        draw.line((0, y, width, y), fill=color)
+
+    margin_x = max(10, int(width * 0.08))
+    top_margin = max(18, int(height * 0.055))
+    bottom_margin = max(14, int(height * 0.035))
+    product_layer = analysis.product_layers[0] if analysis.product_layers else None
+    product_box = product_layer.bbox.to_pixel_box(source.width, source.height) if product_layer else (0, 0, source.width, source.height)
+    product = source.crop(product_box).convert("RGBA")
+    product_max_w = max(1, width - margin_x * 2)
+    product_max_h = max(1, int(height * 0.42))
+    product_scale = min(product_max_w / max(1, product.width), product_max_h / max(1, product.height))
+    product = product.resize((max(1, int(product.width * product_scale)), max(1, int(product.height * product_scale))), Image.Resampling.LANCZOS)
+    product_x = (width - product.width) // 2
+    product_y = height - bottom_margin - product.height
+    shadow = Image.new("RGBA", product.size, (0, 0, 0, 0))
+    shadow_alpha = product.getchannel("A").filter(ImageFilter.GaussianBlur(radius=max(2, width // 45)))
+    shadow.putalpha(shadow_alpha.point(lambda value: int(value * 0.22)))
+    canvas.paste(shadow.convert("RGB"), (product_x + max(1, width // 80), product_y + max(2, height // 160)), shadow)
+    canvas.paste(product.convert("RGB"), (product_x, product_y), product)
+
+    text_candidates = analysis.marketing_text_layers or analysis.text_layers
+    text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
+    text_meta = {"textOverflow": False, "lineCount": 0, "fontSize": 0}
+    if text:
+        text_top = top_margin
+        text_bottom = max(text_top + 1, product_y - max(14, int(height * 0.035)))
+        text_area_w = max(1, width - margin_x * 2)
+        text_area_h = max(1, text_bottom - text_top)
+        max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.18)))
+        first_style = text_candidates[0].text_style if text_candidates else None
+        fill = first_style.color_rgb.as_tuple() if first_style else (18, 28, 45)
+        is_bold = True if first_style is None else first_style.is_bold
+        display_text = text.upper() if first_style and first_style.uppercase else text
+        lines, font_size, line_height, overflow = fit_plain_text_to_box(
+            draw,
+            display_text,
+            text_area_w,
+            text_area_h,
+            max_font_size=max_font,
+            min_font_size=8,
+            bold=is_bold,
+        )
+        font = get_font(font_size, bold=is_bold)
+        total_h = len(lines) * line_height
+        y = text_top + max(0, (text_area_h - total_h) // 2)
+        for line in lines:
+            line_w = text_width(draw, line, font)
+            x = margin_x + max(0, int((text_area_w - line_w) / 2))
+            draw.text((x, y), line, fill=fill, font=font)
+            y += line_height
+        text_meta = {"textOverflow": overflow, "lineCount": len(lines), "fontSize": font_size}
+
+    return canvas, {
+        "provider": "local",
+        "strategy": "large_rectangle_relayout",
+        **text_meta,
+    }
+
+
+def build_outpaint_seed_and_mask(source: Image.Image, width: int, height: int, plan: Any) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
+    source_rgba = source.convert("RGBA")
+    seed = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    mask = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+
+    scale = min(width / source.width, height / source.height)
+    resized_size = (
+        max(1, int(round(source.width * scale))),
+        max(1, int(round(source.height * scale))),
+    )
+    resized = source_rgba.resize(resized_size, Image.Resampling.LANCZOS)
+    paste_x = (width - resized.width) // 2
+    paste_y = (height - resized.height) // 2
+    if plan.logic_bucket == LogicBucket.VERTICAL_SQUARE and height > width:
+        paste_y = max(0, min(height - resized.height, int(height * 0.30)))
+    elif plan.logic_bucket == LogicBucket.LANDSCAPE_WIDE and width > height:
+        paste_x = max(0, min(width - resized.width, int(width * 0.50 - resized.width * 0.50)))
+
+    seed.paste(resized, (paste_x, paste_y), resized)
+    keep = Image.new("RGBA", resized.size, (255, 255, 255, 255))
+    mask.paste(keep, (paste_x, paste_y), keep)
+    return seed, mask, {
+        "sourcePasteBox": [paste_x, paste_y, paste_x + resized.width, paste_y + resized.height],
+        "sourceScale": round(scale, 4),
+    }
+
+
+def build_openai_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
+    product_notes = ", ".join(layer.id for layer in analysis.product_layers[:3]) or "main product"
+    text_notes = ", ".join(layer.original_text for layer in analysis.marketing_text_layers[:2]) or "existing ad text"
+    return (
+        "Extend this finished advertising creative to the transparent canvas area only. "
+        "Preserve the pasted original creative exactly: do not alter, translate, move, crop, blur, or redraw any existing text, logo, product label, product, person, or foreground object. "
+        "Fill only the transparent/masked area with a natural continuation of the existing background, matching lighting, blur, grain, color, texture, and perspective. "
+        f"Placement: {plan.placement_id}. Bucket: {plan.logic_bucket.value}. Important protected subjects: {product_notes}. Existing marketing text to preserve: {text_notes}. "
+        "No new text, no new logo, no watermark, no extra objects, no duplicated product."
+    )
+
+
+def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI outpaint resize.")
+
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
+    if quality not in {"low", "medium", "high", "auto"}:
+        quality = "medium"
+
+    seed, mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
+    image_file = io.BytesIO()
+    seed.save(image_file, format="PNG")
+    image_file.seek(0)
+    mask_file = io.BytesIO()
+    mask.save(mask_file, format="PNG")
+    mask_file.seek(0)
+
+    client = OpenAI(api_key=api_key)
+    response, api_variant = create_openai_image_edit_with_fallback(
+        client,
+        {
+            "model": model,
+            "image": ("smart-reframe-seed.png", image_file, "image/png"),
+            "mask": ("smart-reframe-mask.png", mask_file, "image/png"),
+            "prompt": build_openai_outpaint_prompt(plan, analysis),
+            "quality": quality,
+        },
+        [image_file, mask_file],
+        output_format="png",
+        size="auto",
+        width=width,
+        height=height,
+    )
+    rendered = decode_openai_image_response(response)
+    if rendered.size != (width, height):
+        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
+    return rendered, {
+        "provider": "openai",
+        "model": model,
+        "quality": quality,
+        "strategy": "openai_outpaint",
+        "apiVariant": api_variant,
+        **seed_meta,
+    }
+
+
+def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    if plan.logic_bucket == LogicBucket.NARROW_BANNER:
+        return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
+    if plan.logic_bucket == LogicBucket.LARGE_RECTANGLE and height / max(1, width) >= 1.5:
+        return render_large_rectangle_relayout(source, width, height, analysis)
+    if plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT:
+        try:
+            rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
+            return rendered, meta
+        except Exception as exc:
+            fallback = render_blurred_fit_resize(source, width, height)
+            return fallback, {"provider": "local", "strategy": "blurred_fit_fallback", "fallbackReason": str(exc)}
+    return render_blurred_fit_resize(source, width, height), {"provider": "local", "strategy": plan.expansion.strategy.value}
 
 
 def crop_to_ratio(image: Image.Image, focus_bbox: tuple[int, int, int, int], target_ratio: float, offset_x: int = 0, offset_y: int = 0) -> Image.Image:
@@ -8583,6 +9221,15 @@ def sanitize_stem(path: Path) -> str:
     return "".join(char if char.isalnum() or char in {"-", "_"} else "-" for char in path.stem.lower()).strip("-") or "creative"
 
 
+def sanitize_debug_token(value: Any) -> str:
+    token = str(value or "unknown").strip().lower().replace("_", "-")
+    return "".join(char if char.isalnum() or char == "-" else "-" for char in token).strip("-") or "unknown"
+
+
+def debug_strategy_filenames_enabled() -> bool:
+    return os.getenv("ADAPTIFAI_DEBUG_STRATEGY_FILENAMES", "0").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def source_suffix(path: Path) -> str:
     digest = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:6]
     return digest
@@ -8714,9 +9361,27 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                     rendered = render_translated_text(render_base, translated_blocks, render_plan=None)
                 except Exception:
                     rendered = render_base.copy()
+            openai_render_meta: dict[str, Any] | None = None
+            localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
+            has_openai_edit_work = any(
+                block.translate and text_changed(block.text, block.translated_text)
+                for block in translated_blocks
+            )
+            if localize_renderer == "openai" and has_openai_edit_work:
+                try:
+                    rendered, openai_render_meta = render_localize_with_openai_image_edit(
+                        source_image,
+                        translated_blocks,
+                        language,
+                        source_language,
+                        output_format,
+                    )
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"OpenAI image localization failed: {exc}") from exc
             token_masks = collect_token_masks(source_image, translated_blocks)
             mask_preview = build_text_mask(source_image, translated_blocks)
             mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-mask.png"
+            openai_edit_mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-openai-edit-mask.png"
             clean_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-clean.png"
             protected_mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-protected-mask.png"
             text_stroke_raw_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-text-stroke-raw.png"
@@ -8744,6 +9409,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             source_reference_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-source-style-reference.png"
             render_plan_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-render-plan.json"
             mask_preview.save(job_dir / mask_filename, "PNG")
+            build_openai_edit_mask(source_image, translated_blocks).save(job_dir / openai_edit_mask_filename, "PNG")
             gated_background.save(job_dir / clean_filename, "PNG")
             render_audit["translatedPreviewImage"].save(job_dir / translated_preview_filename, "PNG")
             render_audit["sourceReferenceImage"].save(job_dir / source_reference_filename, "PNG")
@@ -8983,6 +9649,8 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             debug_payload["cleanedImageWithoutText"] = f"/api/download/{job_dir.name}/{clean_filename}"
             debug_payload["finalLocalizedImageWithTranslatedText"] = final_localized_download_url
             debug_payload["tokenMaskPreview"] = f"/api/download/{job_dir.name}/{mask_filename}"
+            debug_payload["openAIImageEditMask"] = f"/api/download/{job_dir.name}/{openai_edit_mask_filename}"
+            debug_payload["renderProvider"] = openai_render_meta or {"provider": "local"}
             if rendered is not None and final_localized_download_url is not None:
                 asset = OutputAsset(
                     filename=filename,
@@ -9010,6 +9678,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                     "translated_text": editor_text,
                     "blocks": [block.model_dump() for block in translated_blocks],
                     "cleanup_status": cleanup_gate["cleanupStatus"],
+                    "render_provider": openai_render_meta or {"provider": "local"},
                     "final_asset_generated": rendered is not None,
                     "debug": debug_payload,
                     "fit": "cover",
@@ -9071,6 +9740,9 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
     canonical_placement_ids = list(dict.fromkeys(canonical_placement_id(item) for item in placement_ids))
     resolved_creative_modes = {canonical_placement_id(key): value for key, value in (creative_modes or {}).items()}
     resize_mode = os.getenv("ADAPTIFAI_RESIZE_FIT", "cover")
+    resize_strategy = os.getenv("ADAPTIFAI_RESIZE_STRATEGY", "smart-reframe").strip().lower()
+    smart_reframe_enabled = resize_strategy in {"smart-reframe", "smart", "reframe"}
+    safe_resize_strategy = resize_strategy in {"blurred-fit", "fit", "contain-blur", "safe"}
     parity_report = build_preview_template_parity_report(canonical_placement_ids)
     parity_report_filename = "previewTemplateParityReport.json"
     (job_dir / parity_report_filename).write_text(json.dumps(parity_report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -9078,11 +9750,19 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
     source_entries: list[dict[str, Any]] = []
     for image_path in image_paths(paths):
         source_image = Image.open(image_path).convert("RGB")
+        focus_bbox = (0, 0, source_image.width, source_image.height) if safe_resize_strategy else build_resize_focus_bbox(source_image)
+        visual_analysis = build_smart_reframe_analysis(source_image, focus_bbox)
+        reframe_plans = {
+            plan.placement_id: plan
+            for plan in SmartReframe(visual_analysis).execute_sync(canonical_placement_ids, custom_width, custom_height)
+        }
         source_entries.append(
             {
                 "path": image_path,
                 "image": source_image,
-                "focus_bbox": build_resize_focus_bbox(source_image),
+                "focus_bbox": focus_bbox,
+                "visual_analysis": visual_analysis,
+                "reframe_plans": reframe_plans,
             }
         )
 
@@ -9091,9 +9771,35 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
         width, height = resolve_resize_dimensions(canonical_id, custom_width, custom_height)
         placement_assets: list[dict[str, Any]] = []
         for source_entry in source_entries:
-            try:
-                rendered = smart_resize_image(source_entry["image"], width, height, placement_id=canonical_id)
-            except Exception:
+            plan = source_entry["reframe_plans"].get(canonical_id)
+            render_meta: dict[str, Any] = {"provider": "local", "strategy": "legacy"}
+            if smart_reframe_enabled and plan is not None:
+                rendered, render_meta = render_smart_reframe_image(
+                    source_entry["image"],
+                    width,
+                    height,
+                    plan,
+                    source_entry["visual_analysis"],
+                )
+            elif safe_resize_strategy:
+                rendered = render_blurred_fit_resize(source_entry["image"], width, height)
+                render_meta = {"provider": "local", "strategy": "blurred_fit"}
+            else:
+                try:
+                    rendered = smart_resize_image(source_entry["image"], width, height, placement_id=canonical_id)
+                    render_meta = {"provider": "local", "strategy": "legacy_smart_resize"}
+                except Exception:
+                    rendered = render_resize_image(
+                        source_entry["image"],
+                        width,
+                        height,
+                        fit=resize_mode,
+                        focus_bbox=source_entry["focus_bbox"],
+                    )
+                    render_meta = {"provider": "local", "strategy": "legacy_resize_fallback"}
+            if rendered.size != (width, height):
+                previous_size = rendered.size
+                previous_strategy = render_meta.get("strategy", "unknown")
                 rendered = render_resize_image(
                     source_entry["image"],
                     width,
@@ -9101,12 +9807,21 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                     fit=resize_mode,
                     focus_bbox=source_entry["focus_bbox"],
                 )
+                render_meta = {
+                    **render_meta,
+                    "provider": "local",
+                    "strategy": f"{previous_strategy}_dimension_fix",
+                    "fallbackReason": f"Rendered size {previous_size} did not match target {(width, height)}.",
+                }
             placement_assets.append(
                 {
                     "source_name": source_entry["path"].name,
                     "rendered": rendered,
                     "source_image": source_entry["image"],
                     "focus_bbox": source_entry["focus_bbox"],
+                    "reframe_plan": plan,
+                    "visual_analysis": source_entry["visual_analysis"],
+                    "render_meta": render_meta,
                 }
             )
         rendered_assets_by_placement[canonical_id] = placement_assets
@@ -9125,10 +9840,18 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                 creative_mode = "single"
             active_index = 0 if creative_mode == "single" else next((index for index, item in enumerate(rendered_set) if item["source_name"] == image_path.name), 0)
             rendered = rendered_set[active_index]["rendered"]
+            active_reframe_plan = rendered_set[active_index].get("reframe_plan")
+            active_visual_analysis = rendered_set[active_index].get("visual_analysis")
+            active_render_meta = rendered_set[active_index].get("render_meta") or {}
+            strategy_slug = sanitize_debug_token(active_render_meta.get("strategy") or (active_reframe_plan.expansion.strategy.value if active_reframe_plan is not None else resize_strategy))
+            bucket_slug = sanitize_debug_token(active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else "legacy")
             filename = resize_filename(image_path, canonical_id, output_format)
             save_image_output(rendered, job_dir / filename, normalize_output_format(output_format, image_path))
             raw_asset_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-raw-localized-asset.png"
-            resized_asset_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-resized-asset.png"
+            if debug_strategy_filenames_enabled():
+                resized_asset_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-{bucket_slug}-{strategy_slug}-resized-asset.png"
+            else:
+                resized_asset_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-resized-asset.png"
             preview_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-native-placement-preview.png"
             preview_template_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-preview-template-used.json"
             placement_render_log_filename = f"debug-{sanitize_stem(image_path)}-{canonical_id}-placement-render-log.json"
@@ -9160,7 +9883,12 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                 "targetWidth": width,
                 "targetHeight": height,
                 "resizeMode": resize_mode,
-                "cropBox": compute_resize_crop_box(source_image, focus_bbox, width / max(1, height)) if resize_mode == "cover" else None,
+                "resizeStrategy": resize_strategy,
+                "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
+                "renderMeta": active_render_meta,
+                "smartReframePlan": active_reframe_plan.model_dump(mode="json") if active_reframe_plan is not None else None,
+                "visualAnalysis": active_visual_analysis.model_dump(mode="json") if active_visual_analysis is not None else None,
+                "cropBox": None if (safe_resize_strategy or smart_reframe_enabled) else compute_resize_crop_box(source_image, focus_bbox, width / max(1, height)) if resize_mode == "cover" else None,
                 "focusBox": list(focus_bbox),
                 "protectedObjects": [list(focus_bbox)],
                 "safeZoneWarnings": safe_zone_warnings_for(canonical_id),
@@ -9197,6 +9925,10 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                     "width": width,
                     "height": height,
                     "fit": resize_mode,
+                    "resizeStrategy": resize_strategy,
+                    "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
+                    "renderMeta": active_render_meta,
+                    "smartReframePlan": active_reframe_plan.model_dump(mode="json") if active_reframe_plan is not None else None,
                     "scale": 100,
                     "translated_text": "",
                     "blocks": [],
@@ -9363,6 +10095,19 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
     if edit.text_italic:
         rendered = _apply_italic_shear(rendered, styled_blocks, edit.x, edit.y)
     output_path = job_dir / asset_meta["filename"]
+    localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
+    if localize_renderer == "openai" and any(block.translate and text_changed(block.text, block.translated_text) for block in styled_blocks):
+        try:
+            rendered, render_meta = render_localize_with_openai_image_edit(
+                source_image,
+                styled_blocks,
+                str(asset_meta.get("language") or "EN"),
+                str(asset_meta.get("source_language") or "EN"),
+                output_path.suffix.lower().lstrip(".") or "png",
+            )
+            asset_meta["render_provider"] = render_meta
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"OpenAI image localization failed: {exc}") from exc
     save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
     asset_meta["translated_text"] = "\n\n".join(editor_parts)
     asset_meta["blocks"] = [block.model_dump() for block in updated_blocks]
@@ -9383,7 +10128,32 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
 def regenerate_resize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: EditRequest) -> OutputAsset:
     source_image = Image.open(asset_meta["source_path"]).convert("RGB")
     focus_bbox = build_resize_focus_bbox(source_image)
-    rendered = render_resize_image(source_image, int(asset_meta["width"]), int(asset_meta["height"]), edit.fit, edit.scale, edit.x, edit.y, focus_bbox=focus_bbox)
+    resize_strategy = os.getenv("ADAPTIFAI_RESIZE_STRATEGY", "smart-reframe").strip().lower()
+    if (
+        resize_strategy in {"smart-reframe", "smart", "reframe"}
+        and edit.fit == "cover"
+        and edit.scale == 100
+        and edit.x == 0
+        and edit.y == 0
+    ):
+        analysis = build_smart_reframe_analysis(source_image, focus_bbox)
+        plan = SmartReframe(analysis).execute_sync([str(asset_meta.get("placement_id") or "custom-display")])[0]
+        rendered, render_meta = render_smart_reframe_image(source_image, int(asset_meta["width"]), int(asset_meta["height"]), plan, analysis)
+        asset_meta["resize_strategy"] = resize_strategy
+        asset_meta["smart_reframe_plan"] = plan.model_dump(mode="json")
+        asset_meta["render_meta"] = render_meta
+    elif (
+        resize_strategy in {"blurred-fit", "fit", "contain-blur", "safe"}
+        and edit.fit == "cover"
+        and edit.scale == 100
+        and edit.x == 0
+        and edit.y == 0
+    ):
+        rendered = render_blurred_fit_resize(source_image, int(asset_meta["width"]), int(asset_meta["height"]))
+        asset_meta["render_meta"] = {"provider": "local", "strategy": "blurred_fit"}
+    else:
+        rendered = render_resize_image(source_image, int(asset_meta["width"]), int(asset_meta["height"]), edit.fit, edit.scale, edit.x, edit.y, focus_bbox=focus_bbox)
+        asset_meta["render_meta"] = {"provider": "local", "strategy": "manual_resize"}
     output_path = job_dir / asset_meta["filename"]
     save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
     asset_meta["fit"] = edit.fit
