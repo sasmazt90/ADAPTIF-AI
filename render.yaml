@@ -2,7 +2,9 @@ services:
   - type: web
     name: adaptifai-backend
     runtime: docker
-    rootDir: backend
+    rootDir: .
+    dockerfilePath: backend/Dockerfile
+    dockerContext: .
     plan: standard
     healthCheckPath: /health
     disk:
