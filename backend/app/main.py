@@ -8640,22 +8640,94 @@ def build_bottom_locked_hero(
     }
 
 
+def build_integrated_vertical_reframe(
+    source: Image.Image,
+    width: int,
+    height: int,
+    product_box: tuple[int, int, int, int],
+) -> tuple[Image.Image, tuple[int, int, int, int], tuple[int, int, int, int], dict[str, Any]]:
+    target_ratio = width / max(1, height)
+    crop_h = source.height
+    crop_w = max(1, min(source.width, int(round(crop_h * target_ratio))))
+    product_left, product_top, product_right, product_bottom = product_box
+    product_center_x = (product_left + product_right) / 2
+    focus_x = product_left * 0.42 + product_center_x * 0.58
+    crop_left = clamp_int(focus_x - crop_w * 0.5, 0, source.width - crop_w)
+    crop_box = (crop_left, 0, crop_left + crop_w, source.height)
+    canvas = source.crop(crop_box).resize((width, height), Image.Resampling.LANCZOS)
+    scale_x = width / max(1, crop_w)
+    scale_y = height / max(1, crop_h)
+    mapped_product = (
+        clamp_int((product_left - crop_left) * scale_x, 0, width),
+        clamp_int(product_top * scale_y, 0, height),
+        clamp_int((product_right - crop_left) * scale_x, 0, width),
+        clamp_int(product_bottom * scale_y, 0, height),
+    )
+    return canvas, mapped_product, crop_box, {
+        "sourceCropBox": list(crop_box),
+        "mappedProductBox": list(mapped_product),
+        "sourceScaleX": round(scale_x, 4),
+        "sourceScaleY": round(scale_y, 4),
+    }
+
+
+def build_clean_source_texture_fill(
+    source: Image.Image,
+    width: int,
+    height: int,
+    text_source_boxes: list[tuple[int, int, int, int]],
+) -> tuple[Image.Image, dict[str, Any]]:
+    text_bottom = max((box[3] for box in text_source_boxes), default=int(source.height * 0.38))
+    text_right = max((box[2] for box in text_source_boxes), default=0)
+    sample_top = 0
+    sample_bottom = min(source.height, max(int(source.height * 0.38), text_bottom + int(source.height * 0.08)))
+    sample_left = min(source.width - 1, text_right + int(source.width * 0.035))
+    if source.width - sample_left < max(80, int(source.width * 0.14)):
+        sample_left = int(source.width * 0.70)
+    sample_box = (
+        max(0, min(source.width - 1, sample_left)),
+        sample_top,
+        source.width,
+        max(sample_top + 1, sample_bottom),
+    )
+    texture = source.crop(sample_box).convert("RGB")
+    if texture.width < 4 or texture.height < 4:
+        texture = source.crop((int(source.width * 0.62), 0, source.width, max(1, sample_bottom))).convert("RGB")
+        sample_box = (int(source.width * 0.62), 0, source.width, max(1, sample_bottom))
+    texture = ImageOps.fit(texture, (width, height), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    texture = texture.filter(ImageFilter.GaussianBlur(radius=1.2))
+    try:
+        import cv2
+
+        arr = np.array(texture.convert("RGB"), dtype=np.uint8)
+        float_arr = arr.astype(np.float32)
+        luma = float_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        chroma = float_arr.max(axis=2) - float_arr.min(axis=2)
+        dark_cutoff = min(150.0, float(np.percentile(luma, 36)))
+        mask = ((luma < dark_cutoff) & (chroma > 16)).astype(np.uint8) * 255
+        if int(np.count_nonzero(mask)) > max(8, width * height * 0.01):
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            cleaned = cv2.inpaint(arr, mask, 5, cv2.INPAINT_TELEA)
+            texture = Image.fromarray(cleaned, "RGB").filter(ImageFilter.GaussianBlur(radius=0.4))
+    except Exception:
+        pass
+    return texture, {"textureSampleBox": list(sample_box)}
+
+
 def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     margin_x = max(10, int(width * 0.08))
-    top_margin = max(16, int(height * 0.055))
+    top_margin = max(10, int(height * 0.035))
     product_box = relayout_product_box(source, analysis)
-    hero_top = clamp_int(height * (0.48 if width <= 180 else 0.50), int(height * 0.40), int(height * 0.54))
     text_source_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
-    hero_min_source_y = min(max((box[3] for box in text_source_boxes), default=0) + int(source.height * 0.04), int(source.height * 0.52))
-    hero_min_source_x = min(
-        max((box[2] for box in text_source_boxes), default=0) + int(source.width * 0.012),
-        int(source.width * 0.45),
+    canvas, mapped_product, _crop_box, crop_meta = build_integrated_vertical_reframe(source, width, height, product_box)
+    copy_fill_bottom = clamp_int(
+        min(mapped_product[1] - max(8, int(height * 0.018)), height * (0.55 if width <= 180 else 0.50)),
+        int(height * 0.38),
+        int(height * 0.58),
     )
-    hero, hero_meta = build_bottom_locked_hero(source, width, height, hero_top, product_box, hero_min_source_y, hero_min_source_x)
-    panel_sample_h = max(1, min(source.height, int(source.height * 0.38)))
-    panel_sample = source.crop((0, 0, source.width, panel_sample_h))
-    canvas = build_clean_gradient_panel((width, height), panel_sample, vertical=True)
-    canvas.paste(hero, (0, hero_top))
+    texture_fill, texture_meta = build_clean_source_texture_fill(source, width, copy_fill_bottom, text_source_boxes)
+    canvas.paste(texture_fill, (0, 0))
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
@@ -8663,10 +8735,10 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
     if text:
         draw = ImageDraw.Draw(canvas)
         text_top = top_margin
-        text_bottom = hero_top - max(22, int(height * 0.045))
+        text_bottom = copy_fill_bottom - max(8, int(height * 0.018))
         text_area_w = max(1, width - margin_x * 2)
         text_area_h = max(1, text_bottom - text_top)
-        max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.22)))
+        max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.24)))
         first_style = text_candidates[0].text_style if text_candidates else None
         fill = first_style.color_rgb.as_tuple() if first_style else (18, 28, 45)
         is_bold = True if first_style is None else first_style.is_bold
@@ -8693,8 +8765,10 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
     return canvas, {
         "provider": "local",
         "strategy": "large_rectangle_relayout",
-        "backgroundMode": "clean_gradient_panel_bottom_locked_hero",
-        **hero_meta,
+        "backgroundMode": "integrated_vertical_crop_texture_fill",
+        "copyFillBottom": copy_fill_bottom,
+        **crop_meta,
+        **texture_meta,
         **text_meta,
     }
 

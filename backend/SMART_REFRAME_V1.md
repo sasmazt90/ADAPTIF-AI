@@ -82,8 +82,9 @@ The backend model represents these as named fields.
   marks generative expansion as necessary.
 - `hybrid_relayout`: local Pillow renderer for narrow banners.
 - `large_rectangle_relayout`: local Pillow renderer for `160x600` and `300x600`
-  placements; product is placed near the bottom and marketing copy is fitted in
-  the upper safe area.
+  placements. It keeps one integrated vertical creative: product remains sharp
+  in the lower half, the upper copy area is filled from clean source texture
+  or inpainted background, and text never overlaps the product.
 - `pillow_extend` / `opencv_inpaint`: local deterministic routes; currently
   rendered through the safe blurred-fit compositor until deeper local infill is
   promoted.
