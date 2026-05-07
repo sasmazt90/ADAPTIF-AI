@@ -480,27 +480,52 @@ def text_tokens(text: str) -> set[str]:
     return {token for token in re.split(r"[^a-z0-9]+", normalize_ocr_text(text)) if len(token) >= 3}
 
 
+PACKAGING_CUE_TERMS = (
+    "dr scholl",
+    "scholl",
+    "deodorant",
+    "deo",
+    "chauss",
+    "shoe",
+    "schuh",
+    "geruch",
+    "odeur",
+    "protection",
+    "technolog",
+    "48h",
+    "24h",
+    "instant",
+    "bioderma",
+    "photoderm",
+    "sensibio",
+    "atoderm",
+    "sebium",
+    "naos",
+    "laboratoire",
+    "dermatologique",
+    "spf",
+    "uva",
+    "uvb",
+    "uvr",
+    "fluid",
+    "fluide",
+    "ultra fluid",
+    "ultra-fluid",
+    "xdefense",
+    "invisible",
+    "sun active",
+    "active defense",
+    "ecobiology",
+    "eco biology",
+    "ml",
+    "fl oz",
+    "fl.oz",
+)
+
+
 def has_packaging_cues(text: str) -> bool:
-    normalized = normalize_ocr_text(text)
-    return any(
-        cue in normalized
-        for cue in (
-            "dr scholl",
-            "scholl",
-            "deodorant",
-            "deo",
-            "chauss",
-            "shoe",
-            "schuh",
-            "geruch",
-            "odeur",
-            "protection",
-            "technolog",
-            "48h",
-            "24h",
-            "instant",
-        )
-    )
+    normalized = normalize_match_text(text)
+    return any(normalize_match_text(cue) in normalized for cue in PACKAGING_CUE_TERMS)
 
 
 def normalize_ocr_text(text: str) -> str:
@@ -915,26 +940,7 @@ def suppress_packaging_translation(blocks: list[TextBlock], image_size: tuple[in
         overlap_with_foreground = overlap_fraction(block.bbox, foreground_bbox) if foreground_bbox else 0.0
         normalized = block.text.lower()
         word_count = len([part for part in re.split(r"\s+", normalized) if part])
-        packaging_cues = any(
-            token in normalized
-            for token in (
-                "deodorant",
-                "deo",
-                "geruch",
-                "odour",
-                "odeur",
-                "chauss",
-                "shoe",
-                "schuh",
-                "ml",
-                "dr.scholl",
-                "scholl",
-                "protection",
-                "technologie",
-                "types",
-                "efficac",
-            )
-        )
+        packaging_cues = has_packaging_cues(block.text)
         likely_packaging = (
             block.surface in {"packaging", "product"}
             or (
@@ -955,9 +961,9 @@ def suppress_packaging_translation(blocks: list[TextBlock], image_size: tuple[in
                 )
             )
             or (
-                overlap_with_foreground >= 0.78
+                overlap_with_foreground >= 0.55
                 and packaging_cues
-                and word_count >= 4
+                and word_count >= 1
                 and block_width <= image_width * 0.5
                 and block_height <= image_height * 0.2
             )
@@ -1560,7 +1566,7 @@ def translate_with_gpt4o(blocks: list[TextBlock], languages: list[str]) -> dict[
 
     client = OpenAI()
     prompt = {
-        "task": "Translate every source string into the requested target language as natural ad copy. Only keep protected brand/product tokens unchanged. Preserve [BOLD]...[/BOLD] tags exactly around the semantically emphasized phrase. Return one translated string per source string in the same order. Keep brand names, product names, packaging labels, URLs, QR references, Android TV, iPad Pro, H2O, Ask.NAOS.com, Dr.Scholl's and Scholl unchanged unless grammar absolutely requires surrounding words to change. Keep metric tokens exactly unchanged when they appear, including patterns like 24h, 48H, 84%, 88%, 2.4G+5G and Dual-Band. Translate surrounding claim language naturally.",
+        "task": "Translate every source string into the requested target language as faithful marketing localization, not free transcreation. Preserve the exact meaning, claim scope, and emphasis. Do not add product names, SKU names, model names, brand names, or new claims that are not present in the source string. Only keep protected brand/product tokens unchanged when they are already present in that source string. Preserve [BOLD]...[/BOLD] tags exactly around the semantically emphasized phrase. Preserve meaningful line breaks: if a source line is a separate visual/emphasized claim, keep its translation as a separate line and do not merge it into another style line. Return one translated string per source string in the same order. Keep existing brand names, product names, packaging labels, URLs, QR references, Android TV, iPad Pro, H2O, Ask.NAOS.com, Dr.Scholl's and Scholl unchanged unless grammar absolutely requires surrounding words to change. Keep metric tokens exactly unchanged when they appear, including patterns like 24h, 48H, 84%, 88%, 2.4G+5G and Dual-Band. Translate surrounding claim language naturally but faithfully.",
         "target_languages": {language: LANGUAGE_NAMES.get(language.upper(), language) for language in languages},
         "strings": source,
     }
@@ -7470,8 +7476,62 @@ def image_to_png_bytes(image: Image.Image) -> io.BytesIO:
     return buffer
 
 
-def build_openai_edit_mask(image: Image.Image, blocks: list[TextBlock]) -> Image.Image:
-    edit_luma = build_text_mask(image, blocks, padding=34)
+def is_localize_marketing_edit_block(
+    block: TextBlock,
+    image_size: tuple[int, int],
+    foreground_bbox: tuple[int, int, int, int] | None = None,
+) -> bool:
+    if not block.translate or not text_changed(block.text, block.translated_text):
+        return False
+    if block.surface != "overlay":
+        return False
+    width, height = image_size
+    block_width = max(1, block.bbox[2] - block.bbox[0])
+    block_height = max(1, block.bbox[3] - block.bbox[1])
+    overlap_with_foreground = overlap_fraction(block.bbox, foreground_bbox) if foreground_bbox else 0.0
+    center_x = (block.bbox[0] + block.bbox[2]) / 2
+    product_label_like = (
+        has_packaging_cues(block.text)
+        and block_width <= max(1, width) * 0.5
+        and block_height <= max(1, height) * 0.25
+        and (overlap_with_foreground >= 0.22 or center_x >= max(1, width) * 0.45)
+    )
+    return not product_label_like
+
+
+def localize_edit_boxes_for_block(block: TextBlock, image_size: tuple[int, int]) -> list[tuple[int, int, int, int]]:
+    width, height = image_size
+    regions = block.line_boxes if block.surface == "overlay" and block.line_boxes else [block.clean_box or block.bbox]
+    boxes: list[tuple[int, int, int, int]] = []
+    for left, top, right, bottom in regions:
+        if right <= left or bottom <= top:
+            continue
+        pad_x = max(3, min(16, int(round(max(block.font_size_estimate, right - left) * 0.035))))
+        pad_y = max(2, min(10, int(round(max(block.line_height_estimate, bottom - top) * 0.08))))
+        boxes.append(
+            (
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(width, right + pad_x),
+                min(height, bottom + pad_y),
+            )
+        )
+    return boxes
+
+
+def build_openai_localize_edit_mask(
+    image: Image.Image,
+    blocks: list[TextBlock],
+    foreground_bbox: tuple[int, int, int, int] | None = None,
+) -> Image.Image:
+    edit_luma = Image.new("L", image.size, 0)
+    draw = ImageDraw.Draw(edit_luma)
+    for block in blocks:
+        if not is_localize_marketing_edit_block(block, image.size, foreground_bbox):
+            continue
+        for box in localize_edit_boxes_for_block(block, image.size):
+            draw.rectangle(box, fill=255)
+    edit_luma = edit_luma.filter(ImageFilter.GaussianBlur(radius=0.35))
     alpha = ImageChops.invert(edit_luma).point(lambda value: 0 if value < 18 else value)
     mask = Image.new("RGBA", image.size, (255, 255, 255, 255))
     mask.putalpha(alpha)
@@ -7552,16 +7612,31 @@ def build_openai_localize_prompt(
     blocks: list[TextBlock],
     target_language: str,
     source_language: str,
+    image_size: tuple[int, int],
+    foreground_bbox: tuple[int, int, int, int] | None = None,
 ) -> str:
     source_items: list[dict[str, Any]] = []
     for block in blocks:
-        if not block.translate or not text_changed(block.text, block.translated_text):
+        if not is_localize_marketing_edit_block(block, image_size, foreground_bbox):
             continue
+        source_lines = block.line_texts or [block.text]
+        replacement_lines = [line.strip() for line in (block.translated_text or block.text).splitlines() if line.strip()]
+        line_boxes = localize_edit_boxes_for_block(block, image_size)
         source_items.append(
             {
                 "source_text": block.text,
                 "replacement_text": block.translated_text or block.text,
                 "bbox": list(block.bbox),
+                "line_mapping": [
+                    {
+                        "source_line": source_lines[index] if index < len(source_lines) else block.text,
+                        "replacement_line": replacement_lines[index] if index < len(replacement_lines) else "",
+                        "editable_box": list(line_boxes[index]) if index < len(line_boxes) else list(block.bbox),
+                    }
+                    for index in range(max(len(source_lines), len(replacement_lines), len(line_boxes), 1))
+                ],
+                "source_style_spans": block.source_style_spans,
+                "translated_style_spans": block.translated_style_spans,
                 "style": {
                     "font_weight": block.font_weight,
                     "font_size_estimate": block.font_size_estimate,
@@ -7571,18 +7646,33 @@ def build_openai_localize_prompt(
                 },
             }
         )
+    protected_items = [
+        {
+            "text": block.text,
+            "bbox": list(block.bbox),
+            "surface": block.surface,
+            "reason": "product_or_packaging_text" if block.surface in {"packaging", "product"} or has_packaging_cues(block.text) else "non_marketing_text",
+        }
+        for block in blocks
+        if not any(item.get("source_text") == block.text for item in source_items)
+        and (block.surface in {"packaging", "product"} or has_packaging_cues(block.text) or not block.translate)
+    ][:30]
 
     return (
-        "Edit the provided ad creative for marketing text localization.\n"
+        "Edit the provided ad creative for strict marketing text localization.\n"
         f"Source language: {source_language}. Target language: {LANGUAGE_NAMES.get(target_language.upper(), target_language)} ({target_language}).\n"
-        "Replace only the source marketing text listed below with its replacement text.\n"
-        "Preserve the same visual design: font style, approximate weight, color, casing, line spacing, alignment, and placement.\n"
-        "Keep the product, packaging, person, objects, background, lighting, shadows, composition, and all non-marketing text unchanged.\n"
-        "Do not translate, redraw, blur, or alter any product label, ingredient text, logo text, brand mark, QR code, UI chrome, or small packaging text.\n"
-        "Use the mask only as guidance for the editable marketing text region; avoid edits outside that region.\n"
-        "Do not add new logos, watermarks, badges, or extra copy.\n"
+        "Hard contract:\n"
+        "1. Replace ONLY the editable source marketing text items listed in Text replacements JSON.\n"
+        "2. Use each replacement_text exactly. Do not paraphrase, summarize, reorder, add product names, add SKU names, or invent new copy.\n"
+        "3. If replacement_text has line breaks, keep those line breaks. If line_mapping is present, map each replacement_line to the corresponding source_line/editable_box.\n"
+        "4. Transfer style semantically and visually: source blue text stays blue in the corresponding translated words; source white text on a yellow highlight stays white on the same yellow highlight; font weight, casing, size hierarchy, alignment, background color, and spacing must match the source region.\n"
+        "5. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
+        "6. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
+        "7. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
+        "8. Do not add new logos, watermarks, badges, product names, or extra copy.\n"
         "Return a finished localized image only.\n"
-        f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}"
+        f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}\n"
+        f"Protected non-editable text hints JSON:\n{json.dumps(protected_items, ensure_ascii=False, indent=2)}"
     )
 
 
@@ -7603,8 +7693,9 @@ def render_localize_with_openai_image_edit(
         quality = "medium"
 
     extension = normalize_output_format(output_format)
-    prompt = build_openai_localize_prompt(translated_blocks, target_language, source_language)
-    mask_image = build_openai_edit_mask(source_image, translated_blocks)
+    foreground_bbox = detect_foreground_bbox(source_image)
+    prompt = build_openai_localize_prompt(translated_blocks, target_language, source_language, source_image.size, foreground_bbox)
+    mask_image = build_openai_localize_edit_mask(source_image, translated_blocks, foreground_bbox)
     image_file = image_to_png_bytes(source_image)
     mask_file = io.BytesIO()
     mask_image.save(mask_file, format="PNG")
@@ -7635,7 +7726,9 @@ def render_localize_with_openai_image_edit(
         "model": model,
         "quality": quality,
         "apiVariant": api_variant,
-        "maskedBlocks": len([block for block in translated_blocks if block.translate and text_changed(block.text, block.translated_text)]),
+        "maskedBlocks": len([block for block in translated_blocks if is_localize_marketing_edit_block(block, source_image.size, foreground_bbox)]),
+        "maskMode": "strict_marketing_line_boxes",
+        "styleContract": "exact_replacement_text_semantic_style_lock",
         "outputFormat": openai_output_format_for(extension),
     }
 
@@ -9670,8 +9763,9 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                     rendered = render_base.copy()
             openai_render_meta: dict[str, Any] | None = None
             localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
+            localize_foreground_bbox = detect_foreground_bbox(source_image)
             has_openai_edit_work = any(
-                block.translate and text_changed(block.text, block.translated_text)
+                is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
                 for block in translated_blocks
             )
             if localize_renderer == "openai" and has_openai_edit_work:
@@ -9716,7 +9810,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             source_reference_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-source-style-reference.png"
             render_plan_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-render-plan.json"
             mask_preview.save(job_dir / mask_filename, "PNG")
-            build_openai_edit_mask(source_image, translated_blocks).save(job_dir / openai_edit_mask_filename, "PNG")
+            build_openai_localize_edit_mask(source_image, translated_blocks, detect_foreground_bbox(source_image)).save(job_dir / openai_edit_mask_filename, "PNG")
             gated_background.save(job_dir / clean_filename, "PNG")
             render_audit["translatedPreviewImage"].save(job_dir / translated_preview_filename, "PNG")
             render_audit["sourceReferenceImage"].save(job_dir / source_reference_filename, "PNG")
@@ -10403,7 +10497,11 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
         rendered = _apply_italic_shear(rendered, styled_blocks, edit.x, edit.y)
     output_path = job_dir / asset_meta["filename"]
     localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
-    if localize_renderer == "openai" and any(block.translate and text_changed(block.text, block.translated_text) for block in styled_blocks):
+    localize_foreground_bbox = detect_foreground_bbox(source_image)
+    if localize_renderer == "openai" and any(
+        is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
+        for block in styled_blocks
+    ):
         try:
             rendered, render_meta = render_localize_with_openai_image_edit(
                 source_image,
