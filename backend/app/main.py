@@ -8578,25 +8578,92 @@ def relayout_product_box(source: Image.Image, analysis: VisualAnalysis) -> tuple
     )
 
 
+def build_clean_gradient_panel(size: tuple[int, int], sample_image: Image.Image, *, vertical: bool = True) -> Image.Image:
+    width, height = size
+    sample = np.array(sample_image.convert("RGB"), dtype=np.float32)
+    if sample.size == 0:
+        top_tint = np.array([220, 230, 244], dtype=np.float32)
+        bottom_tint = np.array([198, 214, 232], dtype=np.float32)
+    else:
+        pixels = sample.reshape(-1, 3)
+        top_tint = np.percentile(pixels, 86, axis=0)
+        bottom_tint = np.percentile(pixels, 62, axis=0)
+    top_tint = np.clip([top_tint[0] * 0.96 + 4, top_tint[1] * 1.02 + 6, top_tint[2] * 1.10 + 12], 0, 255)
+    bottom_tint = np.clip([bottom_tint[0] * 0.96 + 4, bottom_tint[1] * 1.02 + 6, bottom_tint[2] * 1.08 + 10], 0, 255)
+    panel = Image.new("RGB", (width, height), tuple(int(value) for value in top_tint))
+    draw_panel = ImageDraw.Draw(panel)
+    steps = height if vertical else width
+    for index in range(max(1, steps)):
+        t = index / max(1, steps - 1)
+        color = tuple(int(top_tint[channel] * (1 - t) + bottom_tint[channel] * t) for channel in range(3))
+        if vertical:
+            draw_panel.line((0, index, width, index), fill=color)
+        else:
+            draw_panel.line((index, 0, index, height), fill=color)
+    return panel
+
+
+def build_bottom_locked_hero(
+    source: Image.Image,
+    width: int,
+    height: int,
+    hero_top: int,
+    product_box: tuple[int, int, int, int],
+    min_source_y: int = 0,
+    min_source_x: int = 0,
+) -> tuple[Image.Image, dict[str, Any]]:
+    hero_h = max(1, height - hero_top)
+    target_ratio = width / max(1, hero_h)
+    product_left, product_top, product_right, product_bottom = product_box
+    product_center_x = product_left * 0.55 + ((product_left + product_right) / 2) * 0.45
+    min_source_y = max(0, min(source.height - 1, min_source_y))
+    available_h = max(1, source.height - min_source_y)
+    crop_h = available_h
+    crop_w = max(1, int(round(crop_h * target_ratio)))
+    if crop_w > source.width:
+        crop_w = source.width
+        crop_h = max(1, min(source.height, int(round(crop_w / max(0.01, target_ratio)))))
+    min_source_x = max(0, min(source.width - crop_w, min_source_x))
+    crop_left = clamp_int(product_center_x - crop_w * 0.5, min_source_x, source.width - crop_w)
+    desired_top = max(min_source_y, product_top - crop_h * 0.22)
+    crop_top = clamp_int(desired_top, min_source_y, source.height - crop_h)
+    if product_bottom > crop_top + crop_h:
+        crop_top = clamp_int(product_bottom - crop_h, min_source_y, source.height - crop_h)
+    crop_box = (crop_left, crop_top, crop_left + crop_w, crop_top + crop_h)
+    hero = source.crop(crop_box).resize((width, hero_h), Image.Resampling.LANCZOS)
+    return hero, {
+        "heroTop": hero_top,
+        "heroCropBox": list(crop_box),
+        "heroHeight": hero_h,
+        "heroMinSourceY": min_source_y,
+        "heroMinSourceX": min_source_x,
+    }
+
+
 def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     margin_x = max(10, int(width * 0.08))
-    top_margin = max(18, int(height * 0.055))
+    top_margin = max(16, int(height * 0.055))
     product_box = relayout_product_box(source, analysis)
-    canvas, mapped_product, crop_meta = build_content_aware_reframe_canvas(source, width, height, product_box)
+    hero_top = clamp_int(height * (0.48 if width <= 180 else 0.50), int(height * 0.40), int(height * 0.54))
+    text_source_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
+    hero_min_source_y = min(max((box[3] for box in text_source_boxes), default=0) + int(source.height * 0.04), int(source.height * 0.52))
+    hero_min_source_x = min(
+        max((box[2] for box in text_source_boxes), default=0) + int(source.width * 0.012),
+        int(source.width * 0.45),
+    )
+    hero, hero_meta = build_bottom_locked_hero(source, width, height, hero_top, product_box, hero_min_source_y, hero_min_source_x)
+    panel_sample_h = max(1, min(source.height, int(source.height * 0.38)))
+    panel_sample = source.crop((0, 0, source.width, panel_sample_h))
+    canvas = build_clean_gradient_panel((width, height), panel_sample, vertical=True)
+    canvas.paste(hero, (0, hero_top))
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
     text_meta = {"textOverflow": False, "lineCount": 0, "fontSize": 0}
     if text:
-        text_top = top_margin
-        text_bottom = max(text_top + 1, min(int(height * 0.52), mapped_product[1] - max(10, int(height * 0.025))))
-        canvas = apply_copy_area_feather(
-            canvas,
-            copy_bottom=text_bottom + max(12, int(height * 0.035)),
-            strength=250 if width <= 180 else 235,
-            blur_radius=max(7, min(18, width // 11)),
-        )
         draw = ImageDraw.Draw(canvas)
+        text_top = top_margin
+        text_bottom = hero_top - max(22, int(height * 0.045))
         text_area_w = max(1, width - margin_x * 2)
         text_area_h = max(1, text_bottom - text_top)
         max_font = max(12, min(34, int(width * 0.17), int(text_area_h * 0.22)))
@@ -8626,8 +8693,8 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
     return canvas, {
         "provider": "local",
         "strategy": "large_rectangle_relayout",
-        "backgroundMode": "content_aware_source_crop_feather",
-        **crop_meta,
+        "backgroundMode": "clean_gradient_panel_bottom_locked_hero",
+        **hero_meta,
         **text_meta,
     }
 
