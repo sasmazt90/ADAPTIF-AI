@@ -8715,19 +8715,71 @@ def build_clean_source_texture_fill(
     return texture, {"textureSampleBox": list(sample_box)}
 
 
+def build_protected_hero_region(source: Image.Image, analysis: VisualAnalysis, product_box: tuple[int, int, int, int], target_width: int) -> tuple[int, int, int, int]:
+    text_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
+    text_right = max((box[2] for box in text_boxes), default=int(source.width * 0.36))
+    left = min(max(int(source.width * 0.32), text_right - int(source.width * 0.18)), int(source.width * 0.45))
+    top = min(product_box[1] - int(source.height * 0.12), int(source.height * 0.46))
+    top = max(int(source.height * 0.36), top)
+    bottom = source.height
+    if target_width <= 180:
+        desired_width = int((bottom - top) * 0.54)
+        center = int((product_box[0] + product_box[2]) * 0.5)
+        left = clamp_int(center - desired_width * 0.60, int(source.width * 0.36), max(int(source.width * 0.36), source.width - desired_width))
+        right = min(source.width, left + desired_width)
+    else:
+        right = source.width
+    return (
+        max(0, min(source.width - 2, left)),
+        max(0, min(source.height - 2, top)),
+        right,
+        bottom,
+    )
+
+
+def paste_contained_hero(
+    canvas: Image.Image,
+    source: Image.Image,
+    hero_region: tuple[int, int, int, int],
+    hero_top: int,
+) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
+    hero_h = max(1, canvas.height - hero_top)
+    hero_w = canvas.width
+    hero_source = source.crop(hero_region).convert("RGB")
+    scale = min(hero_w / max(1, hero_source.width), hero_h / max(1, hero_source.height))
+    hero_size = (
+        max(1, int(round(hero_source.width * scale))),
+        max(1, int(round(hero_source.height * scale))),
+    )
+    hero = hero_source.resize(hero_size, Image.Resampling.LANCZOS)
+    hero_rgba = hero.convert("RGBA")
+    alpha = Image.new("L", hero.size, 255)
+    alpha_draw = ImageDraw.Draw(alpha)
+    fade_h = min(hero.height, max(10, int(canvas.height * 0.035)))
+    for y in range(fade_h):
+        alpha_draw.line((0, y, hero.width, y), fill=int(255 * y / max(1, fade_h - 1)))
+    hero_rgba.putalpha(alpha)
+    paste_x = (hero_w - hero.width) // 2
+    paste_y = hero_top + max(0, hero_h - hero.height)
+    canvas.paste(hero_rgba.convert("RGB"), (paste_x, paste_y), hero_rgba)
+    return (paste_x, paste_y, paste_x + hero.width, paste_y + hero.height), {
+        "heroRegion": list(hero_region),
+        "heroPasteBox": [paste_x, paste_y, paste_x + hero.width, paste_y + hero.height],
+        "heroScale": round(scale, 4),
+        "heroTop": hero_top,
+    }
+
+
 def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     margin_x = max(10, int(width * 0.08))
     top_margin = max(10, int(height * 0.035))
     product_box = relayout_product_box(source, analysis)
     text_source_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
-    canvas, mapped_product, _crop_box, crop_meta = build_integrated_vertical_reframe(source, width, height, product_box)
-    copy_fill_bottom = clamp_int(
-        min(mapped_product[1] - max(8, int(height * 0.018)), height * (0.55 if width <= 180 else 0.50)),
-        int(height * 0.38),
-        int(height * 0.58),
-    )
-    texture_fill, texture_meta = build_clean_source_texture_fill(source, width, copy_fill_bottom, text_source_boxes)
-    canvas.paste(texture_fill, (0, 0))
+    copy_fill_bottom = clamp_int(height * (0.42 if width <= 180 else 0.44), int(height * 0.36), int(height * 0.48))
+    hero_top = copy_fill_bottom + max(8, int(height * 0.018))
+    canvas, texture_meta = build_clean_source_texture_fill(source, width, height, text_source_boxes)
+    hero_region = build_protected_hero_region(source, analysis, product_box, width)
+    hero_paste_box, hero_meta = paste_contained_hero(canvas, source, hero_region, hero_top)
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
@@ -8765,9 +8817,9 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
     return canvas, {
         "provider": "local",
         "strategy": "large_rectangle_relayout",
-        "backgroundMode": "integrated_vertical_crop_texture_fill",
+        "backgroundMode": "protected_contain_hero_texture_fill",
         "copyFillBottom": copy_fill_bottom,
-        **crop_meta,
+        **hero_meta,
         **texture_meta,
         **text_meta,
     }
