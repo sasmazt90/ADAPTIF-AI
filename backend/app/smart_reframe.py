@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from enum import Enum
 from typing import Any, Literal
 
@@ -332,10 +333,10 @@ def choose_expansion_strategy(analysis: VisualAnalysis, target: TargetCanvas) ->
             estimated_cost_tier="none",
         )
 
-    if has_structured_layers and ratio_delta >= 0.55 and target.logic_bucket in {LogicBucket.VERTICAL_SQUARE, LogicBucket.LARGE_RECTANGLE}:
+    if ratio_delta >= 0.16 and target.logic_bucket != LogicBucket.NARROW_BANNER:
         return ExpansionDecision(
             strategy=ExpansionStrategy.OPENAI_OUTPAINT,
-            reason="Aspect ratio changes materially; preserve the protected subject and recompose theme elements instead of blind crop.",
+            reason="Aspect ratio changes materially; preserve the protected creative and complete missing canvas with generative outpaint instead of crop, blur, or flat placeholder.",
             requires_ai=True,
             estimated_cost_tier="medium",
         )
@@ -544,5 +545,83 @@ def build_visual_analysis_prompt(target_language: str) -> str:
     )
 
 
+def _stringify_notes(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(f"{key}:{val}" for key, val in value.items())
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _normalize_layer_payload(layer: Any, index: int, prefix: str) -> dict[str, Any] | None:
+    if not isinstance(layer, dict):
+        return None
+    normalized = dict(layer)
+    normalized.setdefault("id", f"{prefix}-{index + 1}")
+    if "bbox" not in normalized:
+        for key in ("box", "bounds", "bounding_box", "boundingBox"):
+            if key in normalized:
+                normalized["bbox"] = normalized[key]
+                break
+    if "bbox" not in normalized:
+        return None
+    normalized["notes"] = _stringify_notes(normalized.get("notes", ""))
+    role = normalized.get("role")
+    if isinstance(role, str):
+        normalized["role"] = role.strip().lower()
+    return normalized
+
+
+def _normalize_text_layer_payload(layer: Any, index: int) -> dict[str, Any] | None:
+    normalized = _normalize_layer_payload(layer, index, "text")
+    if normalized is None:
+        return None
+    text = normalized.get("original_text") or normalized.get("text") or normalized.get("copy") or ""
+    normalized["original_text"] = str(text)
+    normalized.setdefault("translated_text", normalized["original_text"])
+    return normalized
+
+
 def parse_visual_analysis_payload(payload: dict[str, Any]) -> VisualAnalysis:
-    return VisualAnalysis.model_validate(payload)
+    normalized = dict(payload)
+    background = (
+        normalized.get("background")
+        or normalized.get("background_style")
+        or normalized.get("backgroundStyle")
+        or normalized.get("background_analysis")
+    )
+    if not isinstance(background, dict):
+        background = {}
+    normalized["background"] = {
+        "type": str(background.get("type") or background.get("background_type") or BackgroundType.UNKNOWN.value).strip().lower(),
+        "dominant_color_rgb": background.get("dominant_color_rgb") or background.get("dominantColorRgb"),
+        "is_gradient": bool(background.get("is_gradient") or background.get("isGradient", False)),
+        "texture_complexity": float(background.get("texture_complexity") or background.get("textureComplexity") or 0.0),
+        "can_extend_without_ai": bool(background.get("can_extend_without_ai") or background.get("canExtendWithoutAi", False)),
+    }
+    if not normalized["background"]["dominant_color_rgb"]:
+        normalized["background"]["dominant_color_rgb"] = {"r": 245, "g": 245, "b": 245}
+
+    for key, prefix in (("product_layers", "product"), ("logo_layers", "logo"), ("other_layers", "layer")):
+        source_layers = normalized.get(key) or normalized.get(key.replace("_", "")) or []
+        normalized[key] = [
+            item
+            for index, layer in enumerate(source_layers if isinstance(source_layers, list) else [])
+            if (item := _normalize_layer_payload(layer, index, prefix)) is not None
+        ]
+    source_text_layers = normalized.get("text_layers") or normalized.get("textLayers") or []
+    normalized["text_layers"] = [
+        item
+        for index, layer in enumerate(source_text_layers if isinstance(source_text_layers, list) else [])
+        if (item := _normalize_text_layer_payload(layer, index)) is not None
+    ]
+
+    summary = normalized.get("saliency_summary", "")
+    if isinstance(summary, dict):
+        summary = json.dumps(summary, ensure_ascii=False)
+    normalized["saliency_summary"] = str(summary)
+    warnings = normalized.get("quality_warnings", [])
+    normalized["quality_warnings"] = warnings if isinstance(warnings, list) else [str(warnings)]
+    return VisualAnalysis.model_validate(normalized)

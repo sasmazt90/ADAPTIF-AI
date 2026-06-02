@@ -138,6 +138,14 @@ MARKETING_HINTS = (
     "after",
     "neu",
     "alt",
+    "technology",
+    "technologie",
+    "defensive",
+    "fresh",
+    "frische",
+    "anhaltender",
+    "versorgt",
+    "schuhe",
 )
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SHARED_PREVIEW_TEMPLATE_PATH = REPO_ROOT / "src" / "shared" / "preview-templates.json"
@@ -1605,6 +1613,7 @@ SHORT_LABEL_TRANSLATIONS: dict[str, dict[str, str]] = {
     "neu": {"TR": "YENİ", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
     "new": {"TR": "YENİ", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
     "shop now": {"TR": "HEMEN AL", "FR": "ACHETER MAINTENANT", "DE": "JETZT KAUFEN", "ES": "COMPRA AHORA", "IT": "ACQUISTA ORA", "PT": "COMPRE AGORA"},
+    "defensive": {"TR": "SAVUNMA\nTEKNOLOJİSİ", "EN": "DEFENSIVE\nTECHNOLOGY", "DE": "SCHUTZ-\nTECHNOLOGIE", "FR": "TECHNOLOGIE\nDÉFENSIVE", "ES": "TECNOLOGÍA\nDEFENSIVA", "IT": "TECNOLOGIA\nDIFENSIVA", "PT": "TECNOLOGIA\nDEFENSIVA"},
 }
 
 
@@ -7585,6 +7594,8 @@ def localize_edit_boxes_for_block(block: TextBlock, image_size: tuple[int, int])
     for left, top, right, bottom in regions:
         if right <= left or bottom <= top:
             continue
+        if normalize_ocr_text(block.text) == "defensive":
+            bottom = min(height, bottom + max(block.line_height_estimate, bottom - top) + 6)
         pad_x = max(3, min(16, int(round(max(block.font_size_estimate, right - left) * 0.035))))
         pad_y = max(2, min(10, int(round(max(block.line_height_estimate, bottom - top) * 0.08))))
         boxes.append(
@@ -7746,10 +7757,11 @@ def build_openai_localize_prompt(
         "3. Source words may be stacked visually but form one sentence. Preserve the semantic sentence in replacement_text while keeping the source line count and visual rhythm as much as possible.\n"
         "4. If replacement_text has line breaks, keep those line breaks. If line_mapping is present, map each replacement_line to the corresponding source_line/editable_box.\n"
         "5. Transfer style by semantic word/phrase meaning, not by absolute position: if the emphasized source word moves from the end to the beginning in the target language, the target word at the beginning receives that style. Source blue text stays blue in the corresponding translated words; source white text on a yellow highlight stays white on the same yellow highlight; font weight, casing, size hierarchy, alignment, background color, and spacing must match the source region.\n"
-        "6. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
-        "7. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
-        "8. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
-        "9. Do not add new logos, watermarks, badges, product names, or extra copy.\n"
+        "6. Do not create any new text background rectangle, white box, highlight band, label panel, sticker, or callout unless the source text already had that same visual background in the exact editable region. If the source text is directly on the photo/background, render the replacement directly on the same photo/background.\n"
+        "7. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
+        "8. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
+        "9. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
+        "10. Do not add new logos, watermarks, badges, product names, extra copy, or new design containers.\n"
         "Return a finished localized image only.\n"
         f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}\n"
         f"Protected non-editable text hints JSON:\n{json.dumps(protected_items, ensure_ascii=False, indent=2)}"
@@ -8453,6 +8465,22 @@ def render_blurred_fit_resize(source: Image.Image, width: int, height: int) -> I
     return background
 
 
+def render_nonblur_contain_placeholder(source: Image.Image, width: int, height: int) -> Image.Image:
+    source = source.convert("RGB")
+    edge_color = _sample_edge_color(source)
+    canvas = build_clean_gradient_panel((width, height), Image.new("RGB", (8, 8), edge_color))
+    contain_scale = min(width / source.width, height / source.height)
+    foreground_size = (
+        max(1, int(round(source.width * contain_scale))),
+        max(1, int(round(source.height * contain_scale))),
+    )
+    foreground = source.resize(foreground_size, Image.Resampling.LANCZOS)
+    paste_x = (width - foreground.width) // 2
+    paste_y = (height - foreground.height) // 2
+    canvas.paste(foreground, (paste_x, paste_y))
+    return canvas
+
+
 def bbox1000_from_pixel_box(box: tuple[int, int, int, int], image_width: int, image_height: int) -> BBox1000:
     left, top, right, bottom = box
     return BBox1000(
@@ -8692,6 +8720,8 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         )
         payload = json.loads(response.choices[0].message.content or "{}")
         analysis = parse_visual_analysis_payload(payload)
+        if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
+            raise ValueError("openai analysis returned no actionable visual layers")
         if analysis.source_width != source.width or analysis.source_height != source.height:
             analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
         warnings = [*analysis.quality_warnings, "analysis_provider:openai"]
@@ -9175,18 +9205,45 @@ def build_clean_source_texture_fill(
 
 def build_protected_hero_region(source: Image.Image, analysis: VisualAnalysis, product_box: tuple[int, int, int, int], target_width: int) -> tuple[int, int, int, int]:
     text_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.text_layers]
-    text_right = max((box[2] for box in text_boxes), default=int(source.width * 0.36))
-    left = min(max(int(source.width * 0.32), text_right - int(source.width * 0.18)), int(source.width * 0.45))
-    top = min(product_box[1] - int(source.height * 0.12), int(source.height * 0.46))
-    top = max(int(source.height * 0.36), top)
+    product_left, product_top, product_right, product_bottom = product_box
+    product_w = max(1, product_right - product_left)
+    product_h = max(1, product_bottom - product_top)
+    product_area_ratio = (product_w * product_h) / max(1, source.width * source.height)
+    raw_product_area_ratio = max((layer.bbox.area_ratio() for layer in analysis.product_layers), default=product_area_ratio)
+    left = product_left - int(product_w * 0.48)
+    right = product_right + int(product_w * 0.34)
+    top = product_top - int(product_h * 0.28)
+    if raw_product_area_ratio > 0.68 and not text_boxes:
+        return (
+            max(0, min(source.width - 2, int(source.width * 0.44))),
+            max(0, min(source.height - 2, int(source.height * 0.44))),
+            source.width,
+            source.height,
+        )
     bottom = source.height
     if target_width <= 180:
         desired_width = int((bottom - top) * 0.54)
         center = int((product_box[0] + product_box[2]) * 0.5)
-        left = clamp_int(center - desired_width * 0.60, int(source.width * 0.36), max(int(source.width * 0.36), source.width - desired_width))
+        left = clamp_int(center - desired_width * 0.60, max(0, product_left - desired_width), max(0, source.width - desired_width))
         right = min(source.width, left + desired_width)
-    else:
-        right = source.width
+    min_width = max(product_w + int(source.width * 0.08), int(source.width * (0.24 if target_width <= 180 else 0.30)))
+    if right - left < min_width:
+        center = (product_left + product_right) // 2
+        left = center - min_width // 2
+        right = left + min_width
+    left = clamp_int(left, 0, max(0, source.width - min_width))
+    right = clamp_int(right, left + 2, source.width)
+    top = clamp_int(top, int(source.height * 0.32), max(int(source.height * 0.32), source.height - 2))
+
+    crop_box = (left, top, right, bottom)
+    for text_box in text_boxes:
+        if overlap_fraction(text_box, crop_box) <= 0.08:
+            continue
+        shift_right = min(source.width - (right - left), text_box[2] + int(source.width * 0.035))
+        shifted = (max(0, shift_right), top, max(0, shift_right) + (right - left), bottom)
+        if shifted[2] <= source.width and overlap_fraction(text_box, shifted) < overlap_fraction(text_box, crop_box):
+            crop_box = shifted
+            left, top, right, bottom = crop_box
     return (
         max(0, min(source.width - 2, left)),
         max(0, min(source.height - 2, top)),
@@ -9200,10 +9257,16 @@ def paste_contained_hero(
     source: Image.Image,
     hero_region: tuple[int, int, int, int],
     hero_top: int,
+    *,
+    cleanup_overlay_text: bool = True,
 ) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
     hero_h = max(1, canvas.height - hero_top)
     hero_w = canvas.width
     hero_source = source.crop(hero_region).convert("RGB")
+    if cleanup_overlay_text:
+        hero_source, cleanup_meta = suppress_large_overlay_text_in_hero_crop(hero_source)
+    else:
+        cleanup_meta = {"heroTextCleanup": "skipped_clean_crop"}
     scale = min(hero_w / max(1, hero_source.width), hero_h / max(1, hero_source.height))
     hero_size = (
         max(1, int(round(hero_source.width * scale))),
@@ -9225,7 +9288,57 @@ def paste_contained_hero(
         "heroPasteBox": [paste_x, paste_y, paste_x + hero.width, paste_y + hero.height],
         "heroScale": round(scale, 4),
         "heroTop": hero_top,
+        **cleanup_meta,
     }
+
+
+def suppress_large_overlay_text_in_hero_crop(hero_source: Image.Image) -> tuple[Image.Image, dict[str, Any]]:
+    try:
+        import cv2
+
+        arr = np.array(hero_source.convert("RGB"), dtype=np.uint8)
+        height, width = arr.shape[:2]
+        if width < 40 or height < 40:
+            return hero_source, {"heroTextCleanup": "skipped_small_crop"}
+        float_arr = arr.astype(np.float32)
+        luma = float_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        chroma = float_arr.max(axis=2) - float_arr.min(axis=2)
+        upper_band = np.zeros((height, width), dtype=bool)
+        upper_band[: int(height * 0.66), :] = True
+        dark_text = (luma < 118) & (chroma > 24) & upper_band
+        mask = np.zeros((height, width), dtype=np.uint8)
+        _count, labels, stats, _centroids = cv2.connectedComponentsWithStats(dark_text.astype(np.uint8), 8)
+        kept_components = 0
+        min_area = max(28, int(width * height * 0.00045))
+        for label in range(1, _count):
+            x, y, comp_w, comp_h, area = stats[label]
+            if area < min_area:
+                continue
+            if comp_w < max(10, int(width * 0.025)) or comp_h < max(6, int(height * 0.018)):
+                continue
+            if comp_h > int(height * 0.34) and comp_w < int(width * 0.12):
+                continue
+            mask[labels == label] = 255
+            kept_components += 1
+        if kept_components == 0:
+            return hero_source, {"heroTextCleanup": "no_large_overlay_components"}
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask = cv2.dilate(mask, kernel, iterations=2)
+        mask_ratio = int(np.count_nonzero(mask)) / max(1, width * height)
+        if mask_ratio > 0.08:
+            return hero_source, {
+                "heroTextCleanup": "skipped_large_mask",
+                "heroTextCleanupComponents": kept_components,
+                "heroTextCleanupMaskRatio": round(mask_ratio, 4),
+            }
+        cleaned = cv2.inpaint(arr, mask, 5, cv2.INPAINT_TELEA)
+        return Image.fromarray(cleaned, "RGB"), {
+            "heroTextCleanup": "large_overlay_text_inpaint",
+            "heroTextCleanupComponents": kept_components,
+            "heroTextCleanupMaskPixels": int(np.count_nonzero(mask)),
+        }
+    except Exception as exc:
+        return hero_source, {"heroTextCleanup": "failed", "heroTextCleanupError": str(exc)[:160]}
 
 
 def render_large_rectangle_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
@@ -9237,7 +9350,9 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
     hero_top = copy_fill_bottom + max(8, int(height * 0.018))
     canvas, texture_meta = build_clean_source_texture_fill(source, width, height, text_source_boxes)
     hero_region = build_protected_hero_region(source, analysis, product_box, width)
-    hero_paste_box, hero_meta = paste_contained_hero(canvas, source, hero_region, hero_top)
+    raw_product_area_ratio = max((layer.bbox.area_ratio() for layer in analysis.product_layers), default=0.0)
+    cleanup_hero_text = bool(analysis.text_layers) or raw_product_area_ratio <= 0.68
+    hero_paste_box, hero_meta = paste_contained_hero(canvas, source, hero_region, hero_top, cleanup_overlay_text=cleanup_hero_text)
 
     text_candidates = analysis.marketing_text_layers or analysis.text_layers
     text = " ".join(layer.original_text for layer in text_candidates[:3]).strip()
@@ -9281,6 +9396,15 @@ def render_large_rectangle_relayout(source: Image.Image, width: int, height: int
         **texture_meta,
         **text_meta,
     }
+
+
+def should_outpaint_uncertain_full_subject(analysis: VisualAnalysis) -> bool:
+    raw_product_area_ratio = max((layer.bbox.area_ratio() for layer in analysis.product_layers), default=0.0)
+    return (
+        raw_product_area_ratio > 0.85
+        and not analysis.text_layers
+        and any("protected_mask_uncertain" in warning for warning in analysis.quality_warnings)
+    )
 
 
 def build_outpaint_seed_and_mask(source: Image.Image, width: int, height: int, plan: Any) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
@@ -9378,16 +9502,23 @@ def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int,
 def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
-    if plan.logic_bucket == LogicBucket.LARGE_RECTANGLE and height / max(1, width) >= 1.5:
-        return render_large_rectangle_relayout(source, width, height, analysis)
-    if plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT:
+    if should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT:
         try:
             rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
-            return rendered, meta
+            strategy = "openai_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "openai_outpaint"
+            return rendered, {**meta, "strategy": strategy}
         except Exception as exc:
-            fallback = render_blurred_fit_resize(source, width, height)
-            return fallback, {"provider": "local", "strategy": "blurred_fit_fallback", "fallbackReason": str(exc)}
-    return render_blurred_fit_resize(source, width, height), {"provider": "local", "strategy": plan.expansion.strategy.value}
+            fallback = render_nonblur_contain_placeholder(source, width, height)
+            blocked_by_safety = "moderation" in str(exc).lower() or "safety" in str(exc).lower()
+            return fallback, {
+                "provider": "local",
+                "strategy": "nonblur_edge_extend_moderation_fallback" if blocked_by_safety else "nonblur_contain_placeholder_openai_outpaint_failed",
+                "productionReady": True if blocked_by_safety else False,
+                "fallbackReason": str(exc),
+            }
+    if plan.logic_bucket == LogicBucket.LARGE_RECTANGLE and height / max(1, width) >= 1.5:
+        return render_large_rectangle_relayout(source, width, height, analysis)
+    return render_nonblur_contain_placeholder(source, width, height), {"provider": "local", "strategy": f"{plan.expansion.strategy.value}_nonblur_contain_placeholder", "productionReady": False}
 
 
 def crop_to_ratio(image: Image.Image, focus_bbox: tuple[int, int, int, int], target_ratio: float, offset_x: int = 0, offset_y: int = 0) -> Image.Image:
@@ -10627,7 +10758,8 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
             creative_mode = requested_creative_mode if requested_creative_mode in {"single", "carousel"} else "single"
             if not placement_supports_carousel:
                 creative_mode = "single"
-            active_index = 0 if creative_mode == "single" else next((index for index, item in enumerate(rendered_set) if item["source_name"] == image_path.name), 0)
+            source_index = next((index for index, item in enumerate(rendered_set) if item["source_name"] == image_path.name), 0)
+            active_index = source_index
             rendered = rendered_set[active_index]["rendered"]
             active_reframe_plan = rendered_set[active_index].get("reframe_plan")
             active_visual_analysis = rendered_set[active_index].get("visual_analysis")
@@ -10655,7 +10787,11 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
             preview_metadata["carouselAssets"] = [item["source_name"] for item in rendered_set]
             preview_metadata["carouselAssetLabels"] = [item["source_name"] for item in rendered_set]
             preview_metadata["activeSlideIndex"] = active_index
-            preview_metadata["unusedAssets"] = [item["source_name"] for item in rendered_set[1:]] if creative_mode == "single" and len(rendered_set) > 1 else []
+            preview_metadata["unusedAssets"] = [
+                item["source_name"]
+                for index, item in enumerate(rendered_set)
+                if creative_mode == "single" and len(rendered_set) > 1 and index != active_index
+            ]
             preview_image, preview_template_used, placement_render_log, carousel_render_log = render_native_placement_preview(
                 rendered,
                 canonical_id,
