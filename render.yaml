@@ -16,6 +16,16 @@ services:
         sync: false
       - key: OPENAI_TRANSLATION_MODEL
         value: gpt-4o
+      - key: ADAPTIFAI_OPENAI_IMAGE_MODEL
+        value: gpt-image-2
+      - key: ADAPTIFAI_OPENAI_IMAGE_QUALITY
+        value: medium
+      - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER
+        value: auto
+      - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL
+        value: gpt-4o
+      - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE
+        value: "1600"
       - key: ADAPTIFAI_TROCR_MODEL
         value: microsoft/trocr-base-printed
       - key: ADAPTIFAI_OCR_ENGINE

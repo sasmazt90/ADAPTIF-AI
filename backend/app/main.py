@@ -85,6 +85,8 @@ try:
         TextLayer,
         TextStyle,
         VisualAnalysis,
+        build_visual_analysis_prompt,
+        parse_visual_analysis_payload,
     )
 except ImportError:
     from backend.app.smart_reframe import (  # type: ignore[no-redef]
@@ -99,6 +101,8 @@ except ImportError:
         TextLayer,
         TextStyle,
         VisualAnalysis,
+        build_visual_analysis_prompt,
+        parse_visual_analysis_payload,
     )
 
 
@@ -4332,11 +4336,12 @@ def _sanitize_inpaint_result(
 def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image, prompt: str) -> dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
         return {"success": False, "provider": "openai", "failureReason": "openai_not_configured"}
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
     with tempfile.TemporaryDirectory(prefix="adaptifai-openai-full-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         rgba_mask = build_openai_edit_mask(editable_mask)
         image_path, mask_path, alpha_preview_path = export_openai_edit_debug_artifacts(temp_dir, image.convert("RGB"), rgba_mask)
-        request_meta = validate_openai_edit_request(image_path, mask_path, image.convert("RGB"), rgba_mask)
+        request_meta = validate_openai_edit_request(image_path, mask_path, image.convert("RGB"), rgba_mask, model)
         if not request_meta["valid"]:
             return {
                 "success": False,
@@ -4351,7 +4356,7 @@ def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image
             client = OpenAI()
             with image_path.open("rb") as image_file, mask_path.open("rb") as mask_file:
                 response = client.images.edit(
-                    model="gpt-image-1",
+                    model=model,
                     image=image_file,
                     mask=mask_file,
                     prompt=prompt,
@@ -4385,7 +4390,7 @@ def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image
                 "provider": "openai",
                 "failureReason": "openai_api_error",
                 "requestMeta": request_meta,
-                "apiError": extract_openai_error_payload(exc, request_meta, "gpt-image-1"),
+                "apiError": extract_openai_error_payload(exc, request_meta, model),
                 "requestImagePreview": image.convert("RGB"),
                 "requestMaskPreview": rgba_mask,
                 "requestMaskAlphaPreview": rgba_mask.getchannel("A"),
@@ -4438,12 +4443,12 @@ def export_openai_edit_debug_artifacts(
     return image_path, mask_path, alpha_preview_path
 
 
-def validate_openai_edit_request(image_path: Path, mask_path: Path, crop: Image.Image, rgba_mask: Image.Image) -> dict[str, Any]:
+def validate_openai_edit_request(image_path: Path, mask_path: Path, crop: Image.Image, rgba_mask: Image.Image, model: str | None = None) -> dict[str, Any]:
     alpha = np.array(rgba_mask.getchannel("A"))
     transparent_pixels = int((alpha == 0).sum())
     opaque_pixels = int((alpha == 255).sum())
     meta = {
-        "model": "gpt-image-1",
+        "model": model or os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2",
         "imageCropWidth": crop.size[0],
         "imageCropHeight": crop.size[1],
         "maskWidth": rgba_mask.size[0],
@@ -4548,7 +4553,7 @@ def cleanup_block_with_generative_fill_candidates(
     editable_mask_crop = prepared["editable_mask"]
     protected_crop_mask = prepared["protected_crop_mask"]
     if provider in {"openai", "auto"} and os.getenv("OPENAI_API_KEY"):
-        deduped_models = ["gpt-image-1"]
+        deduped_models = [os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"]
         prompt = prompt_override or (
             "Remove only the text pixels inside the transparent mask. Reconstruct only the masked text area using the surrounding background. "
             "Do not modify any unmasked pixels. Preserve all people, products, shoes, logos, packaging, lighting, shadows, textures and background outside the mask exactly. "
@@ -4566,7 +4571,7 @@ def cleanup_block_with_generative_fill_candidates(
                 original_width, original_height = padded["original_size"]
                 rgba_mask = build_openai_edit_mask(request_editable_mask)
                 image_path, mask_path, alpha_preview_path = export_openai_edit_debug_artifacts(temp_dir, request_crop, rgba_mask)
-                request_meta = validate_openai_edit_request(image_path, mask_path, request_crop, rgba_mask)
+                request_meta = validate_openai_edit_request(image_path, mask_path, request_crop, rgba_mask, deduped_models[0])
                 client = OpenAI()
                 for model in deduped_models:
                     attempt: dict[str, Any] = {
@@ -4637,7 +4642,7 @@ def cleanup_block_with_generative_fill_candidates(
         except Exception as exc:
             attempts.append(
                 {
-                    "model": deduped_models[0] if deduped_models else "gpt-image-1",
+                    "model": deduped_models[0] if deduped_models else os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2",
                     "attempted": True,
                     "success": False,
                     "rejected": True,
@@ -8376,12 +8381,66 @@ def sample_marketing_text_color(source: Image.Image, bbox: tuple[int, int, int, 
     return tuple(int(max(0, min(255, value))) for value in color)
 
 
-def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None) -> VisualAnalysis:
-    product_box = focus_bbox or detect_foreground_bbox(source) or (0, 0, source.width, source.height)
+def build_openai_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
+    if not os.getenv("OPENAI_API_KEY", "").strip():
+        return None
+
+    provider = os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto").strip().lower()
+    if provider in {"heuristic", "local", "off", "disabled"}:
+        return None
+
+    try:
+        probe = source.convert("RGB")
+        max_side = int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE", "1600"))
+        if max(probe.size) > max_side:
+            scale = max_side / max(probe.size)
+            probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
+
+        encoded_io = io.BytesIO()
+        probe.save(encoded_io, format="PNG")
+        encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
+
+        client = OpenAI()
+        response = client.chat.completions.create(
+            model=os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL", os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o")),
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        build_visual_analysis_prompt(target_language)
+                        + " Return the dimensions of the original source image, not the resized analysis image. "
+                        + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        payload = json.loads(response.choices[0].message.content or "{}")
+        analysis = parse_visual_analysis_payload(payload)
+        if analysis.source_width != source.width or analysis.source_height != source.height:
+            analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
+        warnings = [*analysis.quality_warnings, "analysis_provider:openai"]
+        return analysis.model_copy(update={"quality_warnings": warnings})
+    except Exception as exc:
+        print(f"[smart_reframe_analysis] openai analysis failed: {exc}", flush=True)
+        return None
+
+
+def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, fallback_reason: str = "") -> VisualAnalysis:
+    foreground_box = detect_foreground_bbox(source)
+    product_box = foreground_box or focus_bbox or (0, 0, source.width, source.height)
     product_layer = ProductLayer(
         id="product-1",
         bbox=bbox1000_from_pixel_box(product_box, source.width, source.height),
-        confidence=0.66 if focus_bbox else 0.45,
+        confidence=0.68 if foreground_box else 0.42,
         saliency=0.82,
         protected=True,
         mask_quality="bbox_only",
@@ -8428,8 +8487,20 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
         background=classify_resize_background(source),
         product_layers=[product_layer],
         text_layers=text_layers,
-        saliency_summary="Heuristic resize analysis: foreground focus bbox, marketing OCR boxes, and background texture estimate.",
+        saliency_summary="Heuristic resize analysis: foreground subject bbox, marketing OCR boxes, and background texture estimate.",
+        quality_warnings=[item for item in ["analysis_provider:heuristic", fallback_reason] if item],
     )
+
+
+def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, target_language: str = "EN") -> VisualAnalysis:
+    provider = os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto").strip().lower()
+    if provider in {"auto", "openai"}:
+        analysis = build_openai_smart_reframe_analysis(source, target_language)
+        if analysis is not None:
+            return analysis
+        if provider == "openai":
+            return build_heuristic_smart_reframe_analysis(source, focus_bbox, "openai_analysis_failed_fallback")
+    return build_heuristic_smart_reframe_analysis(source, focus_bbox)
 
 
 def render_hybrid_banner_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> Image.Image:
@@ -10135,6 +10206,23 @@ def build_preview_template_parity_report(placement_ids: list[str]) -> dict[str, 
     }
 
 
+def smart_reframe_analysis_provider(analysis: VisualAnalysis | None) -> str:
+    if analysis is None:
+        return "unknown"
+    for warning in analysis.quality_warnings:
+        if warning.startswith("analysis_provider:"):
+            return warning.split(":", 1)[1] or "unknown"
+    return "unknown"
+
+
+def merge_resize_warnings(placement_id: str, plan: Any | None = None) -> list[str]:
+    merged: list[str] = []
+    for warning in [*safe_zone_warnings_for(placement_id), *(getattr(plan, "safe_zone_warnings", []) or [])]:
+        if warning and warning not in merged:
+            merged.append(warning)
+    return merged
+
+
 def build_resize_assets(paths: list[Path], placement_ids: list[str], output_format: str, custom_width: int | None, custom_height: int | None, job_dir: Path, creative_modes: dict[str, str] | None = None) -> tuple[list[OutputAsset], list[dict[str, Any]]]:
     outputs: list[OutputAsset] = []
     manifest_assets: list[dict[str, Any]] = []
@@ -10244,6 +10332,8 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
             active_reframe_plan = rendered_set[active_index].get("reframe_plan")
             active_visual_analysis = rendered_set[active_index].get("visual_analysis")
             active_render_meta = rendered_set[active_index].get("render_meta") or {}
+            analysis_provider = smart_reframe_analysis_provider(active_visual_analysis)
+            resize_warnings = merge_resize_warnings(canonical_id, active_reframe_plan)
             strategy_slug = sanitize_debug_token(active_render_meta.get("strategy") or (active_reframe_plan.expansion.strategy.value if active_reframe_plan is not None else resize_strategy))
             bucket_slug = sanitize_debug_token(active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else "legacy")
             filename = resize_filename(image_path, canonical_id, output_format)
@@ -10285,6 +10375,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                 "targetHeight": height,
                 "resizeMode": resize_mode,
                 "resizeStrategy": resize_strategy,
+                "analysisProvider": analysis_provider,
                 "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
                 "renderMeta": active_render_meta,
                 "smartReframePlan": active_reframe_plan.model_dump(mode="json") if active_reframe_plan is not None else None,
@@ -10292,7 +10383,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                 "cropBox": None if (safe_resize_strategy or smart_reframe_enabled) else compute_resize_crop_box(source_image, focus_bbox, width / max(1, height)) if resize_mode == "cover" else None,
                 "focusBox": list(focus_bbox),
                 "protectedObjects": [list(focus_bbox)],
-                "safeZoneWarnings": safe_zone_warnings_for(canonical_id),
+                "safeZoneWarnings": resize_warnings,
                 "textCutoffRisk": "medium" if canonical_id in {"gdn-320x50", "gdn-728x90", "facebook-right-column"} else "low",
                 "productCutoffRisk": "medium" if resize_mode == "cover" and canonical_id not in {"instagram-story", "instagram-reels", "tiktok-in-feed", "tiktok-topview", "youtube-shorts"} else "low",
             }
@@ -10308,7 +10399,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                 filename=filename,
                 width=width,
                 height=height,
-                safe_zone_warnings=safe_zone_warnings_for(canonical_id),
+                safe_zone_warnings=resize_warnings,
                 download_url=f"/api/download/{job_dir.name}/{filename}",
                 source_name=image_path.name,
                 language=None,
@@ -10327,6 +10418,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
                     "height": height,
                     "fit": resize_mode,
                     "resizeStrategy": resize_strategy,
+                    "analysisProvider": analysis_provider,
                     "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
                     "renderMeta": active_render_meta,
                     "smartReframePlan": active_reframe_plan.model_dump(mode="json") if active_reframe_plan is not None else None,
