@@ -78,12 +78,14 @@ try:
         BackgroundType,
         BBox1000,
         ExpansionStrategy,
+        LayerRole,
         LogicBucket,
         ProductLayer,
         RGBColor,
         SmartReframe,
         TextLayer,
         TextStyle,
+        VisualLayer,
         VisualAnalysis,
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
@@ -94,12 +96,14 @@ except ImportError:
         BackgroundType,
         BBox1000,
         ExpansionStrategy,
+        LayerRole,
         LogicBucket,
         ProductLayer,
         RGBColor,
         SmartReframe,
         TextLayer,
         TextStyle,
+        VisualLayer,
         VisualAnalysis,
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
@@ -1614,7 +1618,7 @@ def translate_with_gpt4o(blocks: list[TextBlock], languages: list[str]) -> dict[
 
     client = OpenAI()
     prompt = {
-        "task": "Translate every source string into the requested target language as faithful marketing localization, not free transcreation. Preserve the exact meaning, claim scope, and emphasis. Do not add product names, SKU names, model names, brand names, or new claims that are not present in the source string. Only keep protected brand/product tokens unchanged when they are already present in that source string. Preserve [BOLD]...[/BOLD] tags exactly around the semantically emphasized phrase. Preserve meaningful line breaks: if a source line is a separate visual/emphasized claim, keep its translation as a separate line and do not merge it into another style line. Return one translated string per source string in the same order. Keep existing brand names, product names, packaging labels, URLs, QR references, Android TV, iPad Pro, H2O, Ask.NAOS.com, Dr.Scholl's and Scholl unchanged unless grammar absolutely requires surrounding words to change. Keep metric tokens exactly unchanged when they appear, including patterns like 24h, 48H, 84%, 88%, 2.4G+5G and Dual-Band. Translate surrounding claim language naturally but faithfully.",
+        "task": "Translate every source string into the requested target language as faithful marketing localization, not free transcreation. Treat each source string as one semantic copy block even when words are stacked on separate visual lines; first understand the full sentence/claim, then produce one coherent localized block. Preserve the exact meaning, claim scope, and emphasis. Do not add product names, SKU names, model names, brand names, or new claims that are not present in the source string. Only keep protected brand/product tokens unchanged when they are already present in that source string. Preserve [BOLD]...[/BOLD] tags exactly around the semantically emphasized phrase, even if that phrase moves to a different position in the target language. Preserve style intent by word/phrase meaning, not by absolute source position. Preserve the source line rhythm and line count when it can be done naturally; if the target language needs more characters, keep the same number of lines as much as possible by balancing words across those lines. Return one translated string per source string in the same order. Keep existing brand names, product names, packaging labels, URLs, QR references, Android TV, iPad Pro, H2O, Ask.NAOS.com, Dr.Scholl's and Scholl unchanged unless grammar absolutely requires surrounding words to change. Keep metric tokens exactly unchanged when they appear, including patterns like 24h, 48H, 84%, 88%, 2.4G+5G and Dual-Band. Translate surrounding claim language naturally but faithfully.",
         "target_languages": {language: LANGUAGE_NAMES.get(language.upper(), language) for language in languages},
         "strings": source,
     }
@@ -1799,6 +1803,7 @@ def infer_source_style_spans(text: str, block: TextBlock) -> list[dict[str, Any]
             {
                 "sourceText": segment,
                 "semanticRole": role,
+                "semanticStyleKey": f"{role}:{normalize_ocr_text(segment)}",
                 "style": style,
                 "forceBreakAfter": item.get("forceBreakAfter", False),
                 "color": style.get("color"),
@@ -1806,9 +1811,10 @@ def infer_source_style_spans(text: str, block: TextBlock) -> list[dict[str, Any]
                 "fontWeight": style.get("fontWeight"),
                 "casing": style.get("casing"),
                 "approximatePosition": round(len(spans) / total_segments, 3),
+                "styleTransferMode": "semantic_phrase",
             }
         )
-    return spans or [{"sourceText": text, "semanticRole": "benefit", "style": base_style}]
+    return spans or [{"sourceText": text, "semanticRole": "benefit", "semanticStyleKey": f"benefit:{normalize_ocr_text(text)}", "style": base_style, "styleTransferMode": "semantic_phrase"}]
 
 
 def infer_translated_style_spans(source_text: str, translated_text: str, source_style_spans: list[dict[str, Any]], block: TextBlock) -> list[dict[str, Any]]:
@@ -1817,7 +1823,15 @@ def infer_translated_style_spans(source_text: str, translated_text: str, source_
         return [{"translatedText": translated_text, "matchedSourceRole": "benefit", "style": default_typography_style(block)}]
     source_by_role: dict[str, dict[str, Any]] = {}
     for span in source_style_spans:
-        source_by_role.setdefault(span["semanticRole"], span)
+        role = span["semanticRole"]
+        if role not in source_by_role:
+            source_by_role[role] = span
+            continue
+        current = source_by_role[role]
+        current_ratio = float(current.get("fontSizeRatio", 1.0))
+        span_ratio = float(span.get("fontSizeRatio", 1.0))
+        if span_ratio > current_ratio or int(span.get("fontWeight", 0)) > int(current.get("fontWeight", 0)):
+            source_by_role[role] = span
     translated_spans: list[dict[str, Any]] = []
     for item in segment_items:
         segment = item["text"]
@@ -1834,12 +1848,14 @@ def infer_translated_style_spans(source_text: str, translated_text: str, source_
                 "matchedSourceRole": matched["semanticRole"],
                 "style": style,
                 "sourceSegmentHint": matched["sourceText"],
+                "semanticStyleKey": matched.get("semanticStyleKey", f"{matched['semanticRole']}:{normalize_ocr_text(matched['sourceText'])}"),
                 "forceBreakAfter": item.get("forceBreakAfter", False),
                 "color": style.get("color"),
                 "fontSizeRatio": round(style["fontSize"] / max(1, default_typography_style(block)["fontSize"]), 3),
                 "fontWeight": style.get("fontWeight"),
                 "casing": style.get("casing"),
                 "approximatePosition": round(len(translated_spans) / max(1, len(segment_items)), 3),
+                "styleTransferMode": "semantic_phrase_not_position",
             }
         )
     return translated_spans
@@ -6236,6 +6252,7 @@ def fit_styled_spans(
     spans: list[dict[str, Any]],
     box: tuple[int, int, int, int],
     base_typography: dict[str, Any],
+    preferred_line_count: int | None = None,
 ) -> dict[str, Any]:
     max_width = max(24, box[2] - box[0])
     max_height = max(16, box[3] - box[1])
@@ -6253,13 +6270,18 @@ def fit_styled_spans(
             max(1.0, min(1.5, float(base_typography.get("lineHeight", 18)) / max(1.0, float(base_typography.get("fontSize", 16))))),
         )
         overflow = max(0, widest - max_width) + max(0, total_height - max_height)
-        score = float(scale_factor * 1000 - overflow * 5 - max(0, len(lines) - max(1, len(spans))) * 12)
+        line_count_penalty = 0
+        if preferred_line_count:
+            line_count_penalty = abs(len(lines) - max(1, preferred_line_count)) * 42
+        score = float(scale_factor * 1000 - overflow * 5 - max(0, len(lines) - max(1, len(spans))) * 12 - line_count_penalty)
         candidate = {
             "scaleFactor": float(scale_factor),
             "lines": line_layouts,
             "widest": widest,
             "totalHeight": total_height,
             "overflow": overflow,
+            "preferredLineCount": preferred_line_count,
+            "lineCountDelta": abs(len(lines) - preferred_line_count) if preferred_line_count else 0,
         }
         if overflow == 0:
             if best is None or score > best["score"]:
@@ -6335,7 +6357,8 @@ def select_translation_candidate_for_layout(
         if not candidate_text:
             continue
         spans = infer_translated_style_spans(block.text, candidate_text, block.source_style_spans or infer_source_style_spans(block.text, block), block)
-        layout = fit_styled_spans(draw, spans, box, base_typography)
+        preferred_line_count = max(1, len(block.line_texts) or len([line for line in block.text.splitlines() if line.strip()]) or 1)
+        layout = fit_styled_spans(draw, spans, box, base_typography, preferred_line_count=preferred_line_count)
         quality_score, warnings = assess_layout_quality(layout, box, spans, block)
         faithful_token_count = max(1, len((block.translated_text or block.text).replace("\n", " ").split()))
         candidate_token_count = len(candidate_text.replace("\n", " ").split())
@@ -6357,7 +6380,8 @@ def select_translation_candidate_for_layout(
     if not evaluations:
         fallback_text = block.translated_text or block.text
         fallback_spans = infer_translated_style_spans(block.text, fallback_text, block.source_style_spans or infer_source_style_spans(block.text, block), block)
-        fallback_layout = fit_styled_spans(draw, fallback_spans, box, base_typography)
+        preferred_line_count = max(1, len(block.line_texts) or len([line for line in block.text.splitlines() if line.strip()]) or 1)
+        fallback_layout = fit_styled_spans(draw, fallback_spans, box, base_typography, preferred_line_count=preferred_line_count)
         return {
             "label": "faithful",
             "text": fallback_text,
@@ -6569,7 +6593,8 @@ def build_render_audit_artifacts(
         base_typography = default_typography_style(block)
         source_spans = block.source_style_spans or infer_source_style_spans(block.text, block)
         renderable_source_spans = source_spans_to_renderable(source_spans, block)
-        source_layout = fit_styled_spans(source_draw, renderable_source_spans, bbox, base_typography)
+        preferred_line_count = max(1, len(block.line_texts) or len([line for line in block.text.splitlines() if line.strip()]) or 1)
+        source_layout = fit_styled_spans(source_draw, renderable_source_spans, bbox, base_typography, preferred_line_count=preferred_line_count)
         _, source_boxes = render_styled_spans(source_draw, source_layout, bbox, alignment=block.align)
 
         candidate_choice = select_translation_candidate_for_layout(translated_draw, block, bbox)
@@ -6597,6 +6622,11 @@ def build_render_audit_artifacts(
                 "spanRenderBoxes": translated_boxes,
                 "selectedFontScale": translated_layout.get("scaleFactor", 1.0),
                 "lineBreakStrategy": "semantic_span_layout",
+                "lineCountPreservation": {
+                    "preferred": preferred_line_count,
+                    "actual": len(translated_layout.get("lines", [])),
+                    "delta": translated_layout.get("lineCountDelta", abs(len(translated_layout.get("lines", [])) - preferred_line_count)),
+                },
                 "overflowWarnings": warnings,
                 "selectionReason": candidate_choice.get("reason", ""),
                 "selectedTranslationCandidate": {
@@ -6625,11 +6655,11 @@ def build_render_audit_artifacts(
     }
     semantic_style_mapping = {
         "enabled": True,
-        "mode": "semantic_role",
+        "mode": "semantic_phrase_word_mapping",
         "colorAware": True,
         "fontFamilyAware": "approximate_system_match",
         "letterSpacingAware": "approximate_uniform",
-        "notes": "Semantic roles drive size/weight/casing transfer; font family and letter spacing use approximate system typography rather than pixel-perfect font identification.",
+        "notes": "Styles follow semantic phrase/word meaning rather than source position; line-count preservation is scored against the source visual rhythm.",
     }
     severe_render_warnings = {
         "overflow",
@@ -7713,12 +7743,13 @@ def build_openai_localize_prompt(
         "Hard contract:\n"
         "1. Replace ONLY the editable source marketing text items listed in Text replacements JSON.\n"
         "2. Use each replacement_text exactly. Do not paraphrase, summarize, reorder, add product names, add SKU names, or invent new copy.\n"
-        "3. If replacement_text has line breaks, keep those line breaks. If line_mapping is present, map each replacement_line to the corresponding source_line/editable_box.\n"
-        "4. Transfer style semantically and visually: source blue text stays blue in the corresponding translated words; source white text on a yellow highlight stays white on the same yellow highlight; font weight, casing, size hierarchy, alignment, background color, and spacing must match the source region.\n"
-        "5. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
-        "6. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
-        "7. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
-        "8. Do not add new logos, watermarks, badges, product names, or extra copy.\n"
+        "3. Source words may be stacked visually but form one sentence. Preserve the semantic sentence in replacement_text while keeping the source line count and visual rhythm as much as possible.\n"
+        "4. If replacement_text has line breaks, keep those line breaks. If line_mapping is present, map each replacement_line to the corresponding source_line/editable_box.\n"
+        "5. Transfer style by semantic word/phrase meaning, not by absolute position: if the emphasized source word moves from the end to the beginning in the target language, the target word at the beginning receives that style. Source blue text stays blue in the corresponding translated words; source white text on a yellow highlight stays white on the same yellow highlight; font weight, casing, size hierarchy, alignment, background color, and spacing must match the source region.\n"
+        "6. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
+        "7. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
+        "8. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
+        "9. Do not add new logos, watermarks, badges, product names, or extra copy.\n"
         "Return a finished localized image only.\n"
         f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}\n"
         f"Protected non-editable text hints JSON:\n{json.dumps(protected_items, ensure_ascii=False, indent=2)}"
@@ -7814,6 +7845,53 @@ def bbox_from_luma_mask(mask: Image.Image, min_pixels: int = 64) -> tuple[int, i
     if len(xs) < min_pixels or len(ys) < min_pixels:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def component_boxes_from_luma_mask(mask: Image.Image, min_area_ratio: float = 0.004, max_components: int = 8) -> list[tuple[int, int, int, int]]:
+    probe = mask.convert("L")
+    scale = min(1.0, 620 / max(1, max(probe.size)))
+    if scale < 1.0:
+        probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.NEAREST)
+    arr = np.array(probe) > 16
+    visited = np.zeros(arr.shape, dtype=bool)
+    height, width = arr.shape
+    components: list[tuple[int, int, int, int, int]] = []
+    min_pixels = max(24, int(width * height * min_area_ratio))
+    for start_y in range(height):
+        for start_x in range(width):
+            if visited[start_y, start_x] or not arr[start_y, start_x]:
+                continue
+            stack = [(start_x, start_y)]
+            visited[start_y, start_x] = True
+            min_x = max_x = start_x
+            min_y = max_y = start_y
+            count = 0
+            while stack:
+                x, y = stack.pop()
+                count += 1
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, y)
+                max_y = max(max_y, y)
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and not visited[ny, nx] and arr[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((nx, ny))
+            if count < min_pixels:
+                continue
+            components.append((count, min_x, min_y, max_x + 1, max_y + 1))
+    components.sort(reverse=True)
+    boxes: list[tuple[int, int, int, int]] = []
+    for _count, left, top, right, bottom in components[:max_components]:
+        boxes.append(
+            (
+                max(0, min(mask.width, int(left / max(scale, 1e-6)))),
+                max(0, min(mask.height, int(top / max(scale, 1e-6)))),
+                max(0, min(mask.width, int(right / max(scale, 1e-6)))),
+                max(0, min(mask.height, int(bottom / max(scale, 1e-6)))),
+            )
+        )
+    return boxes
 
 
 def detect_protected_region_mask(
@@ -8456,6 +8534,119 @@ def build_resize_text_exclusion_mask(source: Image.Image, blocks: list[TextBlock
     return mask.filter(ImageFilter.GaussianBlur(radius=0.8))
 
 
+def extract_decorative_resize_layers(
+    source: Image.Image,
+    product_box: tuple[int, int, int, int],
+    text_blocks: list[TextBlock],
+    component_boxes: list[tuple[int, int, int, int]] | None = None,
+    limit: int = 3,
+) -> list[VisualLayer]:
+    layers: list[VisualLayer] = []
+    text_boxes = [block.bbox for block in text_blocks if block.translate]
+    for component_box in component_boxes or []:
+        if overlap_fraction(component_box, product_box) > 0.20:
+            continue
+        if any(overlap_fraction(component_box, text_box) > 0.18 for text_box in text_boxes):
+            continue
+        layers.append(
+            VisualLayer(
+                id=f"decorative-{len(layers) + 1}",
+                role=LayerRole.DECORATIVE,
+                bbox=bbox1000_from_pixel_box(component_box, source.width, source.height),
+                confidence=0.50,
+                saliency=max(0.30, min(0.72, ((component_box[2] - component_box[0]) * (component_box[3] - component_box[1])) / max(1, source.width * source.height) * 4)),
+                protected=False,
+                notes="protected_mask_side_component importance:secondary visibility:partial theme_element:true",
+            )
+        )
+        if len(layers) >= limit:
+            return layers
+
+    probe = source.convert("RGB")
+    scale = min(1.0, 520 / max(1, max(probe.size)))
+    if scale < 1.0:
+        probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
+    arr = np.array(probe, dtype=np.float32)
+    if arr.size == 0:
+        return []
+    gray = np.array(probe.convert("L"), dtype=np.float32)
+    edges = np.array(probe.convert("L").filter(ImageFilter.FIND_EDGES), dtype=np.float32)
+    chroma = arr.max(axis=2) - arr.min(axis=2)
+    edge_threshold = max(20.0, float(np.percentile(edges, 86)))
+    chroma_threshold = max(18.0, float(np.percentile(chroma, 72)))
+    candidate = (edges >= edge_threshold) | (chroma >= chroma_threshold)
+    candidate &= gray > 18
+
+    def scaled_box(box: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
+        return (
+            max(0, min(probe.width, int(box[0] * scale))),
+            max(0, min(probe.height, int(box[1] * scale))),
+            max(0, min(probe.width, int(box[2] * scale))),
+            max(0, min(probe.height, int(box[3] * scale))),
+        )
+
+    protected_boxes = [scaled_box(product_box)] + [scaled_box(block.bbox) for block in text_blocks if block.translate]
+    for left, top, right, bottom in protected_boxes:
+        pad_x = max(2, int((right - left) * 0.08))
+        pad_y = max(2, int((bottom - top) * 0.08))
+        candidate[max(0, top - pad_y): min(probe.height, bottom + pad_y), max(0, left - pad_x): min(probe.width, right + pad_x)] = False
+
+    visited = np.zeros(candidate.shape, dtype=bool)
+    components: list[tuple[int, int, int, int, int]] = []
+    height, width = candidate.shape
+    for start_y in range(height):
+        for start_x in range(width):
+            if visited[start_y, start_x] or not candidate[start_y, start_x]:
+                continue
+            stack = [(start_x, start_y)]
+            visited[start_y, start_x] = True
+            min_x = max_x = start_x
+            min_y = max_y = start_y
+            count = 0
+            while stack:
+                x, y = stack.pop()
+                count += 1
+                min_x = min(min_x, x)
+                max_x = max(max_x, x)
+                min_y = min(min_y, y)
+                max_y = max(max_y, y)
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < width and 0 <= ny < height and not visited[ny, nx] and candidate[ny, nx]:
+                        visited[ny, nx] = True
+                        stack.append((nx, ny))
+            area_ratio = count / max(1, width * height)
+            box_w = max_x - min_x + 1
+            box_h = max_y - min_y + 1
+            if area_ratio < 0.004 or area_ratio > 0.30 or box_w < 12 or box_h < 12:
+                continue
+            components.append((count, min_x, min_y, max_x + 1, max_y + 1))
+
+    components.sort(reverse=True)
+    for index, (count, left, top, right, bottom) in enumerate(components[: limit * 2]):
+        if len(layers) >= limit:
+            break
+        source_box = (
+            max(0, min(source.width, int(left / max(scale, 1e-6)))),
+            max(0, min(source.height, int(top / max(scale, 1e-6)))),
+            max(0, min(source.width, int(right / max(scale, 1e-6)))),
+            max(0, min(source.height, int(bottom / max(scale, 1e-6)))),
+        )
+        if overlap_fraction(source_box, product_box) > 0.12:
+            continue
+        layers.append(
+            VisualLayer(
+                id=f"decorative-{len(layers) + 1}",
+                role=LayerRole.DECORATIVE,
+                bbox=bbox1000_from_pixel_box(source_box, source.width, source.height),
+                confidence=0.42,
+                saliency=max(0.25, min(0.68, count / max(1, width * height) * 8)),
+                protected=False,
+                notes="heuristic_side_or_theme_element importance:secondary visibility:partial theme_element:true",
+            )
+        )
+    return layers
+
+
 def build_openai_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
     if not os.getenv("OPENAI_API_KEY", "").strip():
         return None
@@ -8485,7 +8676,8 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
                     "content": (
                         build_visual_analysis_prompt(target_language)
                         + " Return the dimensions of the original source image, not the resized analysis image. "
-                        + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers."
+                        + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers. "
+                        + "For resize, explicitly identify secondary visual theme elements in other_layers so the planner can recompose them around the protected product instead of cropping the source."
                     ),
                 },
                 {
@@ -8550,7 +8742,15 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
     text_exclusion_mask = build_resize_text_exclusion_mask(source, detector_blocks)
     protected_mask, protected_meta = detect_protected_region_mask(source, exclusion_mask=text_exclusion_mask)
     protected_box = bbox_from_luma_mask(protected_mask)
-    foreground_box = protected_box or detect_foreground_bbox(source)
+    protected_components = component_boxes_from_luma_mask(protected_mask)
+    selected_component: tuple[int, int, int, int] | None = None
+    if focus_bbox and protected_components:
+        selected_component = max(protected_components, key=lambda box: overlap_fraction(box, focus_bbox))
+        if overlap_fraction(selected_component, focus_bbox) < 0.08:
+            selected_component = None
+    if selected_component is None and protected_components:
+        selected_component = max(protected_components, key=lambda box: (box[2] - box[0]) * (box[3] - box[1]))
+    foreground_box = selected_component or protected_box or detect_foreground_bbox(source)
     product_box = foreground_box or focus_bbox or (0, 0, source.width, source.height)
     product_layer = ProductLayer(
         id="product-1",
@@ -8561,6 +8761,7 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
         mask_quality="rough_mask" if protected_box else "bbox_only",
         needs_shadow=True,
     )
+    decorative_layers = extract_decorative_resize_layers(source, product_box, detector_blocks, protected_components)
 
     return VisualAnalysis(
         source_width=source.width,
@@ -8568,13 +8769,16 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
         background=classify_resize_background(source),
         product_layers=[product_layer],
         text_layers=text_layers,
-        saliency_summary="Heuristic resize analysis: foreground subject bbox, marketing OCR boxes, and background texture estimate.",
+        other_layers=decorative_layers,
+        saliency_summary="Heuristic resize analysis: protected foreground subject, marketing OCR boxes, background texture, and secondary decorative/theme components for recompose planning.",
         quality_warnings=[
             item
             for item in [
                 "analysis_provider:heuristic",
                 f"protected_mask:{protected_meta.get('protectedMaskRefinementMethod', 'unknown')}",
                 "protected_mask_uncertain" if protected_meta.get("refinementUncertain") else "",
+                f"protected_components:{len(protected_components)}",
+                f"decorative_layers:{len(decorative_layers)}",
                 fallback_reason,
             ]
             if item
@@ -9109,11 +9313,17 @@ def build_outpaint_seed_and_mask(source: Image.Image, width: int, height: int, p
 def build_openai_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
     product_notes = ", ".join(layer.id for layer in analysis.product_layers[:3]) or "main product"
     text_notes = ", ".join(layer.original_text for layer in analysis.marketing_text_layers[:2]) or "existing ad text"
+    theme_notes = "; ".join(
+        f"{layer.id}:{layer.notes or layer.role.value}"
+        for layer in analysis.other_layers[:4]
+    ) or analysis.saliency_summary or "existing campaign theme"
     return (
         "Extend this finished advertising creative to the transparent canvas area only. "
         "Preserve the pasted original creative exactly: do not alter, translate, move, crop, blur, or redraw any existing text, logo, product label, product, person, or foreground object. "
-        "Fill only the transparent/masked area with a natural continuation of the existing background, matching lighting, blur, grain, color, texture, and perspective. "
+        "Fill only the transparent/masked area with a natural continuation of the existing background, matching lighting, blur, grain, color, texture, perspective, and campaign theme. "
+        "If the new aspect ratio is narrower/taller, keep the protected subject fully visible and let secondary decorative/theme elements appear resized, shifted, or partially visible only in the newly generated area. "
         f"Placement: {plan.placement_id}. Bucket: {plan.logic_bucket.value}. Important protected subjects: {product_notes}. Existing marketing text to preserve: {text_notes}. "
+        f"Theme/secondary elements to respect: {theme_notes}. "
         "No new text, no new logo, no watermark, no extra objects, no duplicated product."
     )
 

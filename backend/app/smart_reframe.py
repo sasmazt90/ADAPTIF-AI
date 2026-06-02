@@ -322,6 +322,7 @@ def choose_expansion_strategy(analysis: VisualAnalysis, target: TargetCanvas) ->
     source_ratio = analysis.source_width / max(1, analysis.source_height)
     ratio_delta = abs(source_ratio - target.ratio)
     bg = analysis.background
+    has_structured_layers = bool(analysis.product_layers or analysis.marketing_text_layers or analysis.other_layers)
 
     if target.logic_bucket == LogicBucket.NARROW_BANNER:
         return ExpansionDecision(
@@ -329,6 +330,14 @@ def choose_expansion_strategy(analysis: VisualAnalysis, target: TargetCanvas) ->
             reason="Narrow banners are too short for outpaint; rebuild as product/text/CTA layout.",
             requires_ai=False,
             estimated_cost_tier="none",
+        )
+
+    if has_structured_layers and ratio_delta >= 0.55 and target.logic_bucket in {LogicBucket.VERTICAL_SQUARE, LogicBucket.LARGE_RECTANGLE}:
+        return ExpansionDecision(
+            strategy=ExpansionStrategy.OPENAI_OUTPAINT,
+            reason="Aspect ratio changes materially; preserve the protected subject and recompose theme elements instead of blind crop.",
+            requires_ai=True,
+            estimated_cost_tier="medium",
         )
 
     if target.logic_bucket == LogicBucket.LANDSCAPE_WIDE and bg.type in {BackgroundType.SOLID, BackgroundType.GRADIENT, BackgroundType.SOFT_BLUR}:
@@ -436,6 +445,7 @@ class SmartReframe:
         instructions: list[PlacementInstruction] = []
         product_zone = target.preferred_product_zone or preferred_zones_for(target.logic_bucket, target.width, target.height)[0]
         text_zone = target.preferred_text_zone or preferred_zones_for(target.logic_bucket, target.width, target.height)[1]
+        decorative_zones = self._decorative_zones(target, product_zone, text_zone)
 
         for index, layer in enumerate(self.analysis.product_layers[:2]):
             instructions.append(
@@ -459,7 +469,39 @@ class SmartReframe:
                 )
             )
 
+        decorative_layers = sorted(
+            [layer for layer in self.analysis.other_layers if layer.role in {LayerRole.DECORATIVE, LayerRole.BACKGROUND, LayerRole.UNKNOWN}],
+            key=lambda layer: (layer.saliency, layer.confidence, layer.bbox.area_ratio()),
+            reverse=True,
+        )
+        for index, layer in enumerate(decorative_layers[:3]):
+            zone = decorative_zones[index % len(decorative_zones)]
+            instructions.append(
+                PlacementInstruction(
+                    layer_id=layer.id,
+                    role=layer.role,
+                    target_bbox=zone,
+                    z_index=8 + index,
+                    scale=max(0.35, min(0.9, 0.42 + layer.saliency * 0.42)),
+                    preserve_aspect_ratio=True,
+                    add_shadow=False,
+                )
+            )
+
         return instructions
+
+    def _decorative_zones(self, target: TargetCanvas, product_zone: BBox1000, text_zone: BBox1000) -> list[BBox1000]:
+        if target.logic_bucket == LogicBucket.NARROW_BANNER:
+            return [_bbox(100, 650, 900, 960), _bbox(80, 40, 920, 250), _bbox(120, 420, 880, 620)]
+        if target.logic_bucket == LogicBucket.LANDSCAPE_WIDE:
+            return [_bbox(90, 55, 420, 330), _bbox(560, 80, 910, 390), _bbox(70, 760, 360, 970)]
+        if target.logic_bucket == LogicBucket.LARGE_RECTANGLE and target.ratio < 0.45:
+            return [_bbox(70, 75, 250, 430), _bbox(90, 565, 320, 940), _bbox(700, 35, 960, 360)]
+        if target.logic_bucket == LogicBucket.LARGE_RECTANGLE:
+            return [_bbox(70, 70, 360, 360), _bbox(80, 690, 410, 950), _bbox(680, 60, 940, 360)]
+        if target.ratio < 0.75:
+            return [_bbox(80, 70, 300, 430), _bbox(90, 575, 340, 935), _bbox(705, 60, 935, 360)]
+        return [_bbox(70, 70, 335, 360), _bbox(90, 670, 360, 940), _bbox(700, 80, 940, 380)]
 
     def _safe_zone_warnings(self, target: TargetCanvas, placements: list[PlacementInstruction]) -> list[str]:
         warnings: list[str] = []
@@ -489,9 +531,15 @@ def build_visual_analysis_prompt(target_language: str) -> str:
         "Use normalized [ymin, xmin, ymax, xmax] coordinates from 0 to 1000. Identify product/person foreground, "
         "marketing text, CTA, logos, product label text, and background type. Mark product, logos, product label text, "
         "and important foreground as protected. Translate only marketing text and CTA into the target language. "
+        "This resize system must recompose the creative, not blindly crop it: the main product/person must remain fully visible, "
+        "the campaign theme/background must stay recognizable, and secondary scene props may be resized, moved, or partially visible. "
+        "List secondary theme props such as sun, umbrella, lounge chair, sea, sky, hands, tools, furniture, or scenery in other_layers "
+        "with role decorative/background/unknown; use notes to state importance:primary/secondary/tertiary, visibility:full/partial, "
+        "and theme_element:true/false. Do not mark decorative side props protected unless they are part of the product. "
         f"Target language: {target_language}. "
         "For background, classify type as solid, gradient, soft_blur, photographic, textured, patterned, or unknown; "
         "estimate texture_complexity from 0 to 1 and can_extend_without_ai. Include exact source_width and source_height. "
+        "In saliency_summary, describe the main protected subject, visual theme, and which side elements can be partial in narrower formats. "
         "Do not include markdown."
     )
 
