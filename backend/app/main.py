@@ -1429,6 +1429,8 @@ def snap_overlay_blocks_to_ocr(
             if not line_match:
                 overlap = text_tokens(candidate.text) & text_tokens(block.text)
                 line_match = len(overlap) >= 2
+            if not line_match and block.translate and candidate.translate and overlap_fraction(candidate.bbox, expanded) > 0.12:
+                line_match = True
             if line_match:
                 candidates.append(candidate)
 
@@ -1453,9 +1455,51 @@ def snap_overlay_blocks_to_ocr(
     return snapped
 
 
+def stabilize_vision_blocks_with_ocr(
+    vision_blocks: list[TextBlock],
+    ocr_blocks: list[TextBlock],
+    image_size: tuple[int, int],
+    foreground_bbox: tuple[int, int, int, int] | None = None,
+) -> list[TextBlock]:
+    snapped = snap_overlay_blocks_to_ocr(vision_blocks, ocr_blocks, image_size, foreground_bbox)
+    image_width, image_height = image_size
+    image_area = max(1, image_width * image_height)
+    stable: list[TextBlock] = []
+    for block in snapped:
+        bbox_area = max(1, block.bbox[2] - block.bbox[0]) * max(1, block.bbox[3] - block.bbox[1])
+        overlap_with_foreground = overlap_fraction(block.bbox, foreground_bbox) if foreground_bbox else 0.0
+        normalized = block.text.lower()
+        likely_packaging = (
+            block.surface in {"packaging", "product"}
+            or has_packaging_cues(block.text)
+            or (
+                overlap_with_foreground >= 0.35
+                and bbox_area <= image_area * 0.10
+                and any(token in normalized for token in ("ml", "spf", "h2o", "dr.", "scholl", "bioderma", "sensibio"))
+            )
+        )
+        updates: dict[str, Any] = {}
+        if likely_packaging:
+            updates.update({"translate": False, "surface": "packaging", "role": "product_label"})
+        elif block.surface == "overlay" and not block.line_boxes:
+            updates.update({"line_boxes": [block.bbox], "line_texts": [block.text]})
+        if block.surface == "overlay" and bbox_area > image_area * 0.62 and len(block.text.split()) <= 4:
+            updates.update({"translate": False, "role": "product_label"})
+        stable.append(block.model_copy(update=updates) if updates else block)
+    return sorted(stable, key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
 def build_localize_blocks(image_path: Path, source_image: Image.Image) -> list[TextBlock]:
     foreground_bbox = detect_foreground_bbox(source_image)
     raw_ocr_blocks = run_trocr_ocr_on_image(image_path)
+    vision_block_blocks = extract_marketing_blocks_with_openai_vision(image_path)
+    if vision_block_blocks:
+        stable_blocks = stabilize_vision_blocks_with_ocr(vision_block_blocks, raw_ocr_blocks, source_image.size, foreground_bbox)
+        stable_blocks = merge_centered_stacks(stable_blocks, source_image.size)
+        stable_blocks = merge_translate_runs(stable_blocks, source_image.size)
+        stable_blocks = append_missing_translate_ocr_blocks(stable_blocks, raw_ocr_blocks, source_image.size)
+        return suppress_packaging_translation(stable_blocks, source_image.size, foreground_bbox)
+
     vision_line_blocks = refine_blocks_with_openai_vision(image_path, raw_ocr_blocks)
     if vision_line_blocks:
         semantic_tokens = annotate_ocr_tokens_with_vision(raw_ocr_blocks, vision_line_blocks)
@@ -7764,6 +7808,14 @@ def detect_foreground_bbox(source: Image.Image) -> tuple[int, int, int, int] | N
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
 
 
+def bbox_from_luma_mask(mask: Image.Image, min_pixels: int = 64) -> tuple[int, int, int, int] | None:
+    arr = np.array(mask.convert("L")) > 16
+    ys, xs = np.where(arr)
+    if len(xs) < min_pixels or len(ys) < min_pixels:
+        return None
+    return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
 def detect_protected_region_mask(
     source: Image.Image,
     exclusion_mask: Image.Image | None = None,
@@ -8381,6 +8433,29 @@ def sample_marketing_text_color(source: Image.Image, bbox: tuple[int, int, int, 
     return tuple(int(max(0, min(255, value))) for value in color)
 
 
+def build_resize_text_exclusion_mask(source: Image.Image, blocks: list[TextBlock]) -> Image.Image:
+    mask = Image.new("L", source.size, 0)
+    draw = ImageDraw.Draw(mask)
+    for block in blocks:
+        if block.surface in {"packaging", "product"}:
+            continue
+        left, top, right, bottom = block.bbox
+        if right <= left or bottom <= top:
+            continue
+        pad_x = max(4, min(24, int((right - left) * 0.08)))
+        pad_y = max(3, min(18, int((bottom - top) * 0.18)))
+        draw.rectangle(
+            (
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(source.width, right + pad_x),
+                min(source.height, bottom + pad_y),
+            ),
+            fill=255,
+        )
+    return mask.filter(ImageFilter.GaussianBlur(radius=0.8))
+
+
 def build_openai_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
     if not os.getenv("OPENAI_API_KEY", "").strip():
         return None
@@ -8435,22 +8510,13 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
 
 
 def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, fallback_reason: str = "") -> VisualAnalysis:
-    foreground_box = detect_foreground_bbox(source)
-    product_box = foreground_box or focus_bbox or (0, 0, source.width, source.height)
-    product_layer = ProductLayer(
-        id="product-1",
-        bbox=bbox1000_from_pixel_box(product_box, source.width, source.height),
-        confidence=0.68 if foreground_box else 0.42,
-        saliency=0.82,
-        protected=True,
-        mask_quality="bbox_only",
-        needs_shadow=True,
-    )
     text_layers: list[TextLayer] = []
+    detector_blocks: list[TextBlock] = []
     temp_path = temp_root() / f"{uuid4().hex}-resize-analysis.png"
     try:
         source.save(temp_path, "PNG")
-        for index, block in enumerate(marketing_filter(run_trocr_ocr_on_image(temp_path))[:6]):
+        detector_blocks = marketing_filter(run_trocr_ocr_on_image(temp_path))
+        for index, block in enumerate(detector_blocks[:6]):
             sampled_color = sample_marketing_text_color(
                 source,
                 block.bbox,
@@ -8481,6 +8547,21 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
     finally:
         temp_path.unlink(missing_ok=True)
 
+    text_exclusion_mask = build_resize_text_exclusion_mask(source, detector_blocks)
+    protected_mask, protected_meta = detect_protected_region_mask(source, exclusion_mask=text_exclusion_mask)
+    protected_box = bbox_from_luma_mask(protected_mask)
+    foreground_box = protected_box or detect_foreground_bbox(source)
+    product_box = foreground_box or focus_bbox or (0, 0, source.width, source.height)
+    product_layer = ProductLayer(
+        id="product-1",
+        bbox=bbox1000_from_pixel_box(product_box, source.width, source.height),
+        confidence=0.74 if protected_box else 0.50 if foreground_box else 0.38,
+        saliency=0.84,
+        protected=True,
+        mask_quality="rough_mask" if protected_box else "bbox_only",
+        needs_shadow=True,
+    )
+
     return VisualAnalysis(
         source_width=source.width,
         source_height=source.height,
@@ -8488,7 +8569,16 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
         product_layers=[product_layer],
         text_layers=text_layers,
         saliency_summary="Heuristic resize analysis: foreground subject bbox, marketing OCR boxes, and background texture estimate.",
-        quality_warnings=[item for item in ["analysis_provider:heuristic", fallback_reason] if item],
+        quality_warnings=[
+            item
+            for item in [
+                "analysis_provider:heuristic",
+                f"protected_mask:{protected_meta.get('protectedMaskRefinementMethod', 'unknown')}",
+                "protected_mask_uncertain" if protected_meta.get("refinementUncertain") else "",
+                fallback_reason,
+            ]
+            if item
+        ],
     )
 
 
