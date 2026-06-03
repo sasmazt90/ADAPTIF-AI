@@ -9167,7 +9167,7 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         probe.save(encoded_io, format="PNG")
         encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
 
-        client = OpenAI()
+        client = OpenAI(timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")))
         response = client.chat.completions.create(
             model=os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL", os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o")),
             temperature=0,
@@ -9246,7 +9246,7 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
                 ],
                 "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
             },
-            timeout=60,
+            timeout=int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
         )
         response.raise_for_status()
         payload = response.json()
@@ -10122,7 +10122,7 @@ def render_vertex_outpaint_reframe(source: Image.Image, width: int, height: int,
                 "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
             },
         },
-        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "90")),
+        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "35")),
     )
     try:
         response.raise_for_status()
