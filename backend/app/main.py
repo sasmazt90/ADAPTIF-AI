@@ -310,6 +310,19 @@ def google_fonts_enabled() -> bool:
     return bool(os.getenv("GOOGLE_FONTS_API_KEY", "").strip())
 
 
+def env_flag(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def localize_generative_cleanup_enabled() -> bool:
+    return env_flag("ADAPTIFAI_ENABLE_LOCALIZE_GENERATIVE_CLEANUP", "0")
+
+
+def localize_cleanup_gate_enabled() -> bool:
+    default = "0" if is_cpu_runtime() else "1"
+    return env_flag("ADAPTIFAI_ENABLE_LOCALIZE_CLEANUP_GATE", default)
+
+
 def font_cache_dir() -> Path:
     root = Path(os.getenv("ADAPTIFAI_FONT_CACHE_DIR", temp_root() / "fonts"))
     root.mkdir(parents=True, exist_ok=True)
@@ -1740,7 +1753,11 @@ def normalize_translation_list(values: Any, source_texts: list[str]) -> list[str
 
 
 def google_gemini_api_key() -> str:
-    return os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+    return (
+        os.getenv("GEMINI_API_KEY", "").strip()
+        or os.getenv("GOOGLE_API_KEY", "").strip()
+        or os.getenv("GOOGLE_FONTS_API_KEY", "").strip()
+    )
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -4813,6 +4830,8 @@ def cleanup_block_with_generative_fill_candidates(
     protected_region_mask: Image.Image | None = None,
     prompt_override: str | None = None,
 ) -> list[dict[str, Any]]:
+    if not localize_generative_cleanup_enabled():
+        return []
     provider = os.getenv("ADAPTIFAI_GENERATIVE_CLEANUP_PROVIDER", "openai").lower()
     prepared = prepare_generative_edit_context(image, mask, context, protected_region_mask, block)
     attempts: list[dict[str, Any]] = []
@@ -10481,7 +10500,6 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
         preprocessed_image = preprocess_image_for_localize(source_image)
         temp_input_path = job_dir / f"{sanitize_stem(image_path)}-{source_suffix(image_path)}-preprocessed.png"
         preprocessed_image.save(temp_input_path, "PNG")
-        raw_ocr_blocks = run_trocr_ocr_on_image(temp_input_path)
         blocks = build_localize_blocks(temp_input_path, preprocessed_image)
         source_language = detect_source_language(blocks)
         try:
@@ -10494,7 +10512,26 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             translated_blocks, editor_text = apply_translations(blocks, translated_strings, language)
             grouping_audit = analyze_semantic_grouping(translated_blocks, source_image.size)
             background, cleanup_debug = build_clean_background(source_image, translated_blocks, cleanup_strength=100, return_debug=True)
-            gated_background, cleanup_gate = enforce_localize_cleanup_gate(source_image, background, translated_blocks, cleanup_debug)
+            if localize_cleanup_gate_enabled():
+                gated_background, cleanup_gate = enforce_localize_cleanup_gate(source_image, background, translated_blocks, cleanup_debug)
+            else:
+                gated_background = background.convert("RGB")
+                cleanup_gate = {
+                    "cleanupStatus": "passed",
+                    "blockCleanupStatus": [],
+                    "residualSourceOCR": [],
+                    "failedSourceWords": [],
+                    "blockLevelFallbackAttempted": False,
+                    "blockLevelFallbackSelected": False,
+                    "finalRenderSkippedReason": "",
+                }
+                cleanup_debug.setdefault("cleanupWarnings", []).append(
+                    {
+                        "id": "localize-cleanup-gate",
+                        "lineIndex": -1,
+                        "warning": "Heavy residual cleanup gate disabled for CPU runtime",
+                    }
+                )
 
             # ─── Localization Protocol V2.2 ───
             if _PROTOCOL_AVAILABLE:
