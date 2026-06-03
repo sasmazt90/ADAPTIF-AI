@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import asyncio
 import json
 import os
 import re
@@ -27,6 +28,7 @@ from fastapi.responses import FileResponse
 from openai import OpenAI
 from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from pydantic import BaseModel, Field
+from starlette.concurrency import run_in_threadpool
 
 try:
     from app.localization_protocol import (
@@ -186,6 +188,7 @@ OCR_DETECTOR = None
 TROCR_PROCESSOR = None
 TROCR_MODEL = None
 OCR_MODEL_LOCK = threading.Lock()
+ADAPT_PROCESSING_SEMAPHORE = asyncio.Semaphore(int(os.getenv("ADAPTIFAI_MAX_ACTIVE_JOBS", "1")))
 HF_CLEANUP_SESSION = None
 HF_CLEANUP_SESSION_LOCK = threading.Lock()
 HF_INPAINT_MODELS = [
@@ -12571,13 +12574,28 @@ async def adapt(
         parsed_creative_modes = {}
     resolved_mode = (mode or ("localize" if placement_ids == ["custom-display"] else "resize")).strip().lower()
 
-    if resolved_mode == "localize":
-        outputs, translations, manifest_assets = build_localize_assets(uploaded_images, languages, output_format, job_dir)
-        extracted_blocks = outputs[0].extracted_blocks if outputs else []
-    else:
-        outputs, manifest_assets = await build_resize_assets(uploaded_images, placement_ids, output_format, custom_width, custom_height, job_dir, creative_modes=parsed_creative_modes)
-        translations = {}
-        extracted_blocks = []
+    async with ADAPT_PROCESSING_SEMAPHORE:
+        if resolved_mode == "localize":
+            outputs, translations, manifest_assets = await run_in_threadpool(
+                build_localize_assets,
+                uploaded_images,
+                languages,
+                output_format,
+                job_dir,
+            )
+            extracted_blocks = outputs[0].extracted_blocks if outputs else []
+        else:
+            outputs, manifest_assets = await build_resize_assets(
+                uploaded_images,
+                placement_ids,
+                output_format,
+                custom_width,
+                custom_height,
+                job_dir,
+                creative_modes=parsed_creative_modes,
+            )
+            translations = {}
+            extracted_blocks = []
 
     manifest = {
         "job_id": job_id,

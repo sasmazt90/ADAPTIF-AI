@@ -59,11 +59,17 @@ services:
       - key: ADAPTIFAI_INPAINT_STEPS
         value: "12"
       - key: ADAPTIFAI_OCR_MAX_SIDE
-        value: "960"
+        value: "720"
       - key: ADAPTIFAI_OCR_BATCH_SIZE
         value: "1"
       - key: ADAPTIFAI_EASYOCR_DECODER
         value: greedy
+      - key: ADAPTIFAI_MAX_ACTIVE_JOBS
+        value: "1"
+      - key: ADAPTIFAI_LOCALIZE_FAST_CLEANUP
+        value: "1"
+      - key: ADAPTIFAI_ENABLE_LOCALIZE_CLEANUP_GATE
+        value: "0"
       - key: ADAPTIFAI_RESIZE_FIT
         value: cover
       - key: ADAPTIFAI_CORS_ORIGINS
