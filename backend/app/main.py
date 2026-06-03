@@ -323,6 +323,11 @@ def localize_cleanup_gate_enabled() -> bool:
     return env_flag("ADAPTIFAI_ENABLE_LOCALIZE_CLEANUP_GATE", default)
 
 
+def localize_fast_cleanup_enabled() -> bool:
+    default = "1" if is_cpu_runtime() else "0"
+    return env_flag("ADAPTIFAI_LOCALIZE_FAST_CLEANUP", default)
+
+
 def font_cache_dir() -> Path:
     root = Path(os.getenv("ADAPTIFAI_FONT_CACHE_DIR", temp_root() / "fonts"))
     root.mkdir(parents=True, exist_ok=True)
@@ -5061,6 +5066,81 @@ def build_clean_background(
                     ],
                 }
             )
+    if localize_fast_cleanup_enabled():
+        for block in blocks:
+            if not block.translate or not text_changed(block.text, block.translated_text):
+                continue
+            for region in iter_block_cleanup_regions(working, block, int(os.getenv("ADAPTIFAI_INPAINT_PADDING", "26"))):
+                expanded = region["expanded_box"]
+                local_mask = region["mask"].convert("L")
+                if local_mask.getbbox() is None:
+                    continue
+                original_crop = working.crop(expanded).convert("RGB")
+                cleaned_crop = cleanup_line_with_mask_guided_reconstruction(working, region).convert("RGB")
+                feather = local_mask.filter(ImageFilter.GaussianBlur(radius=3)).convert("L")
+                working.paste(Image.composite(cleaned_crop, original_crop, feather), expanded)
+                mask_coverage = float((np.array(local_mask) > 16).mean())
+                debug_info["lineCleanupRegions"].append(
+                    {
+                        "id": block.id,
+                        "lineIndex": region["line_index"],
+                        "lineText": region["line_text"],
+                        "tokenBox": list(region["token_box"]),
+                        "expandedBox": list(expanded),
+                    }
+                )
+                debug_info["lineMasks"].append(
+                    {
+                        "id": block.id,
+                        "lineIndex": region["line_index"],
+                        "maskSize": list(local_mask.size),
+                        "maskCoverage": mask_coverage,
+                    }
+                )
+                debug_info["foregroundOverlapScores"].append(
+                    {
+                        "id": block.id,
+                        "lineIndex": region["line_index"],
+                        "score": 0.0,
+                        "bboxForegroundOverlap": 0.0,
+                        "maskForegroundOverlap": 0.0,
+                        "coreMaskForegroundOverlap": 0.0,
+                        "protectedRegionRatio": 0.0,
+                    }
+                )
+                debug_info["lineCleanupStrategies"].append(
+                    {
+                        "id": block.id,
+                        "lineIndex": region["line_index"],
+                        "lineText": region.get("line_text"),
+                        "requestedStrategy": "fast-cpu",
+                        "selectedStrategy": "fast-reconstruction-touchup",
+                        "candidateScores": [],
+                        "selectedCandidate": "fast-reconstruction-touchup",
+                        "rejectedCandidates": [],
+                        "hardRejectReasons": [],
+                        "whySelectedOverOpenCV": "CPU fast cleanup avoids residual OCR scoring and generative cleanup in production.",
+                    }
+                )
+                debug_info["lineCleanupQualityScores"].append(
+                    {
+                        "id": block.id,
+                        "lineIndex": region["line_index"],
+                        "score": 1.0,
+                        "strategy": "fast-reconstruction-touchup",
+                        "scoreBreakdown": {"fastCleanup": True, "maskCoverage": mask_coverage},
+                    }
+                )
+        debug_info["cleanupWarnings"].append(
+            {
+                "id": "localize-fast-cleanup",
+                "lineIndex": -1,
+                "warning": "CPU fast cleanup skipped heavy candidate scoring, residual OCR, and generative cleanup.",
+            }
+        )
+        cleaned = working.convert("RGB")
+        return (cleaned, debug_info) if return_debug else cleaned
+
     for block in blocks:
         if not block.translate or not text_changed(block.text, block.translated_text):
             continue
