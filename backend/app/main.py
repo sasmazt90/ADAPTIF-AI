@@ -9507,7 +9507,8 @@ def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int,
 def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
-    if should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT:
+    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    if openai_outpaint_enabled and (should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT):
         try:
             rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
             strategy = "openai_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "openai_outpaint"
@@ -10290,7 +10291,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                 except Exception:
                     rendered = render_base.copy()
             openai_render_meta: dict[str, Any] | None = None
-            localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
+            localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "local").strip().lower()
             localize_foreground_bbox = detect_foreground_bbox(source_image)
             has_openai_edit_work = any(
                 is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
@@ -11054,7 +11055,7 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
     if edit.text_italic:
         rendered = _apply_italic_shear(rendered, styled_blocks, edit.x, edit.y)
     output_path = job_dir / asset_meta["filename"]
-    localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "openai").strip().lower()
+    localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "local").strip().lower()
     localize_foreground_bbox = detect_foreground_bbox(source_image)
     if localize_renderer == "openai" and any(
         is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
