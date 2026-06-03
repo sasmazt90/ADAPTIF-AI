@@ -20,6 +20,18 @@ services:
         value: gpt-image-2
       - key: ADAPTIFAI_OPENAI_IMAGE_QUALITY
         value: medium
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: VERTEX_AI_PROJECT_ID
+        value: adaptif-ai-1780483603776
+      - key: VERTEX_AI_LOCATION
+        value: us-central1
+      - key: VERTEX_IMAGEN_EDIT_MODEL
+        value: imagen-3.0-capability-001
+      - key: VERTEX_IMAGEN_MODEL
+        value: imagen-3.0-generate-002
+      - key: ADAPTIFAI_ENABLE_VERTEX_OUTPAINT
+        value: "1"
       - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER
         value: auto
       - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL
@@ -56,3 +68,5 @@ services:
         value: /data/easyocr
       - key: ADAPTIFAI_TMP_DIR
         value: /data/tmp/adaptifai
+      - key: WEB_CONCURRENCY
+        value: "2"

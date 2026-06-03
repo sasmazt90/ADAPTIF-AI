@@ -15,6 +15,7 @@ from vertexai.preview.vision_models import ImageGenerationModel
 DEFAULT_PROJECT_ID = "adaptif-ai-1780483603776"
 DEFAULT_LOCATION = "us-central1"
 DEFAULT_MODEL = "imagen-3.0-generate-002"
+DEFAULT_EDIT_MODEL = "imagen-3.0-capability-001"
 DEFAULT_CREDENTIALS = Path("google/adaptif-ai-1780483603776-8020de4fa75d.json")
 DEFAULT_OUTPUT_DIR = Path("ADAPTIFAI TEST IMAGES/vertex-output")
 

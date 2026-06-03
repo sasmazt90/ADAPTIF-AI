@@ -1778,9 +1778,9 @@ def google_service_account_info() -> dict[str, Any] | None:
             print(f"[vertex] invalid service account json env: {exc}", flush=True)
             return None
     path_value = (
-        os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        os.getenv("ADAPTIFAI_VERTEX_CREDENTIALS_FILE", "").strip()
         or os.getenv("VERTEX_AI_CREDENTIALS_FILE", "").strip()
-        or os.getenv("ADAPTIFAI_VERTEX_CREDENTIALS_FILE", "").strip()
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
     )
     if not path_value:
         return None
@@ -1809,6 +1809,10 @@ def vertex_location() -> str:
 
 def vertex_imagen_model() -> str:
     return os.getenv("VERTEX_IMAGEN_MODEL", os.getenv("ADAPTIFAI_VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-002")).strip() or "imagen-3.0-generate-002"
+
+
+def vertex_imagen_edit_model() -> str:
+    return os.getenv("VERTEX_IMAGEN_EDIT_MODEL", os.getenv("ADAPTIFAI_VERTEX_IMAGEN_EDIT_MODEL", "imagen-3.0-capability-001")).strip() or "imagen-3.0-capability-001"
 
 
 def vertex_available() -> bool:
@@ -1881,7 +1885,10 @@ def generate_vertex_imagen_image(
         },
         timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "90")),
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Vertex Imagen generate failed with HTTP {response.status_code}: {response.text[:1200]}") from exc
     payload = response.json()
     predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
     if not predictions:
@@ -1890,6 +1897,12 @@ def generate_vertex_imagen_image(
     if width and height and image.size != (width, height):
         image = image.resize((width, height), Image.Resampling.LANCZOS)
     return image, {"provider": "vertex", "model": model, "location": location, "aspectRatio": aspect_ratio}
+
+
+def image_to_base64_png(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
@@ -10027,22 +10040,158 @@ def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int,
     }
 
 
+def build_vertex_outpaint_base_and_mask(seed: Image.Image, seed_meta: dict[str, Any]) -> tuple[Image.Image, Image.Image]:
+    paste_box = seed_meta.get("sourcePasteBox") or [0, 0, seed.width, seed.height]
+    try:
+        left, top, right, bottom = [int(value) for value in paste_box]
+    except Exception:
+        left, top, right, bottom = 0, 0, seed.width, seed.height
+    rgba_seed = seed.convert("RGBA")
+    alpha = np.array(rgba_seed.getchannel("A"), dtype=np.uint8)
+    rgb_seed = rgba_seed.convert("RGB")
+    if int(np.count_nonzero(alpha)) < seed.width * seed.height:
+        visible = np.array(rgb_seed, dtype=np.uint8)[alpha > 0]
+        fill_color = tuple(int(value) for value in (visible.mean(axis=0) if visible.size else np.array([245, 245, 245])))
+        base = Image.new("RGB", seed.size, fill_color)
+        base.paste(rgb_seed, (0, 0), rgba_seed.getchannel("A"))
+    else:
+        base = rgb_seed
+
+    mask = Image.new("L", seed.size, 255)
+    mask_draw = ImageDraw.Draw(mask)
+    mask_draw.rectangle(
+        (
+            max(0, min(seed.width, left)),
+            max(0, min(seed.height, top)),
+            max(0, min(seed.width, right)),
+            max(0, min(seed.height, bottom)),
+        ),
+        fill=0,
+    )
+    return base, mask.convert("RGB")
+
+
+def render_vertex_outpaint_reframe(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    if not vertex_available():
+        raise RuntimeError("Vertex service account is not configured.")
+    seed, _openai_mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
+    base_image, mask_image = build_vertex_outpaint_base_and_mask(seed, seed_meta)
+    project_id = vertex_project_id()
+    location = vertex_location()
+    model = vertex_imagen_edit_model()
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
+        f"locations/{location}/publishers/google/models/{model}:predict"
+    )
+    prompt = build_openai_outpaint_prompt(plan, analysis)
+    response = vertex_authorized_session().post(
+        endpoint,
+        json={
+            "instances": [
+                {
+                    "prompt": prompt,
+                    "referenceImages": [
+                        {
+                            "referenceType": "REFERENCE_TYPE_RAW",
+                            "referenceId": 1,
+                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(base_image)},
+                        },
+                        {
+                            "referenceType": "REFERENCE_TYPE_MASK",
+                            "referenceId": 2,
+                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(mask_image)},
+                            "maskImageConfig": {
+                                "maskMode": "MASK_MODE_USER_PROVIDED",
+                                "dilation": float(os.getenv("VERTEX_IMAGEN_MASK_DILATION", "0.03")),
+                            },
+                        },
+                    ],
+                }
+            ],
+            "parameters": {
+                "sampleCount": 1,
+                "editMode": "EDIT_MODE_OUTPAINT",
+                "editConfig": {
+                    "baseSteps": int(os.getenv("VERTEX_IMAGEN_EDIT_STEPS", "35")),
+                    "outpaintingConfig": {
+                        "blendingMode": os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_MODE", "alpha-blending"),
+                        "blendingFactor": float(os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_FACTOR", "0.01")),
+                    },
+                },
+                "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
+                "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
+            },
+        },
+        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "90")),
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Vertex Imagen outpaint failed with HTTP {response.status_code}: {response.text[:1200]}") from exc
+    payload = response.json()
+    predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
+    if not predictions:
+        raise ValueError("Vertex Imagen outpaint returned no predictions.")
+    rendered = decode_vertex_imagen_prediction(predictions[0])
+    if rendered.size != (width, height):
+        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
+    return rendered, {
+        "provider": "vertex",
+        "model": model,
+        "location": location,
+        "strategy": "vertex_outpaint",
+        **seed_meta,
+    }
+
+
 def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
     openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
-    if openai_outpaint_enabled and (should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT):
+    vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
+    should_try_outpaint = should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT
+    if should_try_outpaint and openai_outpaint_enabled:
         try:
             rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
             strategy = "openai_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "openai_outpaint"
             return rendered, {**meta, "strategy": strategy}
         except Exception as exc:
-            fallback = render_nonblur_contain_placeholder(source, width, height)
             blocked_by_safety = "moderation" in str(exc).lower() or "safety" in str(exc).lower()
+            if vertex_outpaint_enabled and vertex_available():
+                try:
+                    rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+                    return rendered, {
+                        **meta,
+                        "strategy": "vertex_outpaint_after_openai_failed",
+                        "openaiFallbackReason": str(exc),
+                    }
+                except Exception as vertex_exc:
+                    fallback = render_nonblur_contain_placeholder(source, width, height)
+                    return fallback, {
+                        "provider": "local",
+                        "strategy": "nonblur_contain_placeholder_vertex_outpaint_failed",
+                        "productionReady": False,
+                        "fallbackReason": str(vertex_exc),
+                        "openaiFallbackReason": str(exc),
+                    }
+            fallback = render_nonblur_contain_placeholder(source, width, height)
             return fallback, {
                 "provider": "local",
                 "strategy": "nonblur_edge_extend_moderation_fallback" if blocked_by_safety else "nonblur_contain_placeholder_openai_outpaint_failed",
                 "productionReady": True if blocked_by_safety else False,
+                "fallbackReason": str(exc),
+            }
+    if should_try_outpaint and vertex_outpaint_enabled and vertex_available():
+        try:
+            rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+            strategy = "vertex_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "vertex_outpaint"
+            return rendered, {**meta, "strategy": strategy}
+        except Exception as exc:
+            fallback = render_nonblur_contain_placeholder(source, width, height)
+            return fallback, {
+                "provider": "local",
+                "strategy": "nonblur_contain_placeholder_vertex_outpaint_failed",
+                "productionReady": False,
                 "fallbackReason": str(exc),
             }
     if plan.logic_bucket == LogicBucket.LARGE_RECTANGLE and height / max(1, width) >= 1.5:
@@ -11687,7 +11836,6 @@ def regenerate_resize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: Edi
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    cleanup_old_temp_files()
     return {
         "status": "ok",
         "storage": "stateless-temp-24h",
@@ -11727,7 +11875,7 @@ async def adapt(
     if not files:
         raise HTTPException(status_code=400, detail="Upload at least one creative.")
 
-    cleanup_old_temp_files()
+    background_tasks.add_task(cleanup_old_temp_files)
     job_id = uuid4().hex[:12]
     job_dir = temp_root() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
