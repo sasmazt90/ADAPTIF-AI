@@ -319,7 +319,8 @@ def env_flag(name: str, default: str = "0") -> bool:
 
 
 def localize_generative_cleanup_enabled() -> bool:
-    return env_flag("ADAPTIFAI_ENABLE_LOCALIZE_GENERATIVE_CLEANUP", "0")
+    default = "1" if os.getenv("OPENAI_API_KEY") or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON") else "0"
+    return env_flag("ADAPTIFAI_ENABLE_LOCALIZE_GENERATIVE_CLEANUP", default)
 
 
 def localize_cleanup_gate_enabled() -> bool:
@@ -2079,8 +2080,9 @@ def apply_translations(blocks: list[TextBlock], translated_strings: list[str], t
                 translated = split_text_across_lines(translated, len(block.line_boxes))
             if block.line_boxes:
                 translated = translated.replace("[BOLD]", "").replace("[/BOLD]", "")
+            translated = preserve_source_metric_tokens(block.text, translated)
             translation_candidates = polish_translated_copy(block, translated, target_language)
-            translated = translation_candidates[0]["text"]
+            translated = preserve_source_metric_tokens(block.text, translation_candidates[0]["text"])
             source_style_spans = infer_source_style_spans(block.text, block)
             translated_style_spans = infer_translated_style_spans(block.text, translated, source_style_spans, block)
             output.append(
@@ -2098,6 +2100,23 @@ def apply_translations(blocks: list[TextBlock], translated_strings: list[str], t
         else:
             output.append(block)
     return output, "\n\n".join(editor_parts)
+
+
+def preserve_source_metric_tokens(source_text: str, translated_text: str) -> str:
+    source_tokens = re.findall(r"\b\d+(?:[.,]\d+)?\s*%|\b\d+\s*[hH]\b|\b\d+(?:[.,]\d+)?G(?:\+\d+(?:[.,]\d+)?G)?\b", source_text)
+    output = translated_text
+    for token in source_tokens:
+        compact = re.sub(r"\s+", "", token)
+        if "%" in compact:
+            number = compact.replace("%", "")
+            output = re.sub(rf"%\s*{re.escape(number)}\b", compact, output)
+            output = re.sub(rf"\b{re.escape(number)}\s*%", compact, output)
+        elif re.search(r"[hH]$", compact):
+            number = re.sub(r"[hH]$", "", compact)
+            output = re.sub(rf"\b{re.escape(number)}\s*[hH]\b", compact, output)
+        elif "G" in compact.upper():
+            output = re.sub(re.escape(compact).replace("G", "[gG]"), compact, output)
+    return output
 
 
 def default_typography_style(block: TextBlock) -> dict[str, Any]:
@@ -2251,7 +2270,7 @@ def infer_translated_style_spans(source_text: str, translated_text: str, source_
 
 
 LANGUAGE_FILLER_WORDS: dict[str, set[str]] = {
-    "TR": {"ile", "ve", "bir", "için", "olarak", "daha", "çok", "olan"},
+    "TR": {"ile", "ve", "bir", "için", "olarak", "daha", "çok", "olan", "oranında"},
     "DE": {"und", "mit", "für", "die", "der", "das"},
     "FR": {"et", "avec", "pour", "les", "des", "une", "un"},
     "ES": {"y", "con", "para", "los", "las", "una", "un"},
@@ -2326,8 +2345,8 @@ def polish_translated_copy(block: TextBlock, translated_text: str, target_langua
     source_lines = max(1, len(block.line_texts) or cleaned.count("\n") + 1)
     faithful = maybe_preserve_uppercase(block.text, cleaned)
     if role == "headline":
-        shorter = maybe_preserve_uppercase(block.text, split_text_across_lines(faithful.replace("\n", " "), source_lines))
-        compact = maybe_preserve_uppercase(block.text, split_text_across_lines(faithful.replace("\n", " "), max(2, min(source_lines, 4))))
+        shorter = maybe_preserve_uppercase(block.text, split_text_across_lines(shorten_marketing_copy(faithful, target_language, role, aggressiveness=1).replace("\n", " "), source_lines))
+        compact = maybe_preserve_uppercase(block.text, split_text_across_lines(shorten_marketing_copy(faithful, target_language, role, aggressiveness=2).replace("\n", " "), max(2, min(source_lines, 4))))
     else:
         shorter = maybe_preserve_uppercase(block.text, shorten_marketing_copy(faithful, target_language, role, aggressiveness=1))
         compact = maybe_preserve_uppercase(
@@ -2420,6 +2439,13 @@ def hex_to_rgb(color: str) -> tuple[int, int, int]:
         return tuple(int(normalized[index : index + 2], 16) for index in (0, 2, 4))
     except ValueError:
         return (17, 17, 17)
+
+
+def rgb_to_hex(rgb: Sequence[float | int]) -> str:
+    values = [max(0, min(255, int(round(float(value))))) for value in list(rgb)[:3]]
+    while len(values) < 3:
+        values.append(17)
+    return f"#{values[0]:02x}{values[1]:02x}{values[2]:02x}"
 
 
 def build_text_shaped_region_mask(
@@ -2862,6 +2888,217 @@ def iter_block_cleanup_regions(image: Image.Image, block: TextBlock, padding: in
             }
         )
     return regions
+
+
+def is_overlay_marketing_cleanup_block(block: TextBlock) -> bool:
+    return bool(
+        block.translate
+        and text_changed(block.text, block.translated_text)
+        and block.surface == "overlay"
+    )
+
+
+def is_wide_overlay_text_block(block: TextBlock, image_size: tuple[int, int]) -> bool:
+    width = max(1, block.bbox[2] - block.bbox[0])
+    height = max(1, block.bbox[3] - block.bbox[1])
+    area_ratio = (width * height) / max(1, image_size[0] * image_size[1])
+    return (
+        is_overlay_marketing_cleanup_block(block)
+        and width >= image_size[0] * 0.36
+        and height <= image_size[1] * 0.32
+        and area_ratio >= 0.025
+    )
+
+
+def build_constrained_overlay_text_mask(
+    image: Image.Image,
+    region_box: tuple[int, int, int, int],
+    source_boxes: list[tuple[int, int, int, int]],
+    text_color: str,
+    font_size_estimate: int,
+    line_height_estimate: int,
+) -> Image.Image:
+    import cv2
+
+    left, top, right, bottom = region_box
+    crop = np.array(image.crop(region_box).convert("RGB"), dtype=np.uint8)
+    region_h, region_w = crop.shape[:2]
+    if region_h == 0 or region_w == 0:
+        return Image.new("L", (max(1, right - left), max(1, bottom - top)), 0)
+
+    constraint = np.zeros((region_h, region_w), dtype=np.uint8)
+    line_pad_x = max(2, int(round(max(8, font_size_estimate) * 0.22)))
+    line_pad_y = max(2, int(round(max(8, line_height_estimate) * 0.24)))
+    for box_left, box_top, box_right, box_bottom in source_boxes:
+        rel_left = max(0, box_left - left - line_pad_x)
+        rel_top = max(0, box_top - top - line_pad_y)
+        rel_right = min(region_w, box_right - left + line_pad_x)
+        rel_bottom = min(region_h, box_bottom - top + line_pad_y)
+        if rel_right > rel_left and rel_bottom > rel_top:
+            cv2.rectangle(constraint, (rel_left, rel_top), (rel_right - 1, rel_bottom - 1), 255, thickness=-1)
+
+    if int(np.count_nonzero(constraint)) == 0:
+        return Image.fromarray(constraint, "L")
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+    gray_float = gray.astype(np.float32)
+    blur = cv2.GaussianBlur(gray_float, (0, 0), 2.4)
+    local_delta = np.abs(gray_float - blur)
+    constrained_delta = local_delta[constraint > 0]
+    constrained_gray = gray[constraint > 0]
+    if constrained_delta.size == 0 or constrained_gray.size == 0:
+        return Image.fromarray(constraint, "L")
+
+    delta_threshold = max(7.0, float(np.percentile(constrained_delta, 78)))
+    bright_threshold = max(184.0, float(np.percentile(constrained_gray, 82)))
+    dark_threshold = min(78.0, float(np.percentile(constrained_gray, 18)))
+    chroma = crop.astype(np.float32).max(axis=2) - crop.astype(np.float32).min(axis=2)
+    constrained_chroma = chroma[constraint > 0]
+    chroma_threshold = max(42.0, float(np.percentile(constrained_chroma, 88))) if constrained_chroma.size else 64.0
+
+    edges = cv2.Canny(gray, 36, 118)
+    edge_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    edges = cv2.dilate(edges, edge_kernel, iterations=1)
+
+    contrast_candidate = local_delta >= delta_threshold
+    tonal_candidate = (gray_float >= bright_threshold) | (gray_float <= dark_threshold) | (chroma >= chroma_threshold)
+    candidate = ((contrast_candidate | (edges > 0)) & tonal_candidate) & (constraint > 0)
+
+    candidate_u8 = candidate.astype(np.uint8) * 255
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats((candidate_u8 > 0).astype(np.uint8), connectivity=8)
+    cleaned = np.zeros_like(candidate_u8)
+    constraint_area = max(1, int(np.count_nonzero(constraint)))
+    min_area = max(2, int(round((max(8, font_size_estimate) ** 2) * 0.012)))
+    max_area = max(12, int(round(constraint_area * 0.18)))
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if min_area <= area <= max_area:
+            cleaned[labels == label] = 255
+
+    if int(np.count_nonzero(cleaned)) < max(8, int(round(constraint_area * 0.006))):
+        cleaned = candidate_u8
+
+    kernel_size = max(3, min(7, int(round(max(8, line_height_estimate) / 11)) | 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    cleaned = cv2.dilate(cleaned, kernel, iterations=1)
+    cleaned = cv2.bitwise_and(cleaned, constraint)
+    return Image.fromarray(cleaned, "L")
+
+
+def refine_overlay_text_colors(image: Image.Image, blocks: list[TextBlock]) -> None:
+    for block in blocks:
+        if block.surface != "overlay" or not block.translate:
+            continue
+        boxes = [tuple(box) for box in (block.line_boxes or [])] or [block.clean_box or block.bbox]
+        union = union_bbox(boxes) or (block.clean_box or block.bbox)
+        expanded = expand_bbox(union, image.size, max(4, int(round(max(8, block.line_height_estimate) * 0.18))))
+        try:
+            crop = np.array(image.crop(expanded).convert("RGB"), dtype=np.uint8)
+            gray = crop @ np.array([0.299, 0.587, 0.114])
+            local_mask = build_constrained_overlay_text_mask(
+                image,
+                expanded,
+                boxes,
+                block.color,
+                block.font_size_estimate,
+                block.line_height_estimate,
+            )
+            mask = np.array(local_mask.convert("L")) > 16
+            if not mask.any():
+                continue
+            text_gray = gray[mask]
+            text_rgb = crop[mask]
+            bg_gray = gray[~mask] if (~mask).any() else gray.reshape(-1)
+            bg_median = float(np.median(bg_gray)) if bg_gray.size else float(np.median(gray))
+            bright_gap = float(np.percentile(text_gray, 92) - bg_median)
+            dark_gap = float(bg_median - np.percentile(text_gray, 8))
+            if bright_gap > max(18.0, dark_gap * 0.85):
+                selected = text_rgb[text_gray >= np.percentile(text_gray, 82)]
+            elif dark_gap > 18.0:
+                selected = text_rgb[text_gray <= np.percentile(text_gray, 18)]
+            else:
+                continue
+            if selected.size:
+                block.color = rgb_to_hex(np.median(selected.reshape(-1, 3), axis=0))
+        except Exception:
+            continue
+
+
+def build_overlay_block_cleanup_region(image: Image.Image, block: TextBlock) -> dict[str, Any]:
+    width, height = image.size
+    source_boxes = [tuple(box) for box in (block.line_boxes or [])] or [block.clean_box or block.bbox]
+    union = union_bbox(source_boxes) or (block.clean_box or block.bbox)
+    left, top, right, bottom = union
+    block_w = max(1, right - left)
+    block_h = max(1, bottom - top)
+    wide = is_wide_overlay_text_block(block, image.size)
+    pad_x = max(6, min(int(width * (0.055 if wide else 0.028)), int(block_w * (0.22 if wide else 0.16))))
+    pad_y = max(5, min(int(height * (0.055 if wide else 0.032)), int(block_h * (0.55 if wide else 0.35))))
+    expanded = (
+        max(0, left - pad_x),
+        max(0, top - pad_y),
+        min(width, right + pad_x),
+        min(height, bottom + pad_y),
+    )
+    mask = Image.new("L", (max(1, expanded[2] - expanded[0]), max(1, expanded[3] - expanded[1])), 0)
+    shaped = build_text_shaped_region_mask(
+        image,
+        expanded,
+        block.color,
+        block.font_size_estimate,
+        block.line_height_estimate,
+    )
+    try:
+        crop_arr = np.array(image.crop(expanded).convert("RGB"), dtype=np.float32)
+        luma = crop_arr @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+        chroma = crop_arr.max(axis=2) - crop_arr.min(axis=2)
+        solid_context = float(np.std(luma)) < 22.0 and float(np.std(chroma)) < 18.0
+    except Exception:
+        solid_context = False
+    constrained = build_constrained_overlay_text_mask(
+        image,
+        expanded,
+        source_boxes,
+        block.color,
+        block.font_size_estimate,
+        block.line_height_estimate,
+    )
+    shaped_ratio = float((np.array(shaped) > 16).mean()) if shaped.width and shaped.height else 0.0
+    constrained_ratio = float((np.array(constrained) > 16).mean()) if constrained.width and constrained.height else 0.0
+    if not solid_context and shaped_ratio > max(0.32, constrained_ratio * 3.5):
+        shaped = Image.new("L", shaped.size, 0)
+    if solid_context:
+        draw = ImageDraw.Draw(mask)
+        for box in source_boxes:
+            box_left, box_top, box_right, box_bottom = box
+            rel = (
+                max(0, box_left - expanded[0] - pad_x // 2),
+                max(0, box_top - expanded[1] - pad_y // 2),
+                min(mask.width, box_right - expanded[0] + pad_x // 2),
+                min(mask.height, box_bottom - expanded[1] + pad_y // 2),
+            )
+            draw.rectangle(rel, fill=255)
+        mask = ImageChops.lighter(mask, shaped)
+    else:
+        mask = constrained
+    mask = mask.filter(ImageFilter.MaxFilter(size=5 if not solid_context else (5 if wide else 3)))
+    mask = mask.filter(ImageFilter.GaussianBlur(radius=max(1, min(3, block_h // 18))))
+    return {
+        "block_id": block.id,
+        "line_index": -1,
+        "line_text": " ".join(block.line_texts or [block.text]),
+        "token_box": union,
+        "expanded_box": expanded,
+        "mask": mask,
+        "block_width": block_w,
+        "block_height": block_h,
+        "overlay_marketing_cleanup": True,
+        "wideOverlayCleanup": wide,
+        "solidContextCleanup": solid_context,
+        "shapedMaskRatio": shaped_ratio,
+        "constrainedMaskRatio": constrained_ratio,
+    }
 
 
 def build_text_mask(image: Image.Image, blocks: list[TextBlock], padding: int = 26) -> Image.Image:
@@ -3637,6 +3874,8 @@ def evaluate_block_cleanup_visibility(source_image: Image.Image, cleaned_image: 
 
 
 def build_combined_block_cleanup_region(image: Image.Image, block: TextBlock, padding: int = 26) -> dict[str, Any] | None:
+    if is_overlay_marketing_cleanup_block(block):
+        return build_overlay_block_cleanup_region(image, block)
     regions = iter_block_cleanup_regions(image, block, padding)
     if not regions:
         return None
@@ -3678,9 +3917,9 @@ def is_large_marketing_headline_block(block: TextBlock, image_size: tuple[int, i
         block.translate
         and text_changed(block.text, block.translated_text)
         and block.surface == "overlay"
-        and multi_line
+        and (multi_line or is_wide_overlay_text_block(block, image_size))
         and width >= image_size[0] * 0.38
-        and area_ratio >= 0.07
+        and area_ratio >= 0.025
     )
 
 
@@ -4583,6 +4822,28 @@ def cleanup_line_with_mask_guided_reconstruction(image: Image.Image, region: dic
     return Image.composite(Image.fromarray(blended, "RGB"), crop, feather)
 
 
+def cleanup_region_with_opencv_inpaint(image: Image.Image, region: dict[str, Any]) -> Image.Image:
+    import cv2
+
+    expanded = region["expanded_box"]
+    local_mask = region["mask"].convert("L")
+    crop = image.crop(expanded).convert("RGB")
+    crop_np = np.array(crop, dtype=np.uint8)
+    mask_np = (np.array(local_mask) > 12).astype(np.uint8) * 255
+    if crop_np.size == 0 or int(np.count_nonzero(mask_np)) == 0:
+        return crop
+    block_h = int(region.get("block_height") or crop.height)
+    radius = max(3, min(11, int(round(block_h * 0.18))))
+    kernel_size = max(3, min(9, radius | 1))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    mask_np = cv2.dilate(mask_np, kernel, iterations=1)
+    telea = cv2.inpaint(crop_np, mask_np, radius, cv2.INPAINT_TELEA)
+    ns = cv2.inpaint(crop_np, mask_np, max(3, radius - 1), cv2.INPAINT_NS)
+    blended = cv2.addWeighted(telea, 0.72, ns, 0.28, 0)
+    feather = Image.fromarray(mask_np, "L").filter(ImageFilter.GaussianBlur(radius=2))
+    return Image.composite(Image.fromarray(blended, "RGB"), crop, feather)
+
+
 def prepare_generative_edit_context(
     image: Image.Image,
     local_mask: Image.Image,
@@ -4846,6 +5107,206 @@ def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image
             }
 
 
+def run_vertex_full_image_cleanup(image: Image.Image, editable_mask: Image.Image, prompt: str) -> dict[str, Any]:
+    if not vertex_available():
+        return {"success": False, "provider": "vertex", "failureReason": "vertex_not_configured"}
+    try:
+        project_id = vertex_project_id()
+        location = vertex_location()
+        model = vertex_imagen_edit_model()
+        endpoint = (
+            f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
+            f"locations/{location}/publishers/google/models/{model}:predict"
+        )
+        binary_mask = Image.fromarray((np.array(editable_mask.convert("L")) > 16).astype(np.uint8) * 255, "L")
+        mask_rgb = Image.merge("RGB", (binary_mask, binary_mask, binary_mask))
+        response = vertex_authorized_session().post(
+            endpoint,
+            json={
+                "instances": [
+                    {
+                        "prompt": prompt,
+                        "referenceImages": [
+                            {
+                                "referenceType": "REFERENCE_TYPE_RAW",
+                                "referenceId": 1,
+                                "referenceImage": {"bytesBase64Encoded": image_to_base64_png(image.convert("RGB"))},
+                            },
+                            {
+                                "referenceType": "REFERENCE_TYPE_MASK",
+                                "referenceId": 2,
+                                "referenceImage": {"bytesBase64Encoded": image_to_base64_png(mask_rgb)},
+                                "maskImageConfig": {
+                                    "maskMode": "MASK_MODE_USER_PROVIDED",
+                                    "dilation": float(os.getenv("VERTEX_IMAGEN_MASK_DILATION", "0.02")),
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "parameters": {
+                    "sampleCount": 1,
+                    "editMode": os.getenv("VERTEX_IMAGEN_INPAINT_EDIT_MODE", "EDIT_MODE_INPAINT_REMOVAL"),
+                    "editConfig": {"baseSteps": int(os.getenv("VERTEX_IMAGEN_EDIT_STEPS", "35"))},
+                    "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
+                    "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
+                },
+            },
+            timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "45")),
+        )
+        response.raise_for_status()
+        payload = response.json()
+        predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
+        if not predictions:
+            return {"success": False, "provider": "vertex", "failureReason": "vertex_no_image_returned"}
+        result = decode_vertex_imagen_prediction(predictions[0]).convert("RGB")
+        if result.size != image.size:
+            result = result.resize(image.size, Image.Resampling.LANCZOS)
+        feather = editable_mask.convert("L").filter(ImageFilter.GaussianBlur(radius=2))
+        composited = Image.composite(result, image.convert("RGB"), feather)
+        return {
+            "success": True,
+            "provider": "vertex",
+            "image": composited,
+            "model": model,
+            "location": location,
+            "requestImagePreview": image.convert("RGB"),
+            "requestMaskAlphaPreview": binary_mask,
+            "apiSuccessResultPreview": result.copy(),
+            "postCompositePreview": composited.copy(),
+        }
+    except requests.HTTPError as exc:
+        return {
+            "success": False,
+            "provider": "vertex",
+            "failureReason": "vertex_api_error",
+            "apiError": {"statusCode": getattr(exc.response, "status_code", None), "body": getattr(exc.response, "text", "")[:1200] if getattr(exc, "response", None) is not None else str(exc)},
+        }
+    except Exception as exc:
+        return {"success": False, "provider": "vertex", "failureReason": f"vertex_error:{exc.__class__.__name__}", "apiError": {"message": str(exc)[:1200]}}
+
+
+def build_overlay_provider_composite_mask(image_size: tuple[int, int], block: TextBlock) -> Image.Image:
+    mask = Image.new("L", image_size, 0)
+    draw = ImageDraw.Draw(mask)
+    boxes = [tuple(box) for box in (block.line_boxes or [])] or [block.clean_box or block.bbox]
+    for left, top, right, bottom in boxes:
+        box_w = max(1, right - left)
+        box_h = max(1, bottom - top)
+        pad_x = max(3, int(round(box_w * 0.025)))
+        pad_y = max(3, int(round(box_h * 0.08)))
+        draw.rounded_rectangle(
+            (
+                max(0, left - pad_x),
+                max(0, top - pad_y),
+                min(image_size[0], right + pad_x),
+                min(image_size[1], bottom + pad_y),
+            ),
+            radius=max(3, min(10, box_h // 12)),
+            fill=255,
+        )
+    return mask.filter(ImageFilter.GaussianBlur(radius=4)).convert("L")
+
+
+def composite_overlay_provider_result(source: Image.Image, provider_result: Image.Image, block: TextBlock, request_mask: Image.Image | None = None) -> Image.Image:
+    soft_mask = (
+        request_mask.convert("L").filter(ImageFilter.MaxFilter(size=17)).filter(ImageFilter.GaussianBlur(radius=4))
+        if request_mask is not None
+        else build_overlay_provider_composite_mask(source.size, block)
+    )
+    try:
+        import cv2
+
+        hard_mask = (np.array(soft_mask.convert("L")) > 16).astype(np.uint8) * 255
+        if int(np.count_nonzero(hard_mask)) == 0:
+            return Image.composite(provider_result.convert("RGB"), source.convert("RGB"), soft_mask)
+        boxes = [tuple(box) for box in (block.line_boxes or [])] or [block.clean_box or block.bbox]
+        union = union_bbox(boxes) or (block.clean_box or block.bbox)
+        center = (int((union[0] + union[2]) / 2), int((union[1] + union[3]) / 2))
+        src_np = cv2.cvtColor(np.array(provider_result.convert("RGB")), cv2.COLOR_RGB2BGR)
+        dst_np = cv2.cvtColor(np.array(source.convert("RGB")), cv2.COLOR_RGB2BGR)
+        cloned = cv2.seamlessClone(src_np, dst_np, hard_mask, center, cv2.NORMAL_CLONE)
+        return Image.fromarray(cv2.cvtColor(cloned, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return Image.composite(provider_result.convert("RGB"), source.convert("RGB"), soft_mask)
+
+
+def provider_raw_result_safe_for_overlay(source: Image.Image, raw: Image.Image, block: TextBlock) -> bool:
+    try:
+        mask = build_overlay_provider_composite_mask(source.size, block)
+        mask_np = np.array(mask.convert("L")) > 16
+        if not mask_np.any():
+            return False
+        source_np = np.array(source.convert("RGB"), dtype=np.uint8)
+        raw_np = np.array(raw.resize(source.size, Image.Resampling.LANCZOS).convert("RGB"), dtype=np.uint8)
+        source_luma = source_np @ np.array([0.299, 0.587, 0.114])
+        raw_luma = raw_np @ np.array([0.299, 0.587, 0.114])
+        new_bright = np.logical_and(raw_luma > 218, source_luma < 198)
+        new_bright_ratio = float(new_bright[mask_np].mean())
+        diff = np.abs(raw_np.astype(np.float32) - source_np.astype(np.float32)).mean(axis=2)
+        large_change_ratio = float((diff[mask_np] > 72).mean())
+        return new_bright_ratio < 0.008 and large_change_ratio < 0.45
+    except Exception:
+        return False
+
+
+def cleanup_overlay_marketing_with_full_image_provider(
+    image: Image.Image,
+    block: TextBlock,
+    region: dict[str, Any],
+    prompt: str,
+) -> dict[str, Any]:
+    request_mask = Image.new("L", image.size, 0)
+    request_mask.paste(region["mask"].convert("L"), region["expanded_box"])
+    request_mask = request_mask.filter(ImageFilter.MaxFilter(size=3))
+    composite_mask = build_overlay_provider_composite_mask(image.size, block)
+    attempts: list[dict[str, Any]] = []
+
+    if os.getenv("OPENAI_API_KEY"):
+        openai_result = run_openai_full_image_cleanup(image, request_mask, prompt)
+        attempts.append(openai_result)
+        raw_candidate = openai_result.get("apiSuccessResultPreview")
+        raw_safe = isinstance(raw_candidate, Image.Image) and provider_raw_result_safe_for_overlay(image, raw_candidate, block)
+        raw = raw_candidate if raw_safe else None
+        if openai_result.get("success") and isinstance(raw, Image.Image):
+            composited = composite_overlay_provider_result(image, raw.convert("RGB"), block, request_mask)
+            return {
+                "success": True,
+                "provider": "openai",
+                "image": composited,
+                "requestMaskPreview": request_mask,
+                "compositeMaskPreview": composite_mask,
+                "attempts": attempts,
+                **{key: value for key, value in openai_result.items() if key not in {"image"}},
+            }
+
+    if vertex_available():
+        vertex_result = run_vertex_full_image_cleanup(image, request_mask, prompt)
+        attempts.append(vertex_result)
+        raw_candidate = vertex_result.get("apiSuccessResultPreview")
+        raw = raw_candidate if isinstance(raw_candidate, Image.Image) and provider_raw_result_safe_for_overlay(image, raw_candidate, block) else None
+        if vertex_result.get("success") and isinstance(raw, Image.Image):
+            composited = composite_overlay_provider_result(image, raw.convert("RGB"), block, request_mask)
+            return {
+                "success": True,
+                "provider": "vertex",
+                "image": composited,
+                "requestMaskPreview": request_mask,
+                "compositeMaskPreview": composite_mask,
+                "attempts": attempts,
+                **{key: value for key, value in vertex_result.items() if key not in {"image"}},
+            }
+
+    return {
+        "success": False,
+        "provider": "none",
+        "failureReason": "no_full_image_provider_succeeded",
+        "requestMaskPreview": request_mask,
+        "compositeMaskPreview": composite_mask,
+        "attempts": attempts,
+    }
+
+
 def run_huggingface_full_image_cleanup(
     image: Image.Image,
     editable_mask: Image.Image,
@@ -4981,7 +5442,7 @@ def cleanup_block_with_generative_fill_candidates(
 ) -> list[dict[str, Any]]:
     if not localize_generative_cleanup_enabled():
         return []
-    provider = os.getenv("ADAPTIFAI_GENERATIVE_CLEANUP_PROVIDER", "openai").lower()
+    provider = os.getenv("ADAPTIFAI_GENERATIVE_CLEANUP_PROVIDER", "auto").lower()
     prepared = prepare_generative_edit_context(image, mask, context, protected_region_mask, block)
     attempts: list[dict[str, Any]] = []
     if prepared is None:
@@ -5003,14 +5464,14 @@ def cleanup_block_with_generative_fill_candidates(
     crop = prepared["original_crop"]
     editable_mask_crop = prepared["editable_mask"]
     protected_crop_mask = prepared["protected_crop_mask"]
+    prompt = prompt_override or (
+        "Remove only the text pixels inside the transparent mask. Reconstruct only the masked text area using the surrounding background. "
+        "Do not modify any unmasked pixels. Preserve all people, products, shoes, logos, packaging, lighting, shadows, textures and background outside the mask exactly. "
+        "Do not add text. Do not add blur, panels, gradients, rectangles or new objects. "
+        "Return the clean image only."
+    )
     if provider in {"openai", "auto"} and os.getenv("OPENAI_API_KEY"):
         deduped_models = [os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"]
-        prompt = prompt_override or (
-            "Remove only the text pixels inside the transparent mask. Reconstruct only the masked text area using the surrounding background. "
-            "Do not modify any unmasked pixels. Preserve all people, products, shoes, logos, packaging, lighting, shadows, textures and background outside the mask exactly. "
-            "Do not add text. Do not add blur, panels, gradients, rectangles or new objects. "
-            "Return the clean image only."
-        )
         try:
             with tempfile.TemporaryDirectory(prefix="adaptifai-openai-clean-") as temp_dir_name:
                 temp_dir = Path(temp_dir_name)
@@ -5102,6 +5563,35 @@ def cleanup_block_with_generative_fill_candidates(
             )
             if provider == "openai":
                 return attempts
+    if provider in {"vertex", "auto", "openai"} and vertex_available() and not any(attempt.get("success") for attempt in attempts):
+        try:
+            vertex_result = run_vertex_full_image_cleanup(crop, editable_mask_crop, prompt)
+            attempt: dict[str, Any] = {
+                "model": vertex_imagen_edit_model(),
+                "attempted": True,
+                "success": bool(vertex_result.get("success")),
+                "rejected": not bool(vertex_result.get("success")),
+                "rejectionReasons": [] if vertex_result.get("success") else [str(vertex_result.get("failureReason", "vertex_failed"))],
+                "provider": "vertex",
+                "image": vertex_result.get("image"),
+                "requestImagePreview": vertex_result.get("requestImagePreview", crop.copy()),
+                "requestMaskAlphaPreview": vertex_result.get("requestMaskAlphaPreview", editable_mask_crop.copy()),
+                "apiSuccessResultPreview": vertex_result.get("apiSuccessResultPreview"),
+                "postCompositePreview": vertex_result.get("postCompositePreview"),
+                "apiError": vertex_result.get("apiError"),
+            }
+            attempts.append(attempt)
+        except Exception as exc:
+            attempts.append(
+                {
+                    "model": vertex_imagen_edit_model(),
+                    "attempted": True,
+                    "success": False,
+                    "rejected": True,
+                    "rejectionReasons": [f"vertex fallback failed: {exc.__class__.__name__}"],
+                    "provider": "vertex",
+                }
+            )
     return attempts
 
 
@@ -5214,15 +5704,58 @@ def build_clean_background(
         for block in blocks:
             if not block.translate or not text_changed(block.text, block.translated_text):
                 continue
-            for region in iter_block_cleanup_regions(working, block, int(os.getenv("ADAPTIFAI_INPAINT_PADDING", "26"))):
+            cleanup_regions = (
+                [combined_region]
+                if is_overlay_marketing_cleanup_block(block)
+                and (combined_region := build_combined_block_cleanup_region(working, block, int(os.getenv("ADAPTIFAI_INPAINT_PADDING", "26")))) is not None
+                else iter_block_cleanup_regions(working, block, int(os.getenv("ADAPTIFAI_INPAINT_PADDING", "26")))
+            )
+            for region in cleanup_regions:
                 expanded = region["expanded_box"]
                 local_mask = region["mask"].convert("L")
                 if local_mask.getbbox() is None:
                     continue
                 original_crop = working.crop(expanded).convert("RGB")
-                cleaned_crop = cleanup_line_with_mask_guided_reconstruction(working, region).convert("RGB")
-                feather = local_mask.filter(ImageFilter.GaussianBlur(radius=3)).convert("L")
-                working.paste(Image.composite(cleaned_crop, original_crop, feather), expanded)
+                used_generative = False
+                if is_overlay_marketing_cleanup_block(block) and not bool(region.get("solidContextCleanup")):
+                    prompt = (
+                        "Remove only the original source marketing text inside the mask and reconstruct the masked area from the surrounding image. "
+                        "Preserve the person's skin, product, packaging, logo, lighting, texture, grain, shadows and every unmasked pixel. "
+                        "Do not add new text, do not translate here, do not blur, do not create panels, rectangles, cream, lotion, strokes, marks, labels or objects. "
+                        "The cleaned area must look like the text was never printed on the image."
+                    )
+                    provider_result = cleanup_overlay_marketing_with_full_image_provider(working, block, region, prompt)
+                    debug_info["generativeAttemptPreviews"].append(
+                        {
+                            "id": block.id,
+                            "lineIndex": region["line_index"],
+                            "name": f"fast-full-image:{provider_result.get('provider', 'unknown')}",
+                            "requestImagePreview": working.copy(),
+                            "requestMaskPreview": provider_result.get("requestMaskPreview"),
+                            "requestMaskAlphaPreview": provider_result.get("requestMaskAlphaPreview"),
+                            "apiSuccessResultPreview": provider_result.get("apiSuccessResultPreview"),
+                            "postCompositePreview": provider_result.get("postCompositePreview"),
+                            "apiError": provider_result.get("apiError"),
+                            "compositeMaskPreview": provider_result.get("compositeMaskPreview"),
+                        }
+                    )
+                    if provider_result.get("success") and isinstance(provider_result.get("image"), Image.Image):
+                        provider_image = provider_result["image"].convert("RGB")
+                        cleaned_crop = provider_image.crop(expanded).convert("RGB")
+                        used_generative = True
+                    else:
+                        cleaned_crop = cleanup_region_with_opencv_inpaint(working, region).convert("RGB")
+                else:
+                    cleaned_crop = (
+                        cleanup_region_with_opencv_inpaint(working, region)
+                        if is_overlay_marketing_cleanup_block(block)
+                        else cleanup_line_with_mask_guided_reconstruction(working, region)
+                    ).convert("RGB")
+                if is_overlay_marketing_cleanup_block(block):
+                    working.paste(cleaned_crop, expanded)
+                else:
+                    feather = local_mask.filter(ImageFilter.GaussianBlur(radius=3)).convert("L")
+                    working.paste(Image.composite(cleaned_crop, original_crop, feather), expanded)
                 mask_coverage = float((np.array(local_mask) > 16).mean())
                 debug_info["lineCleanupRegions"].append(
                     {
@@ -5258,9 +5791,9 @@ def build_clean_background(
                         "lineIndex": region["line_index"],
                         "lineText": region.get("line_text"),
                         "requestedStrategy": "fast-cpu",
-                        "selectedStrategy": "fast-reconstruction-touchup",
+                        "selectedStrategy": "fast-generative-inpaint" if used_generative else ("fast-opencv-inpaint" if is_overlay_marketing_cleanup_block(block) else "fast-reconstruction-touchup"),
                         "candidateScores": [],
-                        "selectedCandidate": "fast-reconstruction-touchup",
+                        "selectedCandidate": "fast-generative-inpaint" if used_generative else ("fast-opencv-inpaint" if is_overlay_marketing_cleanup_block(block) else "fast-reconstruction-touchup"),
                         "rejectedCandidates": [],
                         "hardRejectReasons": [],
                         "whySelectedOverOpenCV": "CPU fast cleanup avoids residual OCR scoring and generative cleanup in production.",
@@ -8193,6 +8726,7 @@ def build_openai_localize_prompt(
             {
                 "source_text": block.text,
                 "replacement_text": block.translated_text or block.text,
+                "exact_visible_text_required": block.translated_text or block.text,
                 "bbox": list(block.bbox),
                 "line_mapping": [
                     {
@@ -8231,17 +8765,50 @@ def build_openai_localize_prompt(
         "Hard contract:\n"
         "1. Replace ONLY the editable source marketing text items listed in Text replacements JSON.\n"
         "2. Use each replacement_text exactly. Do not paraphrase, summarize, reorder, add product names, add SKU names, or invent new copy.\n"
+        "2B. The final visible localized text for each item must match exact_visible_text_required character-for-character except for line breaks inserted only to fit. Do not add synonyms, filler words, explanatory words, extra suffixes, or target-language variants that are not present in exact_visible_text_required.\n"
+        "2A. Preserve the exact original canvas, crop, camera framing, zoom level, face/product scale, object positions, background and aspect ratio. Do not reframe, zoom in, zoom out, retouch the whole photo, beautify the subject, or regenerate the full creative.\n"
         "3. Source words may be stacked visually but form one sentence. Preserve the semantic sentence in replacement_text while keeping the source line count and visual rhythm as much as possible.\n"
         "4. If replacement_text has line breaks, keep those line breaks. If line_mapping is present, map each replacement_line to the corresponding source_line/editable_box.\n"
         "5. Transfer style by semantic word/phrase meaning, not by absolute position: if the emphasized source word moves from the end to the beginning in the target language, the target word at the beginning receives that style. Source blue text stays blue in the corresponding translated words; source white text on a yellow highlight stays white on the same yellow highlight; font weight, casing, size hierarchy, alignment, background color, and spacing must match the source region.\n"
         "6. Do not create any new text background rectangle, white box, highlight band, label panel, sticker, or callout unless the source text already had that same visual background in the exact editable region. If the source text is directly on the photo/background, render the replacement directly on the same photo/background.\n"
         "7. Product packaging text is immutable. Do not translate, redraw, blur, clean, repaint, or alter any text printed on bottles, boxes, labels, devices, stickers, logos, brand marks, QR codes, legal text, ingredient text, or UI chrome.\n"
-        "8. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged.\n"
+        "8. Preserve the product, packaging, person, objects, background, lighting, shadows, composition, and all unlisted pixels unchanged. Decorative/safe-zone corner brackets, arrows, frame lines, dividers and icons are not text; preserve them as design elements and do not turn them into quote marks or characters.\n"
         "9. The mask marks the only editable marketing text regions. Treat everything outside the mask as read-only.\n"
         "10. Do not add new logos, watermarks, badges, product names, extra copy, or new design containers.\n"
         "Return a finished localized image only.\n"
         f"Text replacements JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}\n"
         f"Protected non-editable text hints JSON:\n{json.dumps(protected_items, ensure_ascii=False, indent=2)}"
+    )
+
+
+def build_openai_localize_cleanup_prompt(
+    blocks: list[TextBlock],
+    target_language: str,
+    source_language: str,
+    image_size: tuple[int, int],
+    foreground_bbox: tuple[int, int, int, int] | None = None,
+) -> str:
+    source_items = [
+        {
+            "source_text": block.text,
+            "bbox": list(block.bbox),
+            "line_boxes": [list(box) for box in (block.line_boxes or [])],
+        }
+        for block in blocks
+        if is_localize_marketing_edit_block(block, image_size, foreground_bbox)
+    ]
+    return (
+        "Remove the listed source marketing text from this ad creative.\n"
+        f"Source language: {source_language}. Target language later: {LANGUAGE_NAMES.get(target_language.upper(), target_language)} ({target_language}).\n"
+        "Hard contract:\n"
+        "1. Remove only the visible source marketing text pixels inside the transparent/editable mask.\n"
+        "2. Do not add translated text. Do not add any new text at all.\n"
+        "3. Reconstruct the original background/photo/design behind the removed text naturally, matching texture, lighting, grain, shadows and color.\n"
+        "4. Preserve the exact original canvas, crop, camera framing, zoom level, face/product scale, object positions, background and aspect ratio.\n"
+        "5. Preserve safe-zone corner brackets, arrows, frame lines, icons, product packaging, logos, legal text and all unmasked pixels.\n"
+        "6. Do not add boxes, panels, cream/lotion strokes, labels, stickers, artifacts, watermarks or objects.\n"
+        "Return the same creative with only the source marketing text removed.\n"
+        f"Source marketing text to remove JSON:\n{json.dumps(source_items, ensure_ascii=False, indent=2)}"
     )
 
 
@@ -8263,8 +8830,9 @@ def render_localize_with_openai_image_edit(
 
     extension = normalize_output_format(output_format)
     foreground_bbox = detect_foreground_bbox(source_image)
-    prompt = build_openai_localize_prompt(translated_blocks, target_language, source_language, source_image.size, foreground_bbox)
-    mask_image = build_openai_localize_edit_mask(source_image, translated_blocks, foreground_bbox)
+    prompt_blocks = prepare_model_localize_blocks(translated_blocks)
+    prompt = build_openai_localize_cleanup_prompt(prompt_blocks, target_language, source_language, source_image.size, foreground_bbox)
+    mask_image = build_openai_localize_edit_mask(source_image, prompt_blocks, foreground_bbox)
     image_file = image_to_png_bytes(source_image)
     mask_file = io.BytesIO()
     mask_image.save(mask_file, format="PNG")
@@ -8286,20 +8854,58 @@ def render_localize_with_openai_image_edit(
         width=source_image.width,
         height=source_image.height,
     )
-    rendered = decode_openai_image_response(response)
-    if rendered.size != source_image.size:
-        rendered = rendered.resize(source_image.size, Image.Resampling.LANCZOS)
+    cleaned = decode_openai_image_response(response)
+    if cleaned.size != source_image.size:
+        cleaned = cleaned.resize(source_image.size, Image.Resampling.LANCZOS)
+    edit_luma = ImageChops.invert(mask_image.getchannel("A")).convert("L")
+    composite_luma = edit_luma.filter(ImageFilter.MaxFilter(size=61)).filter(ImageFilter.GaussianBlur(radius=6))
+    try:
+        source_np = np.array(source_image.convert("RGB"), dtype=np.float32)
+        rendered_np = np.array(cleaned.convert("RGB"), dtype=np.float32)
+        protected = np.array(composite_luma) <= 8
+        protected_change = float(np.abs(source_np - rendered_np).mean(axis=2)[protected].mean() / 255.0) if protected.any() else 0.0
+    except Exception:
+        protected_change = 1.0
+    used_composite_guard = protected_change > float(os.getenv("ADAPTIFAI_LOCALIZE_MODEL_MAX_PROTECTED_CHANGE", "0.025"))
+    if used_composite_guard:
+        cleaned = Image.composite(cleaned.convert("RGB"), source_image.convert("RGB"), composite_luma)
+    rendered = render_translated_text(cleaned.convert("RGB"), prompt_blocks, render_plan=None)
 
     return rendered, {
         "provider": "openai",
         "model": model,
         "quality": quality,
         "apiVariant": api_variant,
-        "maskedBlocks": len([block for block in translated_blocks if is_localize_marketing_edit_block(block, source_image.size, foreground_bbox)]),
+        "maskedBlocks": len([block for block in prompt_blocks if is_localize_marketing_edit_block(block, source_image.size, foreground_bbox)]),
         "maskMode": "strict_marketing_line_boxes",
-        "styleContract": "exact_replacement_text_semantic_style_lock",
+        "styleContract": "model_cleanup_deterministic_text_render",
         "outputFormat": openai_output_format_for(extension),
+        "protectedChange": protected_change,
+        "usedCompositeGuard": used_composite_guard,
     }
+
+
+def prepare_model_localize_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+    prepared: list[TextBlock] = []
+    for block in blocks:
+        if not block.translate or not block.translation_candidates:
+            prepared.append(block)
+            continue
+        candidates = [
+            preserve_source_metric_tokens(block.text, str(candidate.get("text", "")).strip())
+            for candidate in block.translation_candidates
+            if str(candidate.get("text", "")).strip()
+        ]
+        if not candidates:
+            prepared.append(block)
+            continue
+        source_len = max(1, len((block.text or "").replace("\n", " ")))
+        current = block.translated_text or block.text
+        selected = current
+        if len(current.replace("\n", " ")) > source_len * 0.92:
+            selected = min(candidates, key=lambda value: (len(value.replace("\n", " ")), value.count("\n")))
+        prepared.append(block.model_copy(update={"translated_text": selected}))
+    return prepared
 
 
 def union_bbox(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
@@ -10865,6 +11471,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
         temp_input_path = job_dir / f"{sanitize_stem(image_path)}-{source_suffix(image_path)}-preprocessed.png"
         preprocessed_image.save(temp_input_path, "PNG")
         blocks = build_localize_blocks(temp_input_path, preprocessed_image)
+        refine_overlay_text_colors(source_image, blocks)
         raw_ocr_blocks = list(blocks)
         source_language = detect_source_language(blocks)
         try:
@@ -10876,27 +11483,110 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
             translations_summary[language] = translated_strings
             translated_blocks, editor_text = apply_translations(blocks, translated_strings, language)
             grouping_audit = analyze_semantic_grouping(translated_blocks, source_image.size)
-            background, cleanup_debug = build_clean_background(source_image, translated_blocks, cleanup_strength=100, return_debug=True)
-            if localize_cleanup_gate_enabled():
-                gated_background, cleanup_gate = enforce_localize_cleanup_gate(source_image, background, translated_blocks, cleanup_debug)
-            else:
-                gated_background = background.convert("RGB")
-                cleanup_gate = {
-                    "cleanupStatus": "passed",
-                    "blockCleanupStatus": [],
-                    "residualSourceOCR": [],
-                    "failedSourceWords": [],
-                    "blockLevelFallbackAttempted": False,
-                    "blockLevelFallbackSelected": False,
-                    "finalRenderSkippedReason": "",
-                }
-                cleanup_debug.setdefault("cleanupWarnings", []).append(
-                    {
-                        "id": "localize-cleanup-gate",
-                        "lineIndex": -1,
-                        "warning": "Heavy residual cleanup gate disabled for CPU runtime",
+            foreground_bbox = detect_foreground_bbox(source_image)
+            localize_foreground_bbox = foreground_bbox
+            has_openai_edit_work = any(
+                is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
+                for block in translated_blocks
+            )
+            has_complex_model_cleanup_work = False
+            for block in translated_blocks:
+                if not is_overlay_marketing_cleanup_block(block):
+                    continue
+                try:
+                    region_probe = build_combined_block_cleanup_region(source_image, block)
+                    if region_probe is not None and not bool(region_probe.get("solidContextCleanup")):
+                        has_complex_model_cleanup_work = True
+                        break
+                except Exception:
+                    has_complex_model_cleanup_work = True
+                    break
+            localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "auto").strip().lower()
+            openai_render_meta: dict[str, Any] | None = None
+            rendered: Image.Image | None = None
+            cleanup_debug: dict[str, Any] = {
+                "blockLineGroups": [],
+                "lineCleanupRegions": [],
+                "lineMasks": [],
+                "lineCleanupStrategies": [],
+                "lineCleanupQualityScores": [],
+                "foregroundOverlapScores": [],
+                "cleanupWarnings": [],
+                "generativeAttemptPreviews": [],
+                "protectedRegionMaskImage": Image.new("L", source_image.size, 0),
+                "maskPolarity": "model_direct_localize",
+                "textCoverageEstimate": 0.0,
+                "backgroundLeakageEstimate": 0.0,
+                "maskQualityStatus": "delegated_to_image_editor",
+                "maskFailureReason": "",
+                "maskWhitePixelRatio": 0.0,
+                "textStrokeMaskRawImage": None,
+                "textStrokeMaskFilledImage": None,
+                "textStrokeMaskDilatedImage": None,
+                "textStrokeMaskFinalImage": None,
+            }
+            cleanup_gate = {
+                "cleanupStatus": "passed",
+                "blockCleanupStatus": [],
+                "residualSourceOCR": [],
+                "failedSourceWords": [],
+                "blockLevelFallbackAttempted": False,
+                "blockLevelFallbackSelected": False,
+                "finalRenderSkippedReason": "",
+            }
+            gated_background = source_image.copy()
+
+            should_use_model_localize = (
+                localize_renderer in {"openai", "image", "model"}
+                or (localize_renderer == "auto" and has_complex_model_cleanup_work)
+            )
+            if should_use_model_localize and has_openai_edit_work:
+                try:
+                    rendered, openai_render_meta = render_localize_with_openai_image_edit(
+                        source_image,
+                        translated_blocks,
+                        language,
+                        source_language,
+                        output_format,
+                    )
+                    cleanup_debug["cleanupWarnings"].append(
+                        {
+                            "id": "model-direct-localize",
+                            "lineIndex": -1,
+                            "warning": "Used model image edit as primary localization renderer.",
+                            "provider": openai_render_meta.get("provider"),
+                            "model": openai_render_meta.get("model"),
+                        }
+                    )
+                except Exception as exc:
+                    openai_render_meta = {
+                        "provider": "local",
+                        "strategy": "model_direct_localize_failed",
+                        "fallbackReason": str(exc),
                     }
-                )
+
+            if rendered is None:
+                background, cleanup_debug = build_clean_background(source_image, translated_blocks, cleanup_strength=100, return_debug=True)
+                if localize_cleanup_gate_enabled():
+                    gated_background, cleanup_gate = enforce_localize_cleanup_gate(source_image, background, translated_blocks, cleanup_debug)
+                else:
+                    gated_background = background.convert("RGB")
+                    cleanup_gate = {
+                        "cleanupStatus": "passed",
+                        "blockCleanupStatus": [],
+                        "residualSourceOCR": [],
+                        "failedSourceWords": [],
+                        "blockLevelFallbackAttempted": False,
+                        "blockLevelFallbackSelected": False,
+                        "finalRenderSkippedReason": "",
+                    }
+                    cleanup_debug.setdefault("cleanupWarnings", []).append(
+                        {
+                            "id": "localize-cleanup-gate",
+                            "lineIndex": -1,
+                            "warning": "Heavy residual cleanup gate disabled for CPU runtime",
+                        }
+                    )
 
             # ─── Localization Protocol V2.2 ───
             if _PROTOCOL_AVAILABLE:
@@ -10956,7 +11646,6 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                     pass
             # ─── End Protocol V2.2 ───
 
-            foreground_bbox = detect_foreground_bbox(source_image)
             render_plan_entries = [
                 decide_block_render_strategy(source_image, block, cleanup_debug, foreground_bbox)
                 for block in translated_blocks
@@ -10976,45 +11665,23 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                 else block
                 for block in translated_blocks
             ]
-            rendered: Image.Image | None = None
             render_base = gated_background if gated_background is not None else source_image
-            try:
-                rendered = render_translated_text(render_base, translated_blocks, render_plan=render_plan_map)
-            except Exception:
-                rendered = None
-            # Safety net: if render produced nothing useful (exception or all blocks
-            # suppressed and output identical to base), retry without render_plan so
-            # filter_render_blocks operates in raw mode without any suppression hints.
-            if rendered is None or (
-                rendered is not None
-                and np.array_equal(np.array(rendered), np.array(render_base))
-            ):
+            if rendered is None:
                 try:
-                    rendered = render_translated_text(render_base, translated_blocks, render_plan=None)
+                    rendered = render_translated_text(render_base, translated_blocks, render_plan=render_plan_map)
                 except Exception:
-                    rendered = render_base.copy()
-            openai_render_meta: dict[str, Any] | None = None
-            localize_renderer = os.getenv("ADAPTIFAI_LOCALIZE_RENDERER", "local").strip().lower()
-            localize_foreground_bbox = detect_foreground_bbox(source_image)
-            has_openai_edit_work = any(
-                is_localize_marketing_edit_block(block, source_image.size, localize_foreground_bbox)
-                for block in translated_blocks
-            )
-            if localize_renderer == "openai" and has_openai_edit_work:
-                try:
-                    rendered, openai_render_meta = render_localize_with_openai_image_edit(
-                        source_image,
-                        translated_blocks,
-                        language,
-                        source_language,
-                        output_format,
-                    )
-                except Exception as exc:
-                    openai_render_meta = {
-                        "provider": "local",
-                        "strategy": "local_render_openai_failed",
-                        "fallbackReason": str(exc),
-                    }
+                    rendered = None
+                # Safety net: if render produced nothing useful (exception or all blocks
+                # suppressed and output identical to base), retry without render_plan so
+                # filter_render_blocks operates in raw mode without any suppression hints.
+                if rendered is None or (
+                    rendered is not None
+                    and np.array_equal(np.array(rendered), np.array(render_base))
+                ):
+                    try:
+                        rendered = render_translated_text(render_base, translated_blocks, render_plan=None)
+                    except Exception:
+                        rendered = render_base.copy()
             token_masks = collect_token_masks(source_image, translated_blocks)
             mask_preview = build_text_mask(source_image, translated_blocks)
             mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-mask.png"
