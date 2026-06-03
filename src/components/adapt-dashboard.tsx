@@ -51,6 +51,13 @@ type Device = "mobile" | "desktop";
 type FitMode = "contain" | "cover" | "fill";
 type CreativeMode = "single" | "carousel";
 type PreviewMetadata = PlatformPreviewMetadata;
+type ProgressStage = { label: string; detail: string };
+type RunProgress = {
+  mode: Mode;
+  startedAt: number;
+  estimateMs: number;
+  stages: ProgressStage[];
+};
 type PipelineOutput = {
   placement_id?: string | null;
   filename: string;
@@ -73,6 +80,14 @@ type AdminUser = { user_id: string; credits: number; updated_at: string };
 
 function formatCreditText(value: number) {
   return `${value} credit${value === 1 ? "" : "s"}`;
+}
+
+function formatTimeRemaining(seconds: number) {
+  const safeSeconds = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(safeSeconds / 60);
+  const remainder = safeSeconds % 60;
+  if (minutes <= 0) return `${remainder}s left`;
+  return `${minutes}m ${String(remainder).padStart(2, "0")}s left`;
 }
 
 const platformOrder = ["SOCIAL", "GOOGLE", "CUSTOM"];
@@ -133,6 +148,34 @@ const pricingPacks = [
 
 function cleanCopy(value: string) {
   return value.replaceAll("[BOLD]", "").replaceAll("[/BOLD]", "");
+}
+
+function isPreviewableImage(file: File) {
+  return file.type.startsWith("image/") || /\.(png|jpe?g|webp)$/i.test(file.name);
+}
+
+function buildProgressStages(mode: Mode): ProgressStage[] {
+  return mode === "adapt"
+    ? [
+      { label: "Uploading creative", detail: "Preparing files for localization." },
+      { label: "Reading layout", detail: "Detecting marketing text and visual structure." },
+      { label: "Translating copy", detail: "Keeping sentence meaning while preserving word-level style." },
+      { label: "Rebuilding artwork", detail: "Restoring the design with localized text." },
+      { label: "Exporting files", detail: "Packaging outputs and download links." },
+    ]
+    : [
+      { label: "Uploading creative", detail: "Preparing files for resize." },
+      { label: "Analyzing composition", detail: "Finding the main subject and supporting scene elements." },
+      { label: "Planning reframe", detail: "Fitting the creative into selected platform dimensions." },
+      { label: "Rendering placements", detail: "Generating resized assets without destructive cropping." },
+      { label: "Exporting files", detail: "Packaging outputs and preview links." },
+    ];
+}
+
+function estimateProcessingMs(mode: Mode, fileCount: number, languageCount: number, placementCount: number) {
+  const units = mode === "adapt" ? Math.max(1, fileCount * Math.max(1, languageCount)) : Math.max(1, fileCount * Math.max(1, placementCount));
+  const seconds = mode === "adapt" ? 35 + units * 18 : 28 + units * 14;
+  return Math.min(420_000, seconds * 1000);
 }
 
 function mergeFiles(current: File[], incoming: File[]) {
@@ -426,7 +469,7 @@ function LandingPage({
 function Creative({ placement, copy, mode, x, y, opacity, scale, fit, imageUrl }: { placement: Placement; copy: string; mode: Mode; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string }) {
   const box = placement.ratio === "9:16" ? { x: 10 + x, y: 34 + y, width: 62, height: 14 } : { x: 9 + x, y: 34 + y, width: 58, height: 18 };
   return (
-    <div className="relative overflow-hidden bg-[#f0d553]" style={{ aspectRatio: `${placement.width} / ${placement.height}` }}>
+    <div className="relative h-full w-full overflow-hidden bg-[#f0d553]" style={{ aspectRatio: `${placement.width} / ${placement.height}` }}>
       {imageUrl ? (
         <img
           src={imageUrl}
@@ -502,8 +545,8 @@ function CarouselAssetSurface({
   const showPeek = next && slides.length > 1;
 
   return (
-    <div className="relative overflow-hidden">
-      <div className="overflow-hidden rounded-[inherit]">
+    <div className="relative h-full w-full overflow-hidden">
+      <div className="h-full w-full overflow-hidden rounded-[inherit]">
         <Creative placement={placement} mode={mode} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={current} />
       </div>
       {showPeek ? (
@@ -619,10 +662,44 @@ function CreativeModeControl({
   );
 }
 
+function ProcessingProgress({ progress }: { progress: RunProgress }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const elapsed = Math.max(0, now - progress.startedAt);
+  const rawRatio = elapsed / Math.max(1, progress.estimateMs);
+  const ratio = Math.min(0.94, rawRatio);
+  const percent = Math.max(4, Math.round(ratio * 100));
+  const stageIndex = Math.min(progress.stages.length - 1, Math.floor(ratio * progress.stages.length));
+  const stage = progress.stages[stageIndex] ?? progress.stages[0];
+  const remainingSeconds = (progress.estimateMs * (1 - ratio)) / 1000;
+
+  return (
+    <div className="rounded-md border border-[#0f766e]/20 bg-[#f0fbf7] p-3 text-sm">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-semibold text-[#064e46]">{stage.label}</p>
+          <p className="mt-0.5 text-xs text-[#47746d]">{stage.detail}</p>
+        </div>
+        <span className="shrink-0 text-xs font-semibold tabular-nums text-[#0f766e]">{formatTimeRemaining(remainingSeconds)}</span>
+      </div>
+      <div className="mt-3 h-2 overflow-hidden rounded-full bg-white">
+        <div className="h-full rounded-full bg-[#0f766e] transition-all duration-500" style={{ width: `${percent}%` }} />
+      </div>
+      <div className="mt-2 flex items-center justify-between text-[11px] font-semibold text-[#47746d]">
+        <span>{progress.mode === "adapt" ? "Localize" : "Resize"} in progress</span>
+        <span>{percent}%</span>
+      </div>
+    </div>
+  );
+}
+
 function PhoneChrome({ children, dark = false }: { children: ReactNode; dark?: boolean }) {
   return (
-    <div className="mx-auto w-full max-w-[328px] rounded-[42px] border-[10px] border-[#111] bg-[#111] shadow-2xl">
-      <div className={["relative overflow-hidden rounded-[31px]", dark ? "bg-[#050506]" : "bg-white"].join(" ")}>
+    <div className="mx-auto h-[560px] w-[258px] shrink-0 rounded-[42px] border-[10px] border-[#111] bg-[#111] shadow-2xl sm:h-[610px] sm:w-[282px]">
+      <div className={["relative h-full w-full overflow-hidden rounded-[31px]", dark ? "bg-[#050506]" : "bg-white"].join(" ")}>
         <div className="pointer-events-none absolute left-1/2 top-2 z-30 h-6 w-24 -translate-x-1/2 rounded-full bg-black/90" />
         {children}
       </div>
@@ -713,7 +790,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
   } else if (shellTemplateId === "story_image") {
     shell = (
       <PhoneChrome dark>
-        <div className="relative">
+        <div className="relative h-full">
           <div className="absolute inset-x-4 top-4 z-20 flex gap-1">{Array.from({ length: 4 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
           <div className="absolute left-4 right-4 top-9 z-20 flex items-center justify-between text-white">
             <div className="flex items-center gap-2">
@@ -724,7 +801,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
             </div>
             <X className="h-6 w-6" />
           </div>
-          <div>{asset}</div>
+          <div className="absolute inset-0">{asset}</div>
           <div className="absolute inset-x-7 bottom-20 z-20 grid place-items-center">
             <button type="button" className="rounded-full bg-white px-7 py-3 text-[14px] font-black text-[#111] shadow-lg">{metadata.ctaText}</button>
           </div>
@@ -1235,6 +1312,7 @@ export function AdaptDashboard() {
   const [activeOutputIndex, setActiveOutputIndex] = useState(0);
   const [activeResizeSource, setActiveResizeSource] = useState<string>("");
   const [isRunning, setIsRunning] = useState(false);
+  const [runProgress, setRunProgress] = useState<RunProgress | null>(null);
   const [isApplyingEdit, setIsApplyingEdit] = useState(false);
   const [editStatus, setEditStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -1397,6 +1475,12 @@ export function AdaptDashboard() {
       return;
     }
     setIsRunning(true);
+    setRunProgress({
+      mode,
+      startedAt: Date.now(),
+      estimateMs: estimateProcessingMs(mode, files.length, selectedLanguages.length, selectedPlacementIds.length),
+      stages: buildProgressStages(mode),
+    });
     setError(null);
     setResult(null);
     const formData = new FormData();
@@ -1435,6 +1519,7 @@ export function AdaptDashboard() {
       setError(caught instanceof Error ? caught.message : "Pipeline failed.");
     } finally {
       setIsRunning(false);
+      setRunProgress(null);
     }
   };
 
@@ -1806,19 +1891,30 @@ export function AdaptDashboard() {
                 <div className="mb-4 flex items-center justify-between"><h2 className="font-semibold">Upload</h2><FileArchive className="h-4 w-4 text-[#0f766e]" /></div>
                 <label className="flex min-h-36 cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-[#151515]/30 bg-[#f6f1e7] p-4 text-center hover:border-[#0f766e]"><CloudUpload className="mb-3 h-8 w-8 text-[#0f766e]" /><span className="text-sm font-semibold">Upload PNG, WebP, JPG, JPEG, PDF or ZIP</span><span className="mt-1 text-xs text-[#595959]">Multiple files supported</span><input className="sr-only" multiple accept=".png,.webp,.jpg,.jpeg,.pdf,.zip" type="file" onChange={(e) => setFiles((current) => mergeFiles(current, Array.from(e.target.files ?? [])))} /></label>
                 <div className="mt-3 space-y-2">
-                  {(files.length ? files : [{ name: "No files selected", size: 0 } as File]).map((file) => (
-                    <div key={`${file.name}-${file.size}`} className="flex items-center justify-between rounded-md bg-[#faf9f5] px-3 py-2 text-xs">
-                      <span className="max-w-[190px] truncate">{file.name}</span>
-                      <div className="ml-3 flex items-center gap-2">
-                        <span>{file.size ? `${Math.ceil(file.size / 1024)} KB` : ""}</span>
-                        {file.size ? (
+                  {files.length ? files.map((file) => {
+                    const previewUrl = filePreviewUrls[file.name];
+                    const showThumbnail = previewUrl && isPreviewableImage(file);
+                    return (
+                      <div key={`${file.name}-${file.size}-${file.lastModified}`} className="grid grid-cols-[44px_minmax(0,1fr)_auto] items-center gap-3 rounded-md bg-[#faf9f5] px-2.5 py-2 text-xs">
+                        <div className="h-11 w-11 overflow-hidden rounded-md border border-[#151515]/10 bg-white">
+                          {showThumbnail ? (
+                            <img src={previewUrl} alt={file.name} className="h-full w-full object-cover" />
+                          ) : (
+                            <div className="grid h-full w-full place-items-center text-[#0f766e]"><FileArchive className="h-5 w-5" /></div>
+                          )}
+                        </div>
+                        <span className="min-w-0 truncate">{file.name}</span>
+                        <div className="flex items-center gap-2">
+                          <span className="whitespace-nowrap">{Math.ceil(file.size / 1024)} KB</span>
                           <button type="button" onClick={() => removeFile(file.name, file.size)} className="rounded-full text-[#777] hover:text-[#ee4d6a]" aria-label={`${file.name} remove`}>
                             <XCircle className="h-4 w-4" />
                           </button>
-                        ) : null}
+                        </div>
                       </div>
-                    </div>
-                  ))}
+                    );
+                  }) : (
+                    <div className="rounded-md bg-[#faf9f5] px-3 py-2 text-xs text-[#777]">No files selected</div>
+                  )}
                 </div>
               </section>
 
@@ -1875,6 +1971,11 @@ export function AdaptDashboard() {
               </div>
             )}
           </div>
+          {runProgress ? (
+            <div className="border-b border-[#151515]/10 bg-[#fbfffd] px-4 py-3">
+              <ProcessingProgress progress={runProgress} />
+            </div>
+          ) : null}
           {mode === "adapt" ? (
             <LocalizePreview
               originalUrl={activeOriginalUrl}
@@ -1944,6 +2045,7 @@ export function AdaptDashboard() {
               <div className="flex justify-between gap-3 font-black"><span>Total Credits</span><span>{formatCreditText(actionCredits)}</span></div>
               <div className={["mt-2 flex justify-between gap-3 font-semibold", remainingAfterAction < 0 ? "text-[#b42318]" : "text-[#0f766e]"].join(" ")}><span>Remaining Credits</span><span>{formatCreditText(remainingAfterAction)}</span></div>
             </div>
+            {runProgress ? <div className="mt-4"><ProcessingProgress progress={runProgress} /></div> : null}
             <button type={result ? "button" : "submit"} onClick={result ? applyManualEdit : undefined} disabled={result ? isApplyingEdit || !canApplyCurrentEdit : isRunning || !canRun} className="mt-4 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#ee4d6a] text-sm font-semibold text-white disabled:bg-[#d6d0c4]">
               {result ? (isApplyingEdit ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />) : isRunning ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
               {result ? `Apply edit / use ${editCredits} credits` : mode === "adapt" ? "Run Localize" : "Run Resize"}

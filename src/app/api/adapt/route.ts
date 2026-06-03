@@ -39,6 +39,21 @@ export async function POST(request: NextRequest) {
     const payload = contentType.includes("application/json")
       ? await response.json()
       : { error: `Backend returned ${response.status}`, detail: await response.text() };
+    if (!response.ok) {
+      const detail = typeof payload.detail === "string" ? payload.detail : typeof payload.error === "string" ? payload.error : "";
+      const isGatewayError = response.status === 502 || response.status === 503 || response.status === 504;
+      const message = isGatewayError
+        ? "Backend service is temporarily unavailable while processing this creative. Please retry in a minute; if it repeats, the backend deploy/runtime needs attention."
+        : detail || `Backend returned ${response.status}`;
+      return NextResponse.json(
+        {
+          ...payload,
+          error: message,
+          backend_status: response.status,
+        },
+        { status: response.status },
+      );
+    }
     if (response.ok) {
       const spend = await spendCredits(userId, estimatedCredits);
       if (!spend.ok) {

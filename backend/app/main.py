@@ -4410,7 +4410,7 @@ def _sanitize_inpaint_result(
 def run_openai_full_image_cleanup(image: Image.Image, editable_mask: Image.Image, prompt: str) -> dict[str, Any]:
     if not os.getenv("OPENAI_API_KEY"):
         return {"success": False, "provider": "openai", "failureReason": "openai_not_configured"}
-    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
     with tempfile.TemporaryDirectory(prefix="adaptifai-openai-full-") as temp_dir_name:
         temp_dir = Path(temp_dir_name)
         rgba_mask = build_openai_edit_mask(editable_mask)
@@ -4522,7 +4522,7 @@ def validate_openai_edit_request(image_path: Path, mask_path: Path, crop: Image.
     transparent_pixels = int((alpha == 0).sum())
     opaque_pixels = int((alpha == 255).sum())
     meta = {
-        "model": model or os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2",
+        "model": model or os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1",
         "imageCropWidth": crop.size[0],
         "imageCropHeight": crop.size[1],
         "maskWidth": rgba_mask.size[0],
@@ -4627,7 +4627,7 @@ def cleanup_block_with_generative_fill_candidates(
     editable_mask_crop = prepared["editable_mask"]
     protected_crop_mask = prepared["protected_crop_mask"]
     if provider in {"openai", "auto"} and os.getenv("OPENAI_API_KEY"):
-        deduped_models = [os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"]
+        deduped_models = [os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"]
         prompt = prompt_override or (
             "Remove only the text pixels inside the transparent mask. Reconstruct only the masked text area using the surrounding background. "
             "Do not modify any unmasked pixels. Preserve all people, products, shoes, logos, packaging, lighting, shadows, textures and background outside the mask exactly. "
@@ -4716,7 +4716,7 @@ def cleanup_block_with_generative_fill_candidates(
         except Exception as exc:
             attempts.append(
                 {
-                    "model": deduped_models[0] if deduped_models else os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2",
+                    "model": deduped_models[0] if deduped_models else os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1",
                     "attempted": True,
                     "success": False,
                     "rejected": True,
@@ -7784,7 +7784,7 @@ def render_localize_with_openai_image_edit(
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for OpenAI image localization.")
 
-    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
     quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
     if quality not in {"low", "medium", "high", "auto"}:
         quality = "medium"
@@ -9462,7 +9462,7 @@ def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int,
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is required for OpenAI outpaint resize.")
 
-    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2").strip() or "gpt-image-2"
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
     quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
     if quality not in {"low", "medium", "high", "auto"}:
         quality = "medium"
@@ -10306,7 +10306,11 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                         output_format,
                     )
                 except Exception as exc:
-                    raise HTTPException(status_code=502, detail=f"OpenAI image localization failed: {exc}") from exc
+                    openai_render_meta = {
+                        "provider": "local",
+                        "strategy": "local_render_openai_failed",
+                        "fallbackReason": str(exc),
+                    }
             token_masks = collect_token_masks(source_image, translated_blocks)
             mask_preview = build_text_mask(source_image, translated_blocks)
             mask_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-mask.png"
@@ -11066,7 +11070,11 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
             )
             asset_meta["render_provider"] = render_meta
         except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"OpenAI image localization failed: {exc}") from exc
+            asset_meta["render_provider"] = {
+                "provider": "local",
+                "strategy": "local_render_openai_failed",
+                "fallbackReason": str(exc),
+            }
     save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
     asset_meta["translated_text"] = "\n\n".join(editor_parts)
     asset_meta["blocks"] = [block.model_dump() for block in updated_blocks]
