@@ -293,6 +293,10 @@ def is_cpu_runtime() -> bool:
     return torch_device() == "cpu"
 
 
+def runtime_device_label() -> str:
+    return os.getenv("ADAPTIFAI_RUNTIME_DEVICE", "cpu").strip() or "cpu"
+
+
 def temp_root() -> Path:
     root = Path(os.getenv("ADAPTIFAI_TMP_DIR", Path(tempfile.gettempdir()) / "adaptifai"))
     root.mkdir(parents=True, exist_ok=True)
@@ -8505,14 +8509,18 @@ def detect_protected_region_mask(
 
 
 def build_resize_focus_bbox(source: Image.Image) -> tuple[int, int, int, int]:
-    temp_path = temp_root() / f"{uuid4().hex}.png"
-    try:
-        source.save(temp_path, "PNG")
-        detector_blocks = marketing_filter(run_trocr_ocr_on_image(temp_path))
-    except Exception:
+    detector_blocks: list[TextBlock] = []
+    if env_flag("ADAPTIFAI_RESIZE_FOCUS_OCR", "0"):
+        temp_path = temp_root() / f"{uuid4().hex}.png"
+        try:
+            source.save(temp_path, "PNG")
+            detector_blocks = marketing_filter(run_trocr_ocr_on_image(temp_path))
+        except Exception:
+            detector_blocks = []
+        finally:
+            temp_path.unlink(missing_ok=True)
+    else:
         detector_blocks = []
-    finally:
-        temp_path.unlink(missing_ok=True)
     text_bbox = union_bbox([block.bbox for block in detector_blocks if (block.bbox[2] - block.bbox[0]) > 18 and (block.bbox[3] - block.bbox[1]) > 12])
     foreground_bbox = detect_foreground_bbox(source)
     focus = union_bbox([box for box in [text_bbox, foreground_bbox] if box is not None]) or (0, 0, source.width, source.height)
@@ -11839,9 +11847,9 @@ def health() -> dict[str, str]:
     return {
         "status": "ok",
         "storage": "stateless-temp-24h",
-        "device": torch_device(),
+        "device": runtime_device_label(),
         "ocr_engine": os.getenv("ADAPTIFAI_OCR_ENGINE", "easyocr"),
-        "ocr_max_side": os.getenv("ADAPTIFAI_OCR_MAX_SIDE", "1280" if is_cpu_runtime() else "2200"),
+        "ocr_max_side": os.getenv("ADAPTIFAI_OCR_MAX_SIDE", "1280"),
         "ocr": os.getenv("ADAPTIFAI_TROCR_MODEL", "microsoft/trocr-base-printed"),
         "inpainting_backend": os.getenv("ADAPTIFAI_INPAINT_BACKEND", "stable-diffusion"),
         "inpainting": os.getenv("ADAPTIFAI_INPAINT_MODEL", "runwayml/stable-diffusion-inpainting"),

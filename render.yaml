@@ -44,6 +44,8 @@ services:
         value: "1600"
       - key: ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT
         value: "12"
+      - key: ADAPTIFAI_RESIZE_FOCUS_OCR
+        value: "0"
       - key: ADAPTIFAI_TROCR_MODEL
         value: microsoft/trocr-base-printed
       - key: ADAPTIFAI_OCR_ENGINE
@@ -57,7 +59,7 @@ services:
       - key: ADAPTIFAI_INPAINT_STEPS
         value: "12"
       - key: ADAPTIFAI_OCR_MAX_SIDE
-        value: "1280"
+        value: "960"
       - key: ADAPTIFAI_OCR_BATCH_SIZE
         value: "1"
       - key: ADAPTIFAI_EASYOCR_DECODER
