@@ -299,6 +299,146 @@ def temp_root() -> Path:
     return root
 
 
+GOOGLE_FONTS_CATALOG_LOCK = threading.Lock()
+GOOGLE_FONTS_CATALOG_CACHE: dict[str, dict[str, Any]] | None = None
+GOOGLE_FONT_FILE_CACHE: dict[tuple[str, str], Path | None] = {}
+LOCAL_FONT_FILE_CACHE: dict[tuple[str, bool], Any] = {}
+DEFAULT_GOOGLE_FONT_STACK = ("Inter", "Roboto", "Montserrat", "Poppins", "Open Sans", "Lato")
+
+
+def google_fonts_enabled() -> bool:
+    return bool(os.getenv("GOOGLE_FONTS_API_KEY", "").strip())
+
+
+def font_cache_dir() -> Path:
+    root = Path(os.getenv("ADAPTIFAI_FONT_CACHE_DIR", temp_root() / "fonts"))
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def sanitize_font_cache_name(value: str) -> str:
+    sanitized = re.sub(r"[^a-zA-Z0-9._-]+", "-", value.strip()).strip("-")
+    return sanitized[:80] or "font"
+
+
+def load_google_fonts_catalog() -> dict[str, dict[str, Any]]:
+    global GOOGLE_FONTS_CATALOG_CACHE
+    if GOOGLE_FONTS_CATALOG_CACHE is not None:
+        return GOOGLE_FONTS_CATALOG_CACHE
+
+    key = os.getenv("GOOGLE_FONTS_API_KEY", "").strip()
+    if not key:
+        GOOGLE_FONTS_CATALOG_CACHE = {}
+        return GOOGLE_FONTS_CATALOG_CACHE
+
+    with GOOGLE_FONTS_CATALOG_LOCK:
+        if GOOGLE_FONTS_CATALOG_CACHE is not None:
+            return GOOGLE_FONTS_CATALOG_CACHE
+
+        cache_path = font_cache_dir() / "google-webfonts-catalog.json"
+        payload: dict[str, Any] | None = None
+        try:
+            if cache_path.exists() and time.time() - cache_path.stat().st_mtime < 24 * 60 * 60:
+                payload = json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            payload = None
+
+        if payload is None:
+            try:
+                response = requests.get(
+                    "https://www.googleapis.com/webfonts/v1/webfonts",
+                    params={"key": key, "sort": "popularity"},
+                    timeout=8,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                cache_path.write_text(json.dumps(payload), encoding="utf-8")
+            except Exception as exc:
+                print(f"[fonts] Google Fonts catalog unavailable, using local fonts: {exc}", flush=True)
+                payload = {}
+
+        items = payload.get("items", []) if isinstance(payload, dict) else []
+        GOOGLE_FONTS_CATALOG_CACHE = {
+            str(item.get("family", "")).strip().lower(): item
+            for item in items
+            if isinstance(item, dict) and str(item.get("family", "")).strip()
+        }
+        return GOOGLE_FONTS_CATALOG_CACHE
+
+
+def pick_google_font_family(requested_family: str | None, bold: bool) -> str | None:
+    catalog = load_google_fonts_catalog()
+    if not catalog:
+        return None
+
+    requested = (requested_family or "").strip().strip("'\"")
+    if requested:
+        for candidate in [part.strip().strip("'\"") for part in requested.split(",") if part.strip()]:
+            key = candidate.lower()
+            if key in catalog:
+                return str(catalog[key].get("family") or candidate)
+
+    preferred = os.getenv("ADAPTIFAI_DEFAULT_GOOGLE_FONT", "").strip()
+    fallback_stack = (preferred,) + DEFAULT_GOOGLE_FONT_STACK if preferred else DEFAULT_GOOGLE_FONT_STACK
+    if bold:
+        fallback_stack = (preferred,) + ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato") if preferred else ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato")
+
+    for family in fallback_stack:
+        if family and family.lower() in catalog:
+            return str(catalog[family.lower()].get("family") or family)
+    return None
+
+
+def pick_google_font_variant(item: dict[str, Any], bold: bool) -> tuple[str, str] | None:
+    files = item.get("files", {})
+    if not isinstance(files, dict) or not files:
+        return None
+    variants = [str(variant) for variant in item.get("variants", [])]
+    preferred = ["700", "800", "600", "regular"] if bold else ["regular", "400", "500", "300"]
+    for variant in preferred + variants:
+        url = files.get(variant)
+        if isinstance(url, str) and url:
+            return variant, url.replace("http://", "https://")
+    first_variant, first_url = next(iter(files.items()))
+    return str(first_variant), str(first_url).replace("http://", "https://")
+
+
+def get_google_font_file(requested_family: str | None, bold: bool) -> Path | None:
+    if not google_fonts_enabled():
+        return None
+    family = pick_google_font_family(requested_family, bold)
+    if not family:
+        return None
+    cache_key = (family.lower(), "bold" if bold else "regular")
+    if cache_key in GOOGLE_FONT_FILE_CACHE:
+        return GOOGLE_FONT_FILE_CACHE[cache_key]
+
+    item = load_google_fonts_catalog().get(family.lower())
+    if not item:
+        GOOGLE_FONT_FILE_CACHE[cache_key] = None
+        return None
+    selected = pick_google_font_variant(item, bold)
+    if not selected:
+        GOOGLE_FONT_FILE_CACHE[cache_key] = None
+        return None
+
+    variant, url = selected
+    suffix = Path(url.split("?", 1)[0]).suffix or ".ttf"
+    target = font_cache_dir() / f"{sanitize_font_cache_name(family)}-{sanitize_font_cache_name(variant)}{suffix}"
+    if not target.exists() or target.stat().st_size == 0:
+        try:
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            target.write_bytes(response.content)
+        except Exception as exc:
+            print(f"[fonts] Google font download failed for {family}/{variant}: {exc}", flush=True)
+            GOOGLE_FONT_FILE_CACHE[cache_key] = None
+            return None
+
+    GOOGLE_FONT_FILE_CACHE[cache_key] = target
+    return target
+
+
 def cleanup_old_temp_files() -> None:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     for child in temp_root().iterdir():
@@ -1599,6 +1739,30 @@ def normalize_translation_list(values: Any, source_texts: list[str]) -> list[str
     return translated[: len(source_texts)]
 
 
+def google_gemini_api_key() -> str:
+    return os.getenv("GEMINI_API_KEY", "").strip() or os.getenv("GOOGLE_API_KEY", "").strip()
+
+
+def extract_json_object(text: str) -> dict[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        return {}
+    try:
+        parsed = json.loads(stripped)
+        return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError:
+        pass
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            parsed = json.loads(stripped[start : end + 1])
+            return parsed if isinstance(parsed, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
 LANGUAGE_NAMES = {
     "EN": "English",
     "DE": "German",
@@ -1622,13 +1786,58 @@ SHORT_LABEL_TRANSLATIONS: dict[str, dict[str, str]] = {
 }
 
 
+def translate_with_gemini(blocks: list[TextBlock], languages: list[str]) -> dict[str, list[str]]:
+    source = [block.text for block in blocks if block.translate]
+    if not source:
+        return {language: [] for language in languages}
+
+    api_key = google_gemini_api_key()
+    if not api_key:
+        return {language: source for language in languages}
+
+    model = os.getenv("GEMINI_TRANSLATION_MODEL", os.getenv("ADAPTIFAI_GEMINI_TRANSLATION_MODEL", "gemini-1.5-pro")).strip() or "gemini-1.5-pro"
+    prompt = {
+        "task": "Translate every source string into the requested target language as faithful marketing localization. Treat stacked words as one semantic copy block before translating. Preserve meaning, protected brand/product tokens, metric tokens, [BOLD] tags, style intent by semantic word/phrase meaning, and source line rhythm where natural. Return compact JSON only. Each key must be a requested language code and each value must be an array aligned to the input order.",
+        "target_languages": {language: LANGUAGE_NAMES.get(language.upper(), language) for language in languages},
+        "strings": source,
+    }
+    try:
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"role": "user", "parts": [{"text": json.dumps(prompt, ensure_ascii=False)}]}],
+                "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"},
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+        parsed = extract_json_object(content)
+        translations = {language: normalize_translation_list(parsed.get(language), source) for language in languages}
+        for language in languages:
+            language_code = language.upper()
+            for index, source_text in enumerate(source):
+                mapped = SHORT_LABEL_TRANSLATIONS.get(normalize_ocr_text(source_text), {}).get(language_code)
+                if mapped:
+                    translations[language][index] = mapped
+        return translations
+    except Exception as exc:
+        print(f"[translation] Gemini fallback failed: {exc}", flush=True)
+        return {language: source for language in languages}
+
+
 def translate_with_gpt4o(blocks: list[TextBlock], languages: list[str]) -> dict[str, list[str]]:
     source = [block.text for block in blocks if block.translate]
     if not source:
         return {language: [] for language in languages}
 
     if not os.getenv("OPENAI_API_KEY"):
-        return {language: source for language in languages}
+        return translate_with_gemini(blocks, languages)
 
     client = OpenAI()
     prompt = {
@@ -6074,9 +6283,21 @@ def parse_bold_markup(text: str) -> list[tuple[str, bool]]:
     return [(segment, bold) for segment, bold in segments if segment]
 
 
-def get_font(size: int, bold: bool = False):
+def get_font(size: int, bold: bool = False, family: str | None = None):
+    google_font = get_google_font_file(family, bold)
+    if google_font is not None:
+        try:
+            return ImageFont.truetype(str(google_font), size)
+        except OSError as exc:
+            print(f"[fonts] Google font load failed for {google_font}: {exc}", flush=True)
+
+    local_cache_key = (f"{family or ''}:{size}", bold)
+    if local_cache_key in LOCAL_FONT_FILE_CACHE:
+        return LOCAL_FONT_FILE_CACHE[local_cache_key]
+
     font_names = (
         [
+            family or "",
             "C:/Windows/Fonts/arialbd.ttf",
             "C:/Windows/Fonts/segoeuib.ttf",
             "C:/Windows/Fonts/calibrib.ttf",
@@ -6085,6 +6306,7 @@ def get_font(size: int, bold: bool = False):
         ]
         if bold
         else [
+            family or "",
             "C:/Windows/Fonts/arial.ttf",
             "C:/Windows/Fonts/segoeui.ttf",
             "C:/Windows/Fonts/calibri.ttf",
@@ -6093,11 +6315,17 @@ def get_font(size: int, bold: bool = False):
         ]
     )
     for font_name in font_names:
+        if not font_name:
+            continue
         try:
-            return ImageFont.truetype(font_name, size)
+            font = ImageFont.truetype(font_name, size)
+            LOCAL_FONT_FILE_CACHE[local_cache_key] = font
+            return font
         except OSError:
             continue
-    return ImageFont.load_default()
+    font = ImageFont.load_default()
+    LOCAL_FONT_FILE_CACHE[local_cache_key] = font
+    return font
 
 
 def text_width(draw: ImageDraw.ImageDraw, text: str, font) -> float:
@@ -6179,7 +6407,8 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
 
 def get_font_for_style(style: dict[str, Any], size: int):
     weight = int(style.get("fontWeight", 700))
-    return get_font(size, bold=weight >= 700)
+    family = str(style.get("fontFamily") or "").strip() or None
+    return get_font(size, bold=weight >= 700, family=family)
 
 
 def span_token_width(draw: ImageDraw.ImageDraw, token: dict[str, Any], *, first_in_line: bool, scale_factor: float) -> float:
@@ -6663,7 +6892,7 @@ def build_render_audit_artifacts(
         "lineHeight": True,
         "textBoxPosition": True,
         "relativeVisualHierarchy": True,
-        "fontFamily": "approximate_system_match",
+        "fontFamily": "google_fonts_assisted_match" if google_fonts_enabled() else "approximate_system_match",
         "letterSpacing": "approximate_uniform",
         "multiStyleSpans": any(len(item.get("spans", [])) > 1 for item in source_style_spans_summary),
     }
@@ -6671,7 +6900,7 @@ def build_render_audit_artifacts(
         "enabled": True,
         "mode": "semantic_phrase_word_mapping",
         "colorAware": True,
-        "fontFamilyAware": "approximate_system_match",
+        "fontFamilyAware": "google_fonts_assisted_match" if google_fonts_enabled() else "approximate_system_match",
         "letterSpacingAware": "approximate_uniform",
         "notes": "Styles follow semantic phrase/word meaning rather than source position; line-count preservation is scored against the source visual rhythm.",
     }
@@ -8736,6 +8965,68 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         return None
 
 
+def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
+    api_key = google_gemini_api_key()
+    if not api_key:
+        return None
+
+    provider = os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto").strip().lower()
+    if provider in {"heuristic", "local", "off", "disabled", "openai"}:
+        return None
+
+    try:
+        probe = source.convert("RGB")
+        max_side = int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE", "1600"))
+        if max(probe.size) > max_side:
+            scale = max_side / max(probe.size)
+            probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
+
+        encoded_io = io.BytesIO()
+        probe.save(encoded_io, format="PNG")
+        encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
+        model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-1.5-pro")).strip() or "gemini-1.5-pro"
+        prompt = (
+            build_visual_analysis_prompt(target_language)
+            + " Return JSON only. Return the dimensions of the original source image, not the resized analysis image. "
+            + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers. "
+            + "For resize, explicitly identify secondary visual theme elements in other_layers so the planner can recompose them around the protected product instead of cropping the source."
+        )
+        response = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+            params={"key": api_key},
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing.\n\n{prompt}"},
+                            {"inline_data": {"mime_type": "image/png", "data": encoded}},
+                        ],
+                    }
+                ],
+                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+        parsed = extract_json_object(content)
+        analysis = parse_visual_analysis_payload(parsed)
+        if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
+            raise ValueError("gemini analysis returned no actionable visual layers")
+        if analysis.source_width != source.width or analysis.source_height != source.height:
+            analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
+        warnings = [*analysis.quality_warnings, "analysis_provider:gemini"]
+        return analysis.model_copy(update={"quality_warnings": warnings})
+    except Exception as exc:
+        print(f"[smart_reframe_analysis] gemini analysis failed: {exc}", flush=True)
+        return None
+
+
 def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, fallback_reason: str = "") -> VisualAnalysis:
     text_layers: list[TextLayer] = []
     detector_blocks: list[TextBlock] = []
@@ -8829,6 +9120,12 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
             return analysis
         if provider == "openai":
             return build_heuristic_smart_reframe_analysis(source, focus_bbox, "openai_analysis_failed_fallback")
+    if provider in {"auto", "gemini", "google"}:
+        analysis = build_gemini_smart_reframe_analysis(source, target_language)
+        if analysis is not None:
+            return analysis
+        if provider in {"gemini", "google"}:
+            return build_heuristic_smart_reframe_analysis(source, focus_bbox, "gemini_analysis_failed_fallback")
     return build_heuristic_smart_reframe_analysis(source, focus_bbox)
 
 
@@ -10187,7 +10484,11 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
         raw_ocr_blocks = run_trocr_ocr_on_image(temp_input_path)
         blocks = build_localize_blocks(temp_input_path, preprocessed_image)
         source_language = detect_source_language(blocks)
-        translated_by_language = translate_with_gpt4o(blocks, languages)
+        try:
+            translated_by_language = translate_with_gpt4o(blocks, languages)
+        except Exception as exc:
+            print(f"[translation] OpenAI translation failed, trying Gemini fallback: {exc}", flush=True)
+            translated_by_language = translate_with_gemini(blocks, languages)
         for language, translated_strings in translated_by_language.items():
             translations_summary[language] = translated_strings
             translated_blocks, editor_text = apply_translations(blocks, translated_strings, language)
