@@ -30,6 +30,8 @@ __pycache__/
 # misc
 .DS_Store
 *.pem
+/google/
+/ADAPTIFAI TEST IMAGES/vertex-output/
 
 # debug
 npm-debug.log*

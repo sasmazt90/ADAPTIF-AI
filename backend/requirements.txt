@@ -7,6 +7,8 @@ pillow==12.0.0
 aiofiles==25.1.0
 pypdfium2==5.2.0
 requests==2.32.3
+google-auth>=2.36.0,<3.0.0
+google-cloud-aiplatform>=1.73.0,<2.0.0
 accelerate==1.12.0
 diffusers==0.36.0
 easyocr==1.7.2

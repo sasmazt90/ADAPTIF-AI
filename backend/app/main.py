@@ -1761,8 +1761,135 @@ def google_gemini_api_key() -> str:
     return (
         os.getenv("GEMINI_API_KEY", "").strip()
         or os.getenv("GOOGLE_API_KEY", "").strip()
-        or os.getenv("GOOGLE_FONTS_API_KEY", "").strip()
     )
+
+
+def google_service_account_info() -> dict[str, Any] | None:
+    raw_json = (
+        os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.getenv("VERTEX_AI_SERVICE_ACCOUNT_JSON", "").strip()
+        or os.getenv("ADAPTIFAI_VERTEX_SERVICE_ACCOUNT_JSON", "").strip()
+    )
+    if raw_json:
+        try:
+            parsed = json.loads(raw_json)
+            return parsed if isinstance(parsed, dict) else None
+        except json.JSONDecodeError as exc:
+            print(f"[vertex] invalid service account json env: {exc}", flush=True)
+            return None
+    path_value = (
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        or os.getenv("VERTEX_AI_CREDENTIALS_FILE", "").strip()
+        or os.getenv("ADAPTIFAI_VERTEX_CREDENTIALS_FILE", "").strip()
+    )
+    if not path_value:
+        return None
+    try:
+        path = Path(path_value).expanduser()
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception as exc:
+        print(f"[vertex] could not read service account file: {exc}", flush=True)
+        return None
+
+
+def vertex_project_id() -> str:
+    info = google_service_account_info() or {}
+    return (
+        os.getenv("VERTEX_AI_PROJECT_ID", "").strip()
+        or os.getenv("GOOGLE_CLOUD_PROJECT", "").strip()
+        or os.getenv("GCP_PROJECT", "").strip()
+        or str(info.get("project_id", "")).strip()
+    )
+
+
+def vertex_location() -> str:
+    return os.getenv("VERTEX_AI_LOCATION", os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")).strip() or "us-central1"
+
+
+def vertex_imagen_model() -> str:
+    return os.getenv("VERTEX_IMAGEN_MODEL", os.getenv("ADAPTIFAI_VERTEX_IMAGEN_MODEL", "imagen-3.0-generate-002")).strip() or "imagen-3.0-generate-002"
+
+
+def vertex_available() -> bool:
+    return bool(vertex_project_id() and google_service_account_info())
+
+
+def vertex_authorized_session() -> Any:
+    info = google_service_account_info()
+    if not info:
+        raise RuntimeError("Vertex service account is not configured.")
+    from google.auth.transport.requests import AuthorizedSession
+    from google.oauth2 import service_account
+
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    return AuthorizedSession(credentials)
+
+
+def decode_vertex_imagen_prediction(prediction: dict[str, Any]) -> Image.Image:
+    encoded = (
+        prediction.get("bytesBase64Encoded")
+        or prediction.get("bytes_base64_encoded")
+        or prediction.get("image", {}).get("bytesBase64Encoded")
+        or prediction.get("image", {}).get("bytes_base64_encoded")
+    )
+    if not encoded:
+        raise ValueError("Vertex Imagen response did not include image bytes.")
+    return Image.open(io.BytesIO(base64.b64decode(encoded))).convert("RGB")
+
+
+def generate_vertex_imagen_image(
+    prompt: str,
+    *,
+    width: int | None = None,
+    height: int | None = None,
+    sample_count: int = 1,
+) -> tuple[Image.Image, dict[str, Any]]:
+    project_id = vertex_project_id()
+    if not project_id:
+        raise RuntimeError("VERTEX_AI_PROJECT_ID or project_id in service account JSON is required.")
+    location = vertex_location()
+    model = vertex_imagen_model()
+    aspect_ratio = "1:1"
+    if width and height:
+        ratio = width / max(1, height)
+        if ratio >= 1.65:
+            aspect_ratio = "16:9"
+        elif ratio <= 0.62:
+            aspect_ratio = "9:16"
+        elif ratio >= 1.18:
+            aspect_ratio = "4:3"
+        elif ratio <= 0.84:
+            aspect_ratio = "3:4"
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
+        f"locations/{location}/publishers/google/models/{model}:predict"
+    )
+    response = vertex_authorized_session().post(
+        endpoint,
+        json={
+            "instances": [{"prompt": prompt}],
+            "parameters": {
+                "sampleCount": max(1, min(4, int(sample_count))),
+                "aspectRatio": aspect_ratio,
+                "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
+                "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
+            },
+        },
+        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "90")),
+    )
+    response.raise_for_status()
+    payload = response.json()
+    predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
+    if not predictions:
+        raise ValueError("Vertex Imagen returned no predictions.")
+    image = decode_vertex_imagen_prediction(predictions[0])
+    if width and height and image.size != (width, height):
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+    return image, {"provider": "vertex", "model": model, "location": location, "aspectRatio": aspect_ratio}
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
