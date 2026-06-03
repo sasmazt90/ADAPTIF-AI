@@ -10865,6 +10865,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
         temp_input_path = job_dir / f"{sanitize_stem(image_path)}-{source_suffix(image_path)}-preprocessed.png"
         preprocessed_image.save(temp_input_path, "PNG")
         blocks = build_localize_blocks(temp_input_path, preprocessed_image)
+        raw_ocr_blocks = list(blocks)
         source_language = detect_source_language(blocks)
         try:
             translated_by_language = translate_with_gpt4o(blocks, languages)
