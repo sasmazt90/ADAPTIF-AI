@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAuthenticatedEmail } from "@/lib/auth";
+import { getAuthenticatedOrDevelopmentUser } from "@/lib/auth";
 import { estimateLocalizeCredits, estimateResizeCredits } from "@/lib/credit-pricing";
 import { getCredits, spendCredits } from "@/lib/credits";
 
@@ -23,7 +23,7 @@ export async function POST(request: NextRequest) {
 
   try {
     const formData = await request.formData();
-    const userId = (await getAuthenticatedEmail(request)) ?? String(formData.get("user_id") ?? "guest");
+    const userId = await getAuthenticatedOrDevelopmentUser(request, String(formData.get("user_id") ?? "guest"));
     const estimatedCredits = estimateCredits(formData);
     const currentCredits = await getCredits(userId);
     if (currentCredits < estimatedCredits) {

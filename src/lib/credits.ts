@@ -89,7 +89,11 @@ export async function spendCredits(userId: string, credits: number) {
       const balance = await addCredits(normalized, -Math.trunc(credits), undefined, "system", "adapt_spend");
       return { ok: true, credits: balance };
     } catch {
-      return { ok: false, credits: await getCredits(normalized) };
+      try {
+        return { ok: false, credits: await getCredits(normalized) };
+      } catch {
+        return { ok: false, credits: 0 };
+      }
     }
   }
 

@@ -1,5 +1,9 @@
 import { getSupabaseAdmin, hasSupabaseServerConfig } from "@/lib/supabase";
 
+export function allowsDevelopmentUserFallback() {
+  return !hasSupabaseServerConfig() && process.env.NODE_ENV !== "production" && !process.env.VERCEL;
+}
+
 export async function getAuthenticatedEmail(request: Request) {
   if (!hasSupabaseServerConfig()) return null;
 
@@ -18,4 +22,17 @@ export async function getAuthenticatedEmail(request: Request) {
   }
 
   return email;
+}
+
+export async function requireAuthenticatedEmail(request: Request) {
+  const email = await getAuthenticatedEmail(request);
+  if (email) return email;
+  throw new Error("Authentication required.");
+}
+
+export async function getAuthenticatedOrDevelopmentUser(request: Request, fallbackUserId: string | null | undefined = "guest") {
+  const email = await getAuthenticatedEmail(request);
+  if (email) return email;
+  if (allowsDevelopmentUserFallback()) return fallbackUserId?.trim() || "guest";
+  throw new Error("Authentication required.");
 }

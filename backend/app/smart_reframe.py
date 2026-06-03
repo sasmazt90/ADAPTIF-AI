@@ -294,6 +294,13 @@ def preferred_zones_for(bucket: LogicBucket, width: int, height: int) -> tuple[B
 
 
 TARGET_MAP: dict[str, TargetCanvas] = {
+    "social-feed-square": _target("social-feed-square", ReframeTarget.SQUARE_1_1, 1080, 1080, LogicBucket.VERTICAL_SQUARE, [_safe_zone("social-feed-caption", "Caption and actions", 0, 820, 1000, 180)]),
+    "social-feed-portrait": _target("social-feed-portrait", ReframeTarget.VERTICAL_4_5, 1080, 1350, LogicBucket.VERTICAL_SQUARE, [_safe_zone("social-portrait-caption", "Caption and actions", 0, 860, 1000, 140)]),
+    "story-image": _target("story-image", ReframeTarget.STORY_9_16, 1080, 1920, LogicBucket.VERTICAL_SQUARE, [_safe_zone("story-header", "Story header", 0, 0, 1000, 120), _safe_zone("story-cta", "CTA/message area", 0, 860, 1000, 140)]),
+    "wide-landscape": _target("wide-landscape", ReframeTarget.LANDSCAPE_1_91_1, 1200, 628, LogicBucket.LANDSCAPE_WIDE, [_safe_zone("wide-actions", "Actions and link metadata", 0, 860, 1000, 140)]),
+    "google-responsive-landscape": _target("google-responsive-landscape", ReframeTarget.LANDSCAPE_1_91_1, 1200, 628, LogicBucket.LANDSCAPE_WIDE, [_safe_zone("g-rda-landscape-adchoices", "AdChoices corner", 860, 0, 140, 120)]),
+    "google-responsive-square": _target("google-responsive-square", ReframeTarget.SQUARE_1_1, 1200, 1200, LogicBucket.VERTICAL_SQUARE, [_safe_zone("g-rda-square-adchoices", "AdChoices corner", 860, 0, 140, 120)]),
+    "google-responsive-vertical": _target("google-responsive-vertical", ReframeTarget.STORY_9_16, 900, 1600, LogicBucket.VERTICAL_SQUARE, [_safe_zone("g-rda-vertical-adchoices", "AdChoices corner", 820, 0, 180, 100)]),
     "facebook-feed": _target("facebook-feed", ReframeTarget.SQUARE_1_1, 1080, 1080, LogicBucket.VERTICAL_SQUARE, [_safe_zone("fb-feed-footer", "Reaction + CTA footer", 0, 820, 1000, 180)]),
     "facebook-marketplace": _target("facebook-marketplace", ReframeTarget.SQUARE_1_1, 1080, 1080, LogicBucket.VERTICAL_SQUARE, [_safe_zone("marketplace-meta", "Listing details", 0, 760, 1000, 240)]),
     "facebook-right-column": _target("facebook-right-column", ReframeTarget.LANDSCAPE_1_91_1, 1200, 628, LogicBucket.LANDSCAPE_WIDE, [_safe_zone("fb-column-meta", "Headline + CTA", 0, 700, 1000, 300)]),

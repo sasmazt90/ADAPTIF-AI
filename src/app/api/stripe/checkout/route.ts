@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getAuthenticatedEmail } from "@/lib/auth";
+import { getAuthenticatedOrDevelopmentUser } from "@/lib/auth";
 import { creditPacks, CreditPackId, getStripe, getStripeEnv } from "@/lib/stripe";
 
 function cleanOrigin(value: string | null | undefined) {
@@ -51,7 +51,7 @@ async function createCheckoutSessionWithRest({
 export async function POST(request: NextRequest) {
   try {
     const body = (await request.json()) as { pack?: CreditPackId; user_id?: string };
-    const userId = (await getAuthenticatedEmail(request)) ?? body.user_id ?? "guest";
+    const userId = await getAuthenticatedOrDevelopmentUser(request, body.user_id ?? "guest");
     const packId = body.pack ?? "starter";
     const pack = creditPacks[packId];
 

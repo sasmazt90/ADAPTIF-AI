@@ -269,12 +269,17 @@ class EditRequest(BaseModel):
 
 
 app = FastAPI(title="AdaptifAI Backend", version="0.2.0")
+cors_origins = [
+    origin.strip()
+    for origin in os.getenv("ADAPTIFAI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(",")
+    if origin.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=os.getenv("ADAPTIFAI_CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000").split(","),
+    allow_origins=cors_origins,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["authorization", "content-type", "accept", "x-requested-with"],
 )
 
 
@@ -9587,12 +9592,33 @@ def safe_zone_warnings_for(placement_id: str) -> list[str]:
 
 
 PLACEMENT_ID_ALIASES = {
-    "meta-feed": "facebook-feed",
-    "meta-marketplace": "facebook-marketplace",
-    "meta-right-column": "facebook-right-column",
-    "meta-stories": "instagram-story",
-    "tiktok-branded": "tiktok-branded-content",
-    "youtube-16x9": "youtube-instream",
+    "meta-feed": "social-feed-square",
+    "facebook-feed": "social-feed-square",
+    "facebook-marketplace": "social-feed-square",
+    "instagram-feed": "social-feed-square",
+    "linkedin-single-square": "social-feed-square",
+    "meta-marketplace": "social-feed-square",
+    "meta-right-column": "wide-landscape",
+    "facebook-right-column": "wide-landscape",
+    "linkedin-single-wide": "wide-landscape",
+    "linkedin-sponsored": "wide-landscape",
+    "meta-stories": "story-image",
+    "instagram-story": "story-image",
+    "snap-top-snap": "story-image",
+    "snap-story-ad": "story-image",
+    "instagram-reels": "story-image",
+    "tiktok-in-feed": "story-image",
+    "tiktok-topview": "story-image",
+    "tiktok-branded": "story-image",
+    "tiktok-branded-content": "story-image",
+    "youtube-16x9": "google-responsive-landscape",
+    "youtube-instream": "google-responsive-landscape",
+    "youtube-shorts": "story-image",
+    "gdn-300x250": "google-responsive-square",
+    "gdn-728x90": "google-responsive-landscape",
+    "gdn-160x600": "google-responsive-vertical",
+    "gdn-320x50": "google-responsive-landscape",
+    "gdn-300x600": "google-responsive-vertical",
     "native-custom": "custom-display",
 }
 
@@ -10654,7 +10680,7 @@ def merge_resize_warnings(placement_id: str, plan: Any | None = None) -> list[st
     return merged
 
 
-def build_resize_assets(paths: list[Path], placement_ids: list[str], output_format: str, custom_width: int | None, custom_height: int | None, job_dir: Path, creative_modes: dict[str, str] | None = None) -> tuple[list[OutputAsset], list[dict[str, Any]]]:
+async def build_resize_assets(paths: list[Path], placement_ids: list[str], output_format: str, custom_width: int | None, custom_height: int | None, job_dir: Path, creative_modes: dict[str, str] | None = None) -> tuple[list[OutputAsset], list[dict[str, Any]]]:
     outputs: list[OutputAsset] = []
     manifest_assets: list[dict[str, Any]] = []
     canonical_placement_ids = list(dict.fromkeys(canonical_placement_id(item) for item in placement_ids))
@@ -10674,7 +10700,7 @@ def build_resize_assets(paths: list[Path], placement_ids: list[str], output_form
         visual_analysis = build_smart_reframe_analysis(source_image, focus_bbox)
         reframe_plans = {
             plan.placement_id: plan
-            for plan in SmartReframe(visual_analysis).execute_sync(canonical_placement_ids, custom_width, custom_height)
+            for plan in await SmartReframe(visual_analysis).execute(canonical_placement_ids, custom_width, custom_height)
         }
         source_entries.append(
             {
@@ -11171,7 +11197,7 @@ async def adapt(
         outputs, translations, manifest_assets = build_localize_assets(uploaded_images, languages, output_format, job_dir)
         extracted_blocks = outputs[0].extracted_blocks if outputs else []
     else:
-        outputs, manifest_assets = build_resize_assets(uploaded_images, placement_ids, output_format, custom_width, custom_height, job_dir, creative_modes=parsed_creative_modes)
+        outputs, manifest_assets = await build_resize_assets(uploaded_images, placement_ids, output_format, custom_width, custom_height, job_dir, creative_modes=parsed_creative_modes)
         translations = {}
         extracted_blocks = []
 

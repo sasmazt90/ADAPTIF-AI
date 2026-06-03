@@ -10,25 +10,38 @@ import {
   CloudUpload,
   CreditCard,
   Download,
+  Bell,
+  Bookmark,
+  BriefcaseBusiness,
   FileArchive,
   Frame,
+  Globe2,
+  Heart,
+  Home,
   Languages,
   Loader2,
   LogIn,
   LogOut,
+  Menu,
+  MessageCircle,
+  MoreHorizontal,
   Scissors,
+  Search,
+  Send,
   Settings2,
   Shield,
   Sparkles,
   Type,
   User,
+  Users,
+  X,
   XCircle,
 } from "lucide-react";
 import type { User as SupabaseUser } from "@supabase/supabase-js";
 import { FormEvent, ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { creditPricing, estimateEditCredits, estimateLocalizeCredits, estimateResizeCredits } from "@/lib/credit-pricing";
 import { languages, outputFormats, Placement, placements } from "@/lib/placements";
-import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata as PlatformPreviewMetadata } from "@/lib/preview-templates";
+import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata as PlatformPreviewMetadata, type PreviewTemplateKind } from "@/lib/preview-templates";
 import { getSupabaseBrowser, hasSupabaseBrowserConfig } from "@/lib/supabase-client";
 
 type Mode = "adapt" | "resize";
@@ -62,7 +75,52 @@ function formatCreditText(value: number) {
   return `${value} credit${value === 1 ? "" : "s"}`;
 }
 
-const platformOrder = ["META", "TIKTOK", "GOOGLE", "SNAPCHAT", "LINKEDIN", "NATIVE/WEB"];
+const platformOrder = ["SOCIAL", "GOOGLE", "CUSTOM"];
+type PreviewVariant = {
+  id: string;
+  label: string;
+  device: "Mobile" | "Desktop";
+  templateId: PreviewTemplateKind;
+};
+
+const previewVariantsByPlacement: Record<string, PreviewVariant[]> = {
+  "social-feed-square": [
+    { id: "instagram-feed-mobile", label: "Instagram Feed", device: "Mobile", templateId: "instagram_feed" },
+    { id: "facebook-feed-mobile", label: "Facebook Feed", device: "Mobile", templateId: "facebook_feed" },
+    { id: "linkedin-feed-mobile-square", label: "LinkedIn Feed", device: "Mobile", templateId: "linkedin_mobile_feed" },
+    { id: "linkedin-feed-desktop-square", label: "LinkedIn Feed", device: "Desktop", templateId: "linkedin_single_image_1080x1080" },
+  ],
+  "social-feed-portrait": [
+    { id: "instagram-feed-mobile-portrait", label: "Instagram Feed", device: "Mobile", templateId: "social_feed_portrait" },
+    { id: "facebook-feed-mobile-portrait", label: "Facebook Feed", device: "Mobile", templateId: "facebook_feed" },
+  ],
+  "story-image": [
+    { id: "instagram-story-mobile", label: "Instagram Story", device: "Mobile", templateId: "story_image" },
+    { id: "facebook-story-mobile", label: "Facebook Story", device: "Mobile", templateId: "story_image" },
+    { id: "snapchat-story-mobile", label: "Snapchat Story", device: "Mobile", templateId: "snap_story_ad" },
+  ],
+  "wide-landscape": [
+    { id: "linkedin-wide-mobile", label: "LinkedIn Feed", device: "Mobile", templateId: "linkedin_mobile_feed" },
+    { id: "linkedin-wide-desktop", label: "LinkedIn Feed", device: "Desktop", templateId: "wide_landscape" },
+    { id: "facebook-right-column-desktop", label: "Facebook Right Column", device: "Desktop", templateId: "facebook_right_column" },
+  ],
+  "google-responsive-landscape": [
+    { id: "google-rda-landscape-desktop", label: "Google Responsive Display", device: "Desktop", templateId: "google_responsive_landscape" },
+  ],
+  "google-responsive-square": [
+    { id: "google-rda-square-desktop", label: "Google Responsive Display", device: "Desktop", templateId: "google_responsive_square" },
+  ],
+  "google-responsive-vertical": [
+    { id: "google-rda-vertical-mobile", label: "Google Responsive Display", device: "Mobile", templateId: "google_responsive_vertical" },
+  ],
+  "custom-display": [
+    { id: "custom-web-desktop", label: "Custom Web Preview", device: "Desktop", templateId: "custom_display" },
+  ],
+};
+
+function previewVariantsForPlacement(placementId: string) {
+  return previewVariantsByPlacement[placementId] ?? previewVariantsByPlacement["custom-display"];
+}
 const sampleCopy = {
   adapt: "Launch faster with localized ads",
   resize: "Creative resized for every paid channel",
@@ -366,7 +424,7 @@ function LandingPage({
 }
 
 function Creative({ placement, copy, mode, x, y, opacity, scale, fit, imageUrl }: { placement: Placement; copy: string; mode: Mode; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string }) {
-  const box = placement.ratio === "9:16" ? { x: 10 + x, y: 30 + y, width: 62, height: 18 } : { x: 9 + x, y: 32 + y, width: 58, height: 20 };
+  const box = placement.ratio === "9:16" ? { x: 10 + x, y: 34 + y, width: 62, height: 14 } : { x: 9 + x, y: 34 + y, width: 58, height: 18 };
   return (
     <div className="relative overflow-hidden bg-[#f0d553]" style={{ aspectRatio: `${placement.width} / ${placement.height}` }}>
       {imageUrl ? (
@@ -379,15 +437,15 @@ function Creative({ placement, copy, mode, x, y, opacity, scale, fit, imageUrl }
       ) : (
         <>
           <div
-            className={["absolute inset-0 bg-[linear-gradient(135deg,#f9f4e8_0%,#f0d553_34%,#38b6a6_68%,#171717_100%)]", fit === "fill" ? "blur-[1px]" : ""].join(" ")}
+            className={["absolute inset-0 bg-[linear-gradient(135deg,#f9f4e8_0%,#f0d553_34%,#38b6a6_72%,#172320_100%)]", fit === "fill" ? "blur-[1px]" : ""].join(" ")}
             style={{ transform: `scale(${scale / 100})` }}
           />
-          <div className="absolute left-[8%] top-[12%] h-[18%] w-[28%] rounded-[50%] bg-white/80" />
-          <div className="absolute bottom-[10%] right-[8%] h-[28%] w-[44%] bg-[#ee4d6a]/80" />
-          <div className="absolute left-[12%] top-[22%] h-[24%] w-[58%] rounded bg-[#ff4d4d]/20" style={{ opacity: opacity / 100 }} />
+          <div className="absolute left-[8%] top-[13%] h-[16%] w-[28%] rounded-full bg-white/70" />
+          <div className="absolute bottom-[12%] right-[8%] h-[24%] w-[38%] rounded-sm bg-[#ee4d6a]/70" />
+          <div className="absolute left-[12%] top-[25%] h-[18%] w-[54%] rounded bg-white/10" style={{ opacity: Math.max(0.18, opacity / 140) }} />
           <div className="absolute flex flex-col justify-center" style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, minHeight: `${box.height}%` }}>
-            <p className="max-w-full text-[clamp(10px,2.2vw,24px)] font-black uppercase leading-tight text-[#111] [text-shadow:0_1px_0_rgba(255,255,255,0.75)]">{cleanCopy(copy || sampleCopy[mode])}</p>
-            <p className="mt-1 max-w-[72%] text-[clamp(8px,1.1vw,13px)] font-semibold leading-tight text-[#26302d] [text-shadow:0_1px_0_rgba(255,255,255,0.65)]">{mode === "adapt" ? "Localized copy preview" : "Resize-safe preview"}</p>
+            <p className="max-w-full text-[clamp(9px,1.25vw,14px)] font-black uppercase leading-tight text-[#111] [text-shadow:0_1px_0_rgba(255,255,255,0.55)]">{cleanCopy(copy || sampleCopy[mode]).slice(0, 42)}</p>
+            <p className="mt-1 max-w-[82%] text-[clamp(7px,0.8vw,10px)] font-semibold leading-tight text-[#26302d] [text-shadow:0_1px_0_rgba(255,255,255,0.45)]">Preview placeholder</p>
           </div>
         </>
       )}
@@ -561,8 +619,39 @@ function CreativeModeControl({
   );
 }
 
-function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, imageUrl, metadata }: { placement: Placement; mode: Mode; device: Device; copy: string; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string; metadata: PreviewMetadata }) {
+function PhoneChrome({ children, dark = false }: { children: ReactNode; dark?: boolean }) {
+  return (
+    <div className="mx-auto w-full max-w-[328px] rounded-[42px] border-[10px] border-[#111] bg-[#111] shadow-2xl">
+      <div className={["relative overflow-hidden rounded-[31px]", dark ? "bg-[#050506]" : "bg-white"].join(" ")}>
+        <div className="pointer-events-none absolute left-1/2 top-2 z-30 h-6 w-24 -translate-x-1/2 rounded-full bg-black/90" />
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function BrandAvatar({ label, className = "" }: { label: string; className?: string }) {
+  return (
+    <div className={["grid place-items-center rounded-full bg-[#111] text-xs font-black text-white", className].join(" ")}>
+      {label.slice(0, 1).toUpperCase()}
+    </div>
+  );
+}
+
+function InstagramActionBar() {
+  return (
+    <div className="flex items-center gap-4 px-4 py-3 text-[#111]">
+      <Heart className="h-6 w-6" strokeWidth={2.2} />
+      <MessageCircle className="h-6 w-6" strokeWidth={2.2} />
+      <Send className="h-6 w-6" strokeWidth={2.2} />
+      <Bookmark className="ml-auto h-6 w-6" strokeWidth={2.2} />
+    </div>
+  );
+}
+
+function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, imageUrl, metadata, previewTemplateId }: { placement: Placement; mode: Mode; device: Device; copy: string; x: number; y: number; opacity: number; scale: number; fit: FitMode; imageUrl?: string; metadata: PreviewMetadata; previewTemplateId?: PreviewTemplateKind }) {
   const template = placementPreviewTemplates[placement.id] ?? placementPreviewTemplates["custom-display"];
+  const shellTemplateId = previewTemplateId ?? template.id;
   const box = placement.ratio === "9:16" ? { x: 9 + x, y: 28 + y, width: 65, height: 24 } : { x: 8 + x, y: 30 + y, width: 62, height: 26 };
   const warnings = placement.safeZones.filter((zone) => overlaps(zone, box));
   const carouselAssets = metadata.carouselAssets?.filter(Boolean) ?? [];
@@ -587,7 +676,129 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
   const framedCreative = <AdFrame placement={placement}>{asset}</AdFrame>;
   let shell: ReactNode = null;
 
-  if (template.id === "facebook_feed") {
+  if (shellTemplateId === "social_feed_square" || shellTemplateId === "social_feed_portrait") {
+    shell = (
+      <PhoneChrome>
+        <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
+          <span>10:11</span>
+          <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
+        </div>
+        <div className="flex items-center justify-between border-b border-[#eceff3] px-4 py-2">
+          <p className="font-serif text-[28px] font-black tracking-normal">Instagram</p>
+          <div className="flex items-center gap-4"><Heart className="h-6 w-6" /><Send className="h-6 w-6" /></div>
+        </div>
+        <div className="flex items-center justify-between px-4 py-3">
+          <div className="flex items-center gap-2">
+            <div className="rounded-full bg-gradient-to-tr from-[#f7b733] via-[#d62976] to-[#4f5bd5] p-[2px]">
+              <BrandAvatar label={metadata.brandName} className="h-9 w-9 border-2 border-white" />
+            </div>
+            <div><p className="text-[13px] font-bold leading-4">{metadata.username}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
+          </div>
+          <MoreHorizontal className="h-5 w-5 text-[#333]" />
+        </div>
+        <div className="bg-black">{asset}</div>
+        <InstagramActionBar />
+        <div className="space-y-1 px-4 pb-4 text-[12px] leading-4">
+          <p className="font-semibold">{metadata.likesLabel}</p>
+          <p><span className="font-bold">{metadata.username}</span> {metadata.headline}</p>
+          <p className="text-[#555]">{metadata.description}</p>
+          <p className="text-[#777]">{metadata.commentsLabel}</p>
+          <button type="button" className="mt-2 rounded-full border border-[#0b66c3] px-4 py-1.5 text-[11px] font-bold text-[#0b66c3]">{metadata.ctaText}</button>
+        </div>
+        <div className="grid grid-cols-5 border-t border-[#eceff3] px-5 py-3 text-[#111]">
+          <Home className="h-5 w-5" /><Search className="h-5 w-5" /><div className="h-5 w-5 rounded-md border-2 border-[#111]" /><BriefcaseBusiness className="h-5 w-5" /><User className="h-5 w-5" />
+        </div>
+      </PhoneChrome>
+    );
+  } else if (shellTemplateId === "story_image") {
+    shell = (
+      <PhoneChrome dark>
+        <div className="relative">
+          <div className="absolute inset-x-4 top-4 z-20 flex gap-1">{Array.from({ length: 4 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
+          <div className="absolute left-4 right-4 top-9 z-20 flex items-center justify-between text-white">
+            <div className="flex items-center gap-2">
+              <div className="rounded-full bg-gradient-to-tr from-[#f7b733] via-[#d62976] to-[#4f5bd5] p-[2px]">
+                <BrandAvatar label={metadata.brandName} className="h-9 w-9 border-2 border-black/20" />
+              </div>
+              <div><p className="text-[13px] font-bold leading-4">{metadata.username}</p><p className="text-[10px] text-white/75">{metadata.sponsorLabel}</p></div>
+            </div>
+            <X className="h-6 w-6" />
+          </div>
+          <div>{asset}</div>
+          <div className="absolute inset-x-7 bottom-20 z-20 grid place-items-center">
+            <button type="button" className="rounded-full bg-white px-7 py-3 text-[14px] font-black text-[#111] shadow-lg">{metadata.ctaText}</button>
+          </div>
+          <div className="absolute inset-x-5 bottom-5 z-20 rounded-full border border-white/55 px-5 py-3 text-[13px] font-semibold text-white">Send message</div>
+        </div>
+      </PhoneChrome>
+    );
+  } else if (shellTemplateId === "linkedin_mobile_feed") {
+    shell = (
+      <PhoneChrome>
+        <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
+          <span>10:11</span>
+          <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
+        </div>
+        <div className="flex items-center gap-3 border-b border-[#d6d9de] bg-white px-4 py-3">
+          <div className="grid h-8 w-8 place-items-center rounded bg-[#0a66c2] text-lg font-black text-white">in</div>
+          <div className="flex h-8 flex-1 items-center gap-2 rounded-md bg-[#eef3f8] px-3 text-[#586069]"><Search className="h-4 w-4" /><span className="text-xs">Search</span></div>
+          <MessageCircle className="h-5 w-5 text-[#555]" />
+        </div>
+        <article className="bg-white">
+          <div className="flex items-center justify-between px-4 py-3">
+            <div className="flex items-center gap-3"><BrandAvatar label={metadata.brandName} className="h-10 w-10" /><div><p className="text-[13px] font-bold">{metadata.brandName}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div></div>
+            <MoreHorizontal className="h-5 w-5 text-[#555]" />
+          </div>
+          <p className="px-4 pb-3 text-[12px] leading-4 text-[#222]">{metadata.description}</p>
+          <div>{asset}</div>
+          <div className="px-4 py-3"><p className="text-[14px] font-bold">{metadata.headline}</p><button type="button" className="mt-2 rounded-full border border-[#0a66c2] px-4 py-1.5 text-[11px] font-bold text-[#0a66c2]">{metadata.ctaText}</button></div>
+          <div className="grid grid-cols-4 border-t border-[#edf0f3] px-4 py-3 text-center text-[11px] font-semibold text-[#666]"><span>Like</span><span>Comment</span><span>Share</span><span>Send</span></div>
+        </article>
+        <div className="grid grid-cols-5 border-t border-[#d6d9de] px-5 py-3 text-[#555]">
+          <Home className="h-5 w-5" /><Users className="h-5 w-5" /><BriefcaseBusiness className="h-5 w-5" /><Bell className="h-5 w-5" /><User className="h-5 w-5" />
+        </div>
+      </PhoneChrome>
+    );
+  } else if (shellTemplateId === "wide_landscape") {
+    shell = (
+      <div className="mx-auto w-full max-w-[900px] overflow-hidden rounded-xl border border-[#d6d9de] bg-[#f3f2ef] shadow-xl">
+        <div className="flex items-center gap-6 border-b border-[#d6d9de] bg-white px-6 py-3">
+          <div className="grid h-10 w-10 place-items-center rounded bg-[#0a66c2] text-2xl font-black text-white">in</div>
+          <div className="flex h-10 flex-1 items-center gap-2 rounded-md bg-[#eef3f8] px-3 text-[#586069]"><Search className="h-4 w-4" /><span className="text-sm">Search</span></div>
+          <Home className="h-5 w-5 text-[#555]" /><Users className="h-5 w-5 text-[#555]" /><BriefcaseBusiness className="h-5 w-5 text-[#555]" /><MessageCircle className="h-5 w-5 text-[#555]" /><Bell className="h-5 w-5 text-[#555]" />
+        </div>
+        <div className="grid gap-5 p-5 md:grid-cols-[240px_minmax(0,1fr)_220px]">
+          <aside className="hidden rounded-xl border border-[#d6d9de] bg-white p-4 md:block"><BrandAvatar label={metadata.brandName} className="mx-auto h-16 w-16" /><p className="mt-3 text-center text-lg font-bold">{metadata.brandName}</p><p className="text-center text-xs text-[#666]">Sponsored profile</p></aside>
+          <article className="overflow-hidden rounded-xl border border-[#d6d9de] bg-white">
+            <div className="flex items-center justify-between px-4 py-3"><div className="flex items-center gap-3"><BrandAvatar label={metadata.brandName} className="h-11 w-11" /><div><p className="text-sm font-bold">{metadata.brandName}</p><p className="text-xs text-[#666]">{metadata.sponsorLabel}</p></div></div><MoreHorizontal className="h-5 w-5 text-[#555]" /></div>
+            <div className="px-4 pb-3 text-sm text-[#222]">{metadata.description}</div>
+            <div>{asset}</div>
+            <div className="px-4 py-3"><p className="text-lg font-bold">{metadata.headline}</p><button type="button" className="mt-2 rounded-full border border-[#0a66c2] px-4 py-1.5 text-sm font-bold text-[#0a66c2]">{metadata.ctaText}</button></div>
+            <div className="grid grid-cols-4 border-t border-[#edf0f3] px-4 py-2 text-xs font-semibold text-[#666]"><span>Like</span><span>Comment</span><span>Share</span><span>Send</span></div>
+          </article>
+          <aside className="hidden rounded-xl border border-[#d6d9de] bg-white p-4 md:block"><p className="text-lg font-bold">LinkedIn News</p><p className="mt-3 text-sm font-semibold">{metadata.headline}</p><p className="mt-2 text-xs text-[#666]">Promoted insight</p></aside>
+        </div>
+      </div>
+    );
+  } else if (shellTemplateId === "google_responsive_landscape" || shellTemplateId === "google_responsive_square" || shellTemplateId === "google_responsive_vertical") {
+    shell = (
+      <div className="mx-auto w-full max-w-[880px] overflow-hidden rounded-xl border border-[#dfe1e5] bg-white shadow-xl">
+        <div className="flex items-center gap-2 border-b border-[#dfe1e5] bg-[#f8fafd] px-4 py-2 text-xs text-[#5f6368]">
+          <span className="h-3 w-3 rounded-full bg-[#ea4335]" /><span className="h-3 w-3 rounded-full bg-[#fbbc04]" /><span className="h-3 w-3 rounded-full bg-[#34a853]" /><span className="ml-2 flex flex-1 items-center gap-2 rounded-full bg-white px-3 py-1"><Globe2 className="h-3.5 w-3.5" /> publisher.example/article</span><Menu className="h-4 w-4" />
+        </div>
+        <div className="grid gap-5 p-5 md:grid-cols-[minmax(0,1fr)_280px]">
+          <main className="space-y-3"><h3 className="text-2xl font-black">Article headline with responsive ad slot</h3><p className="text-sm leading-6 text-[#555]">Publisher content surrounds the responsive image asset so the advertiser can preview density, crop pressure and text legibility.</p><div className="h-28 rounded-lg bg-[#f1f3f4]" /></main>
+          <aside className="overflow-hidden rounded-xl border border-[#dfe1e5] bg-white">
+            <div className="flex items-center justify-between border-b border-[#edf0f3] px-3 py-2 text-[10px] font-bold uppercase text-[#5f6368]"><span>Advertisement</span><span>Ad</span></div>
+            <div className="p-3">{framedCreative}</div>
+            <div className="space-y-1 border-t border-[#edf0f3] px-3 py-3"><p className="text-sm font-bold">{metadata.headline}</p><p className="text-xs text-[#5f6368]">{metadata.description}</p><button type="button" className="mt-2 rounded bg-[#1a73e8] px-3 py-1.5 text-xs font-bold text-white">{metadata.ctaText}</button></div>
+          </aside>
+        </div>
+      </div>
+    );
+  }
+
+  if (!shell && shellTemplateId === "facebook_feed") {
     shell = (
       <div className="mx-auto w-full max-w-[440px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-[#eff2f7] px-4 py-3">
@@ -608,7 +819,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "instagram_feed") {
+  } else if (!shell && (shellTemplateId === "social_feed_square" || shellTemplateId === "social_feed_portrait" || shellTemplateId === "instagram_feed")) {
     shell = (
       <div className="mx-auto w-full max-w-[420px] overflow-hidden rounded-[28px] border border-[#151515]/10 bg-white shadow-xl">
         <div className="flex items-center justify-between px-4 py-3">
@@ -631,7 +842,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "instagram_story") {
+  } else if (!shell && (shellTemplateId === "story_image" || shellTemplateId === "instagram_story")) {
     shell = (
       <div className="relative mx-auto w-full max-w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl">
         <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 5 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
@@ -643,7 +854,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         <div className="absolute inset-x-4 bottom-4 z-20 rounded-full bg-white px-4 py-3 text-center text-[12px] font-black text-[#111] shadow-lg">{metadata.ctaText}</div>
       </div>
     );
-  } else if (template.id === "instagram_reels") {
+  } else if (shellTemplateId === "instagram_reels") {
     shell = (
       <div className="relative mx-auto w-full max-w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl text-white">
         <div className="relative">{asset}</div>
@@ -657,7 +868,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "facebook_marketplace") {
+  } else if (shellTemplateId === "facebook_marketplace") {
     shell = (
       <div className="mx-auto w-full max-w-[440px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-[#f3f4f8] shadow-xl">
         <div className="border-b border-[#dde2ec] bg-white px-4 py-3">
@@ -684,7 +895,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "facebook_right_column") {
+  } else if (shellTemplateId === "facebook_right_column") {
     shell = (
       <div className="mx-auto w-full max-w-[560px] overflow-hidden rounded-2xl border border-[#dde2ec] bg-white shadow-xl">
         <div className="border-b border-[#eff2f7] px-4 py-3 text-[12px] font-semibold text-[#666]">facebook.com / Sponsored</div>
@@ -696,7 +907,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "tiktok_infeed") {
+  } else if (shellTemplateId === "tiktok_infeed") {
     shell = (
       <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
         <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-6 w-28 -translate-x-1/2 rounded-full bg-black/90" />
@@ -713,7 +924,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "tiktok_topview") {
+  } else if (shellTemplateId === "tiktok_topview") {
     shell = (
       <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
         <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-6 w-28 -translate-x-1/2 rounded-full bg-black/90" />
@@ -730,7 +941,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         <button type="button" className="absolute bottom-4 left-4 z-20 rounded-full bg-[#f8d948] px-4 py-2 text-[11px] font-black text-[#111]">{metadata.ctaText}</button>
       </div>
     );
-  } else if (template.id === "tiktok_branded_content") {
+  } else if (shellTemplateId === "tiktok_branded_content") {
     shell = (
       <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
         <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
@@ -745,7 +956,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "youtube_instream") {
+  } else if (shellTemplateId === "youtube_instream") {
     shell = (
       <div className="mx-auto w-full max-w-[620px] overflow-hidden rounded-2xl bg-[#0f0f0f] text-white shadow-xl">
         <div className="relative">{asset}<div className="absolute left-3 top-3 rounded bg-black/70 px-2 py-1 text-[10px] font-bold">Ad 0:06</div><div className="absolute bottom-0 left-0 right-0 h-1 bg-white/15"><div className="h-1 w-1/3 bg-[#ff0033]" /></div></div>
@@ -756,7 +967,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "youtube_shorts") {
+  } else if (shellTemplateId === "youtube_shorts") {
     shell = (
       <div className="relative mx-auto w-[286px] overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#0c0c0f] text-white shadow-2xl">
         <div className="relative overflow-hidden rounded-[32px]">{asset}</div>
@@ -770,11 +981,12 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (
-    template.id === "linkedin_single_image_1200x628" ||
-    template.id === "linkedin_single_image_1080x1080" ||
-    template.id === "linkedin_sponsored_content"
-  ) {
+  } else if (!shell && (
+    shellTemplateId === "wide_landscape" ||
+    shellTemplateId === "linkedin_single_image_1200x628" ||
+    shellTemplateId === "linkedin_single_image_1080x1080" ||
+    shellTemplateId === "linkedin_sponsored_content"
+  )) {
     shell = (
       <div className="mx-auto w-full max-w-[560px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
         <div className="flex items-center gap-3 border-b border-[#eff2f7] px-4 py-3">
@@ -792,7 +1004,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (template.id === "snap_top_snap") {
+  } else if (shellTemplateId === "snap_top_snap") {
     shell = (
       <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
         <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-5 w-24 -translate-x-1/2 rounded-full bg-black/85" />
@@ -801,7 +1013,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
       </div>
     );
-  } else if (template.id === "snap_story_ad") {
+  } else if (shellTemplateId === "snap_story_ad") {
     shell = (
       <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
         <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 4 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
@@ -810,38 +1022,56 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
       </div>
     );
-  } else if (template.id === "gdn_300x250") {
+  } else if (!shell && (shellTemplateId === "google_responsive_landscape" || shellTemplateId === "google_responsive_square" || shellTemplateId === "google_responsive_vertical")) {
+    shell = (
+      <div className="mx-auto w-full max-w-[660px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-[#eef2f7] bg-[#f7f8fb] px-3 py-2 text-[10px] font-semibold text-[#667085]">
+          <span>Google Responsive Display</span>
+          <span>Ad</span>
+        </div>
+        <div className="grid gap-3 p-3 md:grid-cols-[minmax(0,1fr)_220px]">
+          <div>{framedCreative}</div>
+          <div className="flex flex-col justify-center rounded-lg bg-[#f7f8fb] p-3">
+            <p className="text-[10px] font-black uppercase text-[#667085]">Responsive ad preview</p>
+            <p className="mt-2 text-sm font-black">{metadata.headline}</p>
+            <p className="mt-1 text-xs text-[#555]">{metadata.description}</p>
+            <button type="button" className="mt-3 w-fit rounded-md bg-[#1a73e8] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+          </div>
+        </div>
+      </div>
+    );
+  } else if (shellTemplateId === "gdn_300x250") {
     shell = (
       <div className="mx-auto w-[300px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-[#eef2f7] bg-[#f7f8fb] px-3 py-2 text-[10px] font-semibold text-[#667085]"><span>Display Ad</span><span>Ad</span></div>
         <div className="p-2">{framedCreative}</div>
       </div>
     );
-  } else if (template.id === "gdn_728x90") {
+  } else if (shellTemplateId === "gdn_728x90") {
     shell = (
       <div className="mx-auto w-full max-w-[760px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="p-2">{framedCreative}</div>
       </div>
     );
-  } else if (template.id === "gdn_160x600") {
+  } else if (shellTemplateId === "gdn_160x600") {
     shell = (
       <div className="mx-auto w-[184px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="p-2">{framedCreative}</div>
       </div>
     );
-  } else if (template.id === "gdn_320x50") {
+  } else if (shellTemplateId === "gdn_320x50") {
     shell = (
       <div className="mx-auto w-[344px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="p-2">{framedCreative}</div>
       </div>
     );
-  } else if (template.id === "gdn_300x600") {
+  } else if (shellTemplateId === "gdn_300x600") {
     shell = (
       <div className="mx-auto w-[324px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="p-2">{framedCreative}</div>
       </div>
     );
-  } else if (template.id.startsWith("gdn_")) {
+  } else if (shellTemplateId.startsWith("gdn_")) {
     shell = (
       <div className="mx-auto w-full max-w-[640px] overflow-hidden rounded-xl border border-[#d3d7df] bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-[#eef2f7] bg-[#f7f8fb] px-3 py-2 text-[10px] font-semibold text-[#667085]">
@@ -851,7 +1081,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         <div className="p-3">{framedCreative}</div>
       </div>
     );
-  } else {
+  } else if (!shell) {
     shell = (
       <div className="mx-auto w-full max-w-[640px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
         <div className="flex items-center gap-2 border-b bg-[#f7f7f7] px-3 py-2"><span className="h-2.5 w-2.5 rounded-full bg-[#ee4d6a]" /><span className="h-2.5 w-2.5 rounded-full bg-[#f0d553]" /><span className="h-2.5 w-2.5 rounded-full bg-[#38b6a6]" /><span className="ml-2 rounded bg-white px-2 py-1 text-[9px] text-[#666]">publisher.example/feature</span></div>
@@ -959,7 +1189,8 @@ export function AdaptDashboard() {
   const grouped = useMemo(() => platformOrder.map((p) => [p, placements.filter((x) => x.platform === p)] as const), []);
   const [mode, setMode] = useState<Mode>("adapt");
   const [selectedPlacementIds, setSelectedPlacementIds] = useState<string[]>([]);
-  const [activePlacementId, setActivePlacementId] = useState("instagram-story");
+  const [activePlacementId, setActivePlacementId] = useState("story-image");
+  const [activePreviewVariantId, setActivePreviewVariantId] = useState("instagram-story-mobile");
   const [creativeModesByPlacement, setCreativeModesByPlacement] = useState<Record<string, CreativeMode>>({});
   const [selectedLanguages, setSelectedLanguages] = useState<string[]>([]);
   const [selectedFormat, setSelectedFormat] = useState("PNG");
@@ -1017,6 +1248,8 @@ export function AdaptDashboard() {
       ratio: `${customWidth}x${customHeight}`,
     };
   }, [activePlacementId, customHeight, customWidth]);
+  const activePreviewVariants = previewVariantsForPlacement(activePlacement.id);
+  const activePreviewVariant = activePreviewVariants.find((variant) => variant.id === activePreviewVariantId) ?? activePreviewVariants[0];
   const currentUserEmail = authUser?.email ?? userId;
   const activeCreativeMode = activePlacement.supportsCarousel ? (creativeModesByPlacement[activePlacement.id] ?? "single") : "single";
   const isAdmin = currentUserEmail.trim().toLowerCase() === (process.env.NEXT_PUBLIC_ADMIN_EMAIL ?? "tolgar@sasmaz.digital").trim().toLowerCase();
@@ -1064,7 +1297,7 @@ export function AdaptDashboard() {
     },
     [activePlacement, activePlacementId, activeResizeOutput, carouselPreviewAssets, copy, creativeModesByPlacement, currentUserEmail, result?.outputs],
   );
-  const [previewMetadata, setPreviewMetadata] = useState<PreviewMetadata>(derivedPreviewMetadata);
+  const previewMetadata = derivedPreviewMetadata;
   const estimatedRunCredits = files.length === 0 ? 0 : mode === "adapt"
     ? estimateLocalizeCredits({ fileCount: files.length, languageCount: selectedLanguages.length, outputFormat: selectedFormat })
     : estimateResizeCredits({ fileCount: files.length, dimensionCount: selectedPlacementIds.length, outputFormat: selectedFormat });
@@ -1119,10 +1352,6 @@ export function AdaptDashboard() {
     fetch(`/api/credits?user_id=${encodeURIComponent(currentUserEmail)}`, { headers: sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined })
       .then((r) => r.json()).then((p) => setCredits(Number(p.credits ?? 0))).catch(() => undefined);
   }, [currentUserEmail, sessionToken, supabaseConfigured]);
-
-  useEffect(() => {
-    setPreviewMetadata(derivedPreviewMetadata);
-  }, [derivedPreviewMetadata]);
 
   const togglePlacement = (id: string) => {
     setSelectedPlacementIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
@@ -1640,6 +1869,9 @@ export function AdaptDashboard() {
                 <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={activePlacementId} onChange={(e) => setActivePlacementId(e.target.value)}>
                   {(selectedPlacementIds.length ? placements.filter((placement) => selectedPlacementIds.includes(placement.id)) : placements).map((placement) => <option key={placement.id} value={placement.id}>{placement.platform} / {placement.label} / {placement.id === "custom-display" ? `${customWidth}x${customHeight}` : `${placement.width}x${placement.height}`}</option>)}
                 </select>
+                <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={activePreviewVariant.id} onChange={(e) => setActivePreviewVariantId(e.target.value)}>
+                  {activePreviewVariants.map((variant) => <option key={variant.id} value={variant.id}>{variant.label} / {variant.device}</option>)}
+                </select>
               </div>
             )}
           </div>
@@ -1656,8 +1888,8 @@ export function AdaptDashboard() {
             />
           ) : (
             <div className="flex items-center justify-center overflow-x-auto py-6">
-              {result ? (
-                <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} />
+              {mode === "resize" ? (
+                <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} previewTemplateId={activePreviewVariant.templateId} />
               ) : (
                 <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
                   <Frame className="h-12 w-12 opacity-30" />

@@ -1,6 +1,14 @@
 import { sharedPreviewPlacementMap, sharedPreviewPlacements, type Placement } from "@/lib/preview-schema";
 
 export type PreviewTemplateKind =
+  | "social_feed_square"
+  | "social_feed_portrait"
+  | "story_image"
+  | "wide_landscape"
+  | "linkedin_mobile_feed"
+  | "google_responsive_landscape"
+  | "google_responsive_square"
+  | "google_responsive_vertical"
   | "facebook_feed"
   | "facebook_marketplace"
   | "facebook_right_column"
@@ -103,6 +111,13 @@ export function derivePreviewMetadata(
   const headline = lines.slice(0, Math.min(2, lines.length)).join(" ").trim() || "Localized campaign headline";
   const description = lines.slice(2).join(" ").trim() || "Adapted creative placed inside a native platform preview.";
   const ctaByPlacement: Record<string, string> = {
+    "social-feed-square": "Shop Now",
+    "social-feed-portrait": "Shop Now",
+    "story-image": "Learn More",
+    "wide-landscape": "Learn More",
+    "google-responsive-landscape": "Learn More",
+    "google-responsive-square": "Learn More",
+    "google-responsive-vertical": "Learn More",
     "facebook-feed": "Shop Now",
     "facebook-marketplace": "Shop Now",
     "facebook-right-column": "Learn More",

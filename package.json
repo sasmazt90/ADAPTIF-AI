@@ -7,7 +7,10 @@
     "dev:backend": "cd backend && python -m uvicorn app.main:app --reload --port 8000",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "npm run test:unit && npm run test:backend",
+    "test:unit": "vitest run",
+    "test:backend": "cd backend && python -m unittest discover -s tests"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.104.0",
@@ -25,6 +28,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.4",
     "tailwindcss": "^4",
-    "typescript": "^5"
+    "typescript": "^5",
+    "vitest": "^4.1.8"
   }
 }

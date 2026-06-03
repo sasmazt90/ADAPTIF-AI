@@ -1,423 +1,579 @@
 {
-  "schemaVersion": "2026-05-01.preview.v1",
+  "schemaVersion": "2026-06-03.preview.static-image.v2",
   "placements": [
     {
-      "placementId": "facebook-feed",
-      "platform": "META",
-      "label": "Facebook Feed",
+      "placementId": "social-feed-square",
+      "platform": "SOCIAL",
+      "label": "Feed Square",
       "ratio": "1:1",
-      "dimensions": { "width": 1080, "height": 1080 },
-      "device": "iphone",
-      "overlay": "facebook",
-      "templateId": "facebook_feed",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.04, 0.18, 0.92, 0.56],
-      "safeArea": { "warnings": ["Review feed footer space before export."], "zones": [{ "id": "fb-feed-footer", "label": "Reaction + CTA footer", "x": 0, "y": 82, "width": 100, "height": 18 }] },
-      "supportedMetadataFields": ["brandName", "accountName", "sponsorLabel", "headline", "description", "caption", "ctaText"],
-      "carouselSupported": true,
-      "uiElements": ["profile_image", "account_name", "sponsored_label", "menu", "feed_asset", "likes", "comments_preview", "social_actions"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.05, 0.04, 0.9, 0.11], "asset": [0.04, 0.18, 0.92, 0.56], "footer": [0.04, 0.8, 0.92, 0.16] }
-    },
-    {
-      "placementId": "facebook-marketplace",
-      "platform": "META",
-      "label": "Facebook Marketplace",
-      "ratio": "1:1",
-      "dimensions": { "width": 1080, "height": 1080 },
-      "device": "iphone",
-      "overlay": "facebook",
-      "templateId": "facebook_marketplace",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.1, 0.21, 0.8, 0.46],
-      "safeArea": { "warnings": ["Keep product thumbnail and title clear inside the listing card."], "zones": [{ "id": "marketplace-meta", "label": "Listing details", "x": 0, "y": 76, "width": 100, "height": 24 }] },
-      "supportedMetadataFields": ["brandName", "headline", "description", "price", "sponsorLabel", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["marketplace_header", "listing_card", "price", "sponsored_label", "cta"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "card": [0.06, 0.16, 0.88, 0.74], "asset": [0.1, 0.21, 0.8, 0.46], "meta": [0.1, 0.7, 0.8, 0.16] }
-    },
-    {
-      "placementId": "facebook-right-column",
-      "platform": "META",
-      "label": "Facebook Right Column",
-      "ratio": "1.91:1",
-      "dimensions": { "width": 1200, "height": 628 },
-      "device": "desktop",
-      "overlay": "facebook",
-      "templateId": "facebook_right_column",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.08, 0.18, 0.84, 0.34],
-      "safeArea": { "warnings": ["Right-column ads need concise copy and a safe CTA area."], "zones": [{ "id": "fb-column-meta", "label": "Headline + CTA", "x": 0, "y": 70, "width": 100, "height": 30 }] },
-      "supportedMetadataFields": ["headline", "description", "ctaText", "sponsorLabel"],
-      "carouselSupported": false,
-      "uiElements": ["desktop_ad_label", "headline", "description", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.08, 0.18, 0.84, 0.34], "meta": [0.08, 0.58, 0.84, 0.24] }
-    },
-    {
-      "placementId": "instagram-feed",
-      "platform": "META",
-      "label": "Instagram Feed",
-      "ratio": "1:1",
-      "dimensions": { "width": 1080, "height": 1080 },
+      "dimensions": {
+        "width": 1080,
+        "height": 1080
+      },
       "device": "iphone",
       "overlay": "instagram",
-      "templateId": "instagram_feed",
+      "templateId": "social_feed_square",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.16, 1.0, 0.62],
-      "safeArea": { "warnings": ["Review caption rail and bottom interaction row before export."], "zones": [{ "id": "ig-caption", "label": "Caption rail", "x": 0, "y": 82, "width": 100, "height": 18 }] },
-      "supportedMetadataFields": ["brandName", "accountName", "sponsorLabel", "headline", "description", "likesLabel", "commentsLabel", "ctaText"],
-      "carouselSupported": true,
-      "uiElements": ["profile_image", "account_name", "sponsored_label", "menu", "feed_asset", "social_actions", "caption", "bottom_navigation"],
+      "assetPlaceholderBox": [
+        0,
+        0.16,
+        1,
+        0.62
+      ],
+      "safeArea": {
+        "warnings": [
+          "Review feed header and caption area before export."
+        ],
+        "zones": [
+          {
+            "id": "social-feed-caption",
+            "label": "Caption and actions",
+            "x": 0,
+            "y": 82,
+            "width": 100,
+            "height": 18
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "accountName",
+        "sponsorLabel",
+        "headline",
+        "description",
+        "likesLabel",
+        "commentsLabel",
+        "ctaText"
+      ],
+      "carouselSupported": false,
+      "uiElements": [
+        "mobile_feed_header",
+        "feed_asset",
+        "social_actions",
+        "caption"
+      ],
       "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.04, 0.04, 0.92, 0.12], "asset": [0.0, 0.16, 1.0, 0.62], "caption": [0.05, 0.84, 0.9, 0.12] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "header": [
+          0.04,
+          0.04,
+          0.92,
+          0.12
+        ],
+        "asset": [
+          0,
+          0.16,
+          1,
+          0.62
+        ],
+        "caption": [
+          0.05,
+          0.84,
+          0.9,
+          0.12
+        ]
+      }
     },
     {
-      "placementId": "instagram-story",
-      "platform": "META",
-      "label": "Instagram Story",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
+      "placementId": "social-feed-portrait",
+      "platform": "SOCIAL",
+      "label": "Feed Portrait",
+      "ratio": "4:5",
+      "dimensions": {
+        "width": 1080,
+        "height": 1350
+      },
       "device": "iphone",
       "overlay": "instagram",
-      "templateId": "instagram_story",
+      "templateId": "social_feed_portrait",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review top story header and bottom CTA space before export."], "zones": [{ "id": "ig-story-header", "label": "Story header", "x": 0, "y": 0, "width": 100, "height": 12 }, { "id": "ig-story-cta", "label": "CTA zone", "x": 0, "y": 86, "width": 100, "height": 14 }] },
-      "supportedMetadataFields": ["accountName", "sponsorLabel", "ctaText"],
+      "assetPlaceholderBox": [
+        0,
+        0.13,
+        1,
+        0.72
+      ],
+      "safeArea": {
+        "warnings": [
+          "Review mobile feed header and bottom caption/actions before export."
+        ],
+        "zones": [
+          {
+            "id": "social-portrait-caption",
+            "label": "Caption and actions",
+            "x": 0,
+            "y": 86,
+            "width": 100,
+            "height": 14
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "accountName",
+        "sponsorLabel",
+        "headline",
+        "description",
+        "likesLabel",
+        "commentsLabel",
+        "ctaText"
+      ],
       "carouselSupported": false,
-      "uiElements": ["progress_bar", "account_name", "sponsored_label", "share_control", "cta"],
+      "uiElements": [
+        "mobile_feed_header",
+        "feed_asset",
+        "social_actions",
+        "caption"
+      ],
       "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "progress": [0.04, 0.03, 0.92, 0.02], "header": [0.05, 0.07, 0.9, 0.08], "cta": [0.06, 0.88, 0.88, 0.08] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "header": [
+          0.04,
+          0.04,
+          0.92,
+          0.1
+        ],
+        "asset": [
+          0,
+          0.13,
+          1,
+          0.72
+        ],
+        "caption": [
+          0.05,
+          0.87,
+          0.9,
+          0.1
+        ]
+      }
     },
     {
-      "placementId": "instagram-reels",
-      "platform": "META",
-      "label": "Instagram Reels",
+      "placementId": "story-image",
+      "platform": "SOCIAL",
+      "label": "Story Image",
       "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
+      "dimensions": {
+        "width": 1080,
+        "height": 1920
+      },
       "device": "iphone",
       "overlay": "instagram",
-      "templateId": "instagram_reels",
+      "templateId": "story_image",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review right action rail and bottom caption area before export."], "zones": [{ "id": "ig-reels-actions", "label": "Action rail", "x": 82, "y": 34, "width": 18, "height": 46 }, { "id": "ig-reels-caption", "label": "Caption area", "x": 0, "y": 80, "width": 100, "height": 20 }] },
-      "supportedMetadataFields": ["accountName", "headline", "description"],
+      "assetPlaceholderBox": [
+        0,
+        0,
+        1,
+        1
+      ],
+      "safeArea": {
+        "warnings": [
+          "Review top story header and bottom CTA/message space before export."
+        ],
+        "zones": [
+          {
+            "id": "story-header",
+            "label": "Story header",
+            "x": 0,
+            "y": 0,
+            "width": 100,
+            "height": 12
+          },
+          {
+            "id": "story-cta",
+            "label": "CTA/message area",
+            "x": 0,
+            "y": 86,
+            "width": 100,
+            "height": 14
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "accountName",
+        "sponsorLabel",
+        "ctaText"
+      ],
       "carouselSupported": false,
-      "uiElements": ["action_rail", "caption", "audio_row"],
+      "uiElements": [
+        "progress_bar",
+        "account_name",
+        "sponsored_label",
+        "cta"
+      ],
       "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "actions": [0.84, 0.35, 0.12, 0.36], "caption": [0.05, 0.79, 0.72, 0.14] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "progress": [
+          0.04,
+          0.03,
+          0.92,
+          0.02
+        ],
+        "header": [
+          0.05,
+          0.07,
+          0.9,
+          0.08
+        ],
+        "cta": [
+          0.06,
+          0.88,
+          0.88,
+          0.08
+        ]
+      }
     },
     {
-      "placementId": "tiktok-in-feed",
-      "platform": "TIKTOK",
-      "label": "TikTok In-Feed Ads",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "android",
-      "overlay": "tiktok",
-      "templateId": "tiktok_infeed",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review lower CTA and right action rail before export."], "zones": [{ "id": "tiktok-actions", "label": "Action rail", "x": 83, "y": 38, "width": 17, "height": 40 }, { "id": "tiktok-caption", "label": "Caption + CTA", "x": 0, "y": 78, "width": 100, "height": 22 }] },
-      "supportedMetadataFields": ["accountName", "sponsorLabel", "description", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["sponsored_label", "action_rail", "caption", "cta"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "actions": [0.83, 0.36, 0.13, 0.34], "caption": [0.06, 0.79, 0.7, 0.13], "cta": [0.06, 0.9, 0.52, 0.06] }
-    },
-    {
-      "placementId": "tiktok-topview",
-      "platform": "TIKTOK",
-      "label": "TikTok TopView",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "android",
-      "overlay": "tiktok",
-      "templateId": "tiktok_topview",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Reserve extra space for takeover CTA and action rail."], "zones": [{ "id": "tiktok-topview-actions", "label": "Action rail", "x": 83, "y": 40, "width": 17, "height": 38 }, { "id": "tiktok-topview-cta", "label": "TopView CTA", "x": 0, "y": 82, "width": 100, "height": 18 }] },
-      "supportedMetadataFields": ["headline", "description", "ctaText", "sponsorLabel"],
-      "carouselSupported": false,
-      "uiElements": ["topview_badge", "action_rail", "caption", "cta"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "badge": [0.05, 0.04, 0.24, 0.05], "actions": [0.83, 0.34, 0.13, 0.32], "caption": [0.06, 0.74, 0.72, 0.14], "cta": [0.06, 0.87, 0.58, 0.07] }
-    },
-    {
-      "placementId": "tiktok-branded-content",
-      "platform": "TIKTOK",
-      "label": "TikTok Branded Content",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "android",
-      "overlay": "tiktok",
-      "templateId": "tiktok_branded_content",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Keep branded disclosure clear in the top safe area."], "zones": [{ "id": "tiktok-brand-label", "label": "Branded disclosure", "x": 0, "y": 0, "width": 100, "height": 12 }] },
-      "supportedMetadataFields": ["brandName", "description"],
-      "carouselSupported": false,
-      "uiElements": ["branded_label", "action_rail", "creator_context"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "disclosure": [0.05, 0.04, 0.46, 0.06], "actions": [0.83, 0.37, 0.13, 0.33], "caption": [0.06, 0.78, 0.72, 0.12] }
-    },
-    {
-      "placementId": "snap-top-snap",
-      "platform": "SNAPCHAT",
-      "label": "Snap Top Snap",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "iphone",
-      "overlay": "snapchat",
-      "templateId": "snap_top_snap",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review swipe CTA and top label area before export."], "zones": [{ "id": "snap-top-header", "label": "Snap header", "x": 0, "y": 0, "width": 100, "height": 12 }, { "id": "snap-top-cta", "label": "Swipe CTA", "x": 0, "y": 86, "width": 100, "height": 14 }] },
-      "supportedMetadataFields": ["brandName", "sponsorLabel", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["brand_label", "sponsored_label", "cta"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.05, 0.04, 0.9, 0.08], "cta": [0.08, 0.89, 0.84, 0.07] }
-    },
-    {
-      "placementId": "snap-story-ad",
-      "platform": "SNAPCHAT",
-      "label": "Snap Story Ad",
-      "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "iphone",
-      "overlay": "snapchat",
-      "templateId": "snap_story_ad",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review progress header and swipe CTA area before export."], "zones": [{ "id": "snap-story-header", "label": "Story header", "x": 0, "y": 0, "width": 100, "height": 12 }, { "id": "snap-story-cta", "label": "CTA", "x": 0, "y": 84, "width": 100, "height": 16 }] },
-      "supportedMetadataFields": ["brandName", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["progress_bar", "brand_label", "cta"],
-      "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "progress": [0.06, 0.03, 0.88, 0.02], "cta": [0.08, 0.88, 0.84, 0.08] }
-    },
-    {
-      "placementId": "linkedin-single-wide",
-      "platform": "LINKEDIN",
-      "label": "LinkedIn Single Image 1200x628",
+      "placementId": "wide-landscape",
+      "platform": "SOCIAL",
+      "label": "Wide Landscape / Link Image",
       "ratio": "1.91:1",
-      "dimensions": { "width": 1200, "height": 628 },
+      "dimensions": {
+        "width": 1200,
+        "height": 628
+      },
       "device": "desktop",
       "overlay": "linkedin",
-      "templateId": "linkedin_single_image_1200x628",
+      "templateId": "wide_landscape",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.04, 0.18, 0.92, 0.5],
-      "safeArea": { "warnings": ["Keep headline and CTA clear for desktop feed framing."], "zones": [{ "id": "linkedin-wide-actions", "label": "Action row", "x": 0, "y": 88, "width": 100, "height": 12 }] },
-      "supportedMetadataFields": ["brandName", "sponsorLabel", "headline", "description", "ctaText"],
-      "carouselSupported": true,
-      "uiElements": ["company_header", "promoted_label", "headline", "description", "cta", "social_actions"],
+      "assetPlaceholderBox": [
+        0.04,
+        0.18,
+        0.92,
+        0.5
+      ],
+      "safeArea": {
+        "warnings": [
+          "Best for link/wide image previews; square or portrait is usually stronger for mobile social feed."
+        ],
+        "zones": [
+          {
+            "id": "wide-actions",
+            "label": "Actions and link metadata",
+            "x": 0,
+            "y": 86,
+            "width": 100,
+            "height": 14
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "accountName",
+        "sponsorLabel",
+        "headline",
+        "description",
+        "ctaText"
+      ],
+      "carouselSupported": false,
+      "uiElements": [
+        "desktop_feed_header",
+        "wide_asset",
+        "link_metadata",
+        "social_actions"
+      ],
       "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.04, 0.04, 0.92, 0.12], "asset": [0.04, 0.18, 0.92, 0.5], "meta": [0.05, 0.71, 0.9, 0.16] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "header": [
+          0.04,
+          0.04,
+          0.92,
+          0.12
+        ],
+        "asset": [
+          0.04,
+          0.18,
+          0.92,
+          0.5
+        ],
+        "meta": [
+          0.05,
+          0.71,
+          0.9,
+          0.16
+        ]
+      }
     },
     {
-      "placementId": "linkedin-single-square",
-      "platform": "LINKEDIN",
-      "label": "LinkedIn Single Image 1080x1080",
+      "placementId": "google-responsive-landscape",
+      "platform": "GOOGLE",
+      "label": "Responsive Landscape",
+      "ratio": "1.91:1",
+      "dimensions": {
+        "width": 1200,
+        "height": 628
+      },
+      "device": "desktop",
+      "overlay": "web",
+      "templateId": "google_responsive_landscape",
+      "templateStatus": "production",
+      "assetPlaceholderBox": [
+        0.04,
+        0.08,
+        0.92,
+        0.62
+      ],
+      "safeArea": {
+        "warnings": [
+          "Responsive display may crop inside publisher placements; keep key product/text centered."
+        ],
+        "zones": [
+          {
+            "id": "g-rda-landscape-adchoices",
+            "label": "AdChoices corner",
+            "x": 86,
+            "y": 0,
+            "width": 14,
+            "height": 12
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "headline",
+        "description",
+        "ctaText"
+      ],
+      "carouselSupported": false,
+      "uiElements": [
+        "publisher_page",
+        "ad_label",
+        "responsive_asset",
+        "cta"
+      ],
+      "deviceFrame": false,
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "asset": [
+          0.04,
+          0.08,
+          0.92,
+          0.62
+        ],
+        "meta": [
+          0.05,
+          0.74,
+          0.9,
+          0.18
+        ]
+      }
+    },
+    {
+      "placementId": "google-responsive-square",
+      "platform": "GOOGLE",
+      "label": "Responsive Square",
       "ratio": "1:1",
-      "dimensions": { "width": 1080, "height": 1080 },
-      "device": "desktop",
-      "overlay": "linkedin",
-      "templateId": "linkedin_single_image_1080x1080",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.04, 0.18, 0.92, 0.54],
-      "safeArea": { "warnings": ["Review square crop so company header and CTA remain visible."], "zones": [{ "id": "linkedin-square-actions", "label": "Action row", "x": 0, "y": 88, "width": 100, "height": 12 }] },
-      "supportedMetadataFields": ["brandName", "sponsorLabel", "headline", "description", "ctaText"],
-      "carouselSupported": true,
-      "uiElements": ["company_header", "promoted_label", "headline", "description", "cta", "social_actions"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.04, 0.04, 0.92, 0.12], "asset": [0.04, 0.18, 0.92, 0.54], "meta": [0.05, 0.75, 0.9, 0.14] }
-    },
-    {
-      "placementId": "linkedin-sponsored",
-      "platform": "LINKEDIN",
-      "label": "LinkedIn Sponsored Content",
-      "ratio": "1.91:1",
-      "dimensions": { "width": 1200, "height": 628 },
-      "device": "desktop",
-      "overlay": "linkedin",
-      "templateId": "linkedin_sponsored_content",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.04, 0.18, 0.92, 0.48],
-      "safeArea": { "warnings": ["Reserve room for sponsored copy and CTA footer."], "zones": [{ "id": "linkedin-sponsored-actions", "label": "Sponsored controls", "x": 0, "y": 86, "width": 100, "height": 14 }] },
-      "supportedMetadataFields": ["brandName", "sponsorLabel", "headline", "description", "ctaText"],
-      "carouselSupported": true,
-      "uiElements": ["company_header", "promoted_label", "headline", "description", "cta", "social_actions"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "header": [0.04, 0.04, 0.92, 0.12], "asset": [0.04, 0.18, 0.92, 0.48], "meta": [0.05, 0.69, 0.9, 0.18] }
-    },
-    {
-      "placementId": "gdn-300x250",
-      "platform": "GOOGLE",
-      "label": "GDN 300x250",
-      "ratio": "300x250",
-      "dimensions": { "width": 300, "height": 250 },
+      "dimensions": {
+        "width": 1200,
+        "height": 1200
+      },
       "device": "desktop",
       "overlay": "web",
-      "templateId": "gdn_300x250",
+      "templateId": "google_responsive_square",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.04, 0.08, 0.92, 0.86],
-      "safeArea": { "warnings": ["Compact banner layout: verify headline and CTA remain readable."], "zones": [{ "id": "gdn-300x250-adchoices", "label": "AdChoices", "x": 86, "y": 0, "width": 14, "height": 12 }] },
-      "supportedMetadataFields": ["brandName", "ctaText"],
+      "assetPlaceholderBox": [
+        0.08,
+        0.06,
+        0.84,
+        0.64
+      ],
+      "safeArea": {
+        "warnings": [
+          "Responsive square image can appear in compact cards; keep brand/product legible."
+        ],
+        "zones": [
+          {
+            "id": "g-rda-square-adchoices",
+            "label": "AdChoices corner",
+            "x": 86,
+            "y": 0,
+            "width": 14,
+            "height": 12
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "headline",
+        "description",
+        "ctaText"
+      ],
       "carouselSupported": false,
-      "uiElements": ["banner_container", "brand_label", "cta"],
+      "uiElements": [
+        "publisher_card",
+        "ad_label",
+        "responsive_asset",
+        "cta"
+      ],
       "deviceFrame": false,
-      "resizeRules": { "mode": "contain", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.04, 0.08, 0.92, 0.86] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "asset": [
+          0.08,
+          0.06,
+          0.84,
+          0.64
+        ],
+        "meta": [
+          0.08,
+          0.74,
+          0.84,
+          0.18
+        ]
+      }
     },
     {
-      "placementId": "gdn-728x90",
+      "placementId": "google-responsive-vertical",
       "platform": "GOOGLE",
-      "label": "GDN 728x90",
-      "ratio": "728x90",
-      "dimensions": { "width": 728, "height": 90 },
-      "device": "desktop",
-      "overlay": "web",
-      "templateId": "gdn_728x90",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.02, 0.1, 0.96, 0.8],
-      "safeArea": { "warnings": ["Leaderboard banners require very short copy and protected CTA spacing."], "zones": [{ "id": "gdn-728x90-adchoices", "label": "AdChoices", "x": 94, "y": 0, "width": 6, "height": 22 }] },
-      "supportedMetadataFields": ["headline", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["banner_container", "headline", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "contain", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.02, 0.1, 0.96, 0.8] }
-    },
-    {
-      "placementId": "gdn-160x600",
-      "platform": "GOOGLE",
-      "label": "GDN 160x600",
-      "ratio": "160x600",
-      "dimensions": { "width": 160, "height": 600 },
-      "device": "desktop",
-      "overlay": "web",
-      "templateId": "gdn_160x600",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.08, 0.04, 0.84, 0.92],
-      "safeArea": { "warnings": ["Skyscraper banners need vertical-safe composition around the CTA rail."], "zones": [{ "id": "gdn-160x600-adchoices", "label": "AdChoices", "x": 72, "y": 0, "width": 28, "height": 7 }] },
-      "supportedMetadataFields": ["headline", "description", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["banner_container", "headline", "description", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "contain", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.08, 0.04, 0.84, 0.92] }
-    },
-    {
-      "placementId": "gdn-320x50",
-      "platform": "GOOGLE",
-      "label": "GDN 320x50",
-      "ratio": "320x50",
-      "dimensions": { "width": 320, "height": 50 },
-      "device": "android",
-      "overlay": "web",
-      "templateId": "gdn_320x50",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.02, 0.1, 0.96, 0.78],
-      "safeArea": { "warnings": ["Mobile banner height is limited; verify no text cutoff."], "zones": [{ "id": "gdn-320x50-adchoices", "label": "AdChoices", "x": 88, "y": 0, "width": 12, "height": 34 }] },
-      "supportedMetadataFields": ["headline", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["banner_container", "headline", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "contain", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.02, 0.1, 0.96, 0.78] }
-    },
-    {
-      "placementId": "gdn-300x600",
-      "platform": "GOOGLE",
-      "label": "GDN 300x600",
-      "ratio": "300x600",
-      "dimensions": { "width": 300, "height": 600 },
-      "device": "desktop",
-      "overlay": "web",
-      "templateId": "gdn_300x600",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.05, 0.04, 0.9, 0.92],
-      "safeArea": { "warnings": ["Half-page banners need balanced product placement and CTA hierarchy."], "zones": [{ "id": "gdn-300x600-adchoices", "label": "AdChoices", "x": 86, "y": 0, "width": 14, "height": 6 }] },
-      "supportedMetadataFields": ["headline", "description", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["banner_container", "headline", "description", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "contain", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.05, 0.04, 0.9, 0.92] }
-    },
-    {
-      "placementId": "youtube-instream",
-      "platform": "GOOGLE",
-      "label": "YouTube Instream",
-      "ratio": "16:9",
-      "dimensions": { "width": 1920, "height": 1080 },
-      "device": "desktop",
-      "overlay": "youtube",
-      "templateId": "youtube_instream",
-      "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 0.78],
-      "safeArea": { "warnings": ["Reserve bottom control rail and CTA overlay space."], "zones": [{ "id": "youtube-controls", "label": "Playback controls", "x": 0, "y": 84, "width": 100, "height": 16 }] },
-      "supportedMetadataFields": ["brandName", "headline", "description", "ctaText"],
-      "carouselSupported": false,
-      "uiElements": ["player_context", "ad_label", "progress_bar", "cta"],
-      "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "asset": [0.0, 0.0, 1.0, 0.78], "meta": [0.04, 0.8, 0.92, 0.16] }
-    },
-    {
-      "placementId": "youtube-shorts",
-      "platform": "GOOGLE",
-      "label": "YouTube Shorts",
+      "label": "Responsive Vertical",
       "ratio": "9:16",
-      "dimensions": { "width": 1080, "height": 1920 },
-      "device": "android",
-      "overlay": "youtube",
-      "templateId": "youtube_shorts",
+      "dimensions": {
+        "width": 900,
+        "height": 1600
+      },
+      "device": "iphone",
+      "overlay": "web",
+      "templateId": "google_responsive_vertical",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.0, 0.0, 1.0, 1.0],
-      "safeArea": { "warnings": ["Review action rail and caption area before export."], "zones": [{ "id": "youtube-shorts-actions", "label": "Action rail", "x": 82, "y": 36, "width": 18, "height": 45 }, { "id": "youtube-shorts-caption", "label": "Caption area", "x": 0, "y": 82, "width": 100, "height": 18 }] },
-      "supportedMetadataFields": ["headline", "description"],
+      "assetPlaceholderBox": [
+        0.08,
+        0.08,
+        0.84,
+        0.74
+      ],
+      "safeArea": {
+        "warnings": [
+          "Vertical responsive image is mobile-heavy; keep CTA and product away from edges."
+        ],
+        "zones": [
+          {
+            "id": "g-rda-vertical-adchoices",
+            "label": "AdChoices corner",
+            "x": 82,
+            "y": 0,
+            "width": 18,
+            "height": 10
+          }
+        ]
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "headline",
+        "description",
+        "ctaText"
+      ],
       "carouselSupported": false,
-      "uiElements": ["shorts_action_rail", "caption"],
+      "uiElements": [
+        "mobile_publisher",
+        "ad_label",
+        "responsive_asset",
+        "cta"
+      ],
       "deviceFrame": true,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "actions": [0.84, 0.35, 0.12, 0.36], "meta": [0.06, 0.78, 0.72, 0.14] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "asset": [
+          0.08,
+          0.08,
+          0.84,
+          0.74
+        ],
+        "meta": [
+          0.08,
+          0.84,
+          0.84,
+          0.12
+        ]
+      }
     },
     {
       "placementId": "custom-display",
-      "platform": "NATIVE/WEB",
-      "label": "Custom Display",
+      "platform": "CUSTOM",
+      "label": "Custom Size",
       "ratio": "User-defined",
-      "dimensions": { "width": 1200, "height": 800 },
+      "dimensions": {
+        "width": 1200,
+        "height": 800
+      },
       "device": "desktop",
       "overlay": "web",
       "templateId": "custom_display",
       "templateStatus": "production",
-      "assetPlaceholderBox": [0.54, 0.18, 0.4, 0.6],
-      "safeArea": { "warnings": [], "zones": [] },
-      "supportedMetadataFields": ["headline", "description", "ctaText", "brandName"],
-      "carouselSupported": true,
-      "uiElements": ["publisher_header", "headline", "description", "cta"],
+      "assetPlaceholderBox": [
+        0.54,
+        0.18,
+        0.4,
+        0.6
+      ],
+      "safeArea": {
+        "warnings": [
+          "Custom placement has no platform-specific safe-zone guarantees."
+        ],
+        "zones": []
+      },
+      "supportedMetadataFields": [
+        "brandName",
+        "headline",
+        "description",
+        "ctaText"
+      ],
+      "carouselSupported": false,
+      "uiElements": [
+        "custom_canvas",
+        "asset"
+      ],
       "deviceFrame": false,
-      "resizeRules": { "mode": "cover", "protectText": true, "protectProduct": true },
-      "layoutBoxes": { "meta": [0.05, 0.16, 0.42, 0.24], "asset": [0.54, 0.18, 0.4, 0.6] }
+      "resizeRules": {
+        "mode": "cover",
+        "protectText": true,
+        "protectProduct": true
+      },
+      "layoutBoxes": {
+        "meta": [
+          0.05,
+          0.16,
+          0.42,
+          0.24
+        ],
+        "asset": [
+          0.54,
+          0.18,
+          0.4,
+          0.6
+        ]
+      }
     }
   ]
 }

@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { getAuthenticatedEmail } from "@/lib/auth";
+import { getAuthenticatedOrDevelopmentUser } from "@/lib/auth";
 import { estimateEditCredits } from "@/lib/credit-pricing";
 import { getCredits, spendCredits } from "@/lib/credits";
 
@@ -7,7 +7,7 @@ export async function POST(request: Request) {
   const backendUrl = process.env.ADAPTIFAI_BACKEND_URL ?? "http://127.0.0.1:8000";
 
   try {
-    const userId = await getAuthenticatedEmail(request);
+    const userId = await getAuthenticatedOrDevelopmentUser(request);
     const body = (await request.json().catch(() => ({}))) as {
       job_id?: string;
       filename?: string;
