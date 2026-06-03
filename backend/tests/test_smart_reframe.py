@@ -42,6 +42,10 @@ class BucketForDimensionsTests(unittest.TestCase):
         self.assertEqual(bucket_for_dimensions(300, 600), LogicBucket.LARGE_RECTANGLE)
         self.assertEqual(bucket_for_dimensions(160, 600), LogicBucket.LARGE_RECTANGLE)
 
+    def test_banner_boundary_requires_short_height(self):
+        self.assertEqual(bucket_for_dimensions(360, 120), LogicBucket.NARROW_BANNER)
+        self.assertEqual(bucket_for_dimensions(363, 121), LogicBucket.LANDSCAPE_WIDE)
+
     def test_ratio_buckets(self):
         self.assertEqual(bucket_for_dimensions(1920, 1080), LogicBucket.LANDSCAPE_WIDE)
         self.assertEqual(bucket_for_dimensions(1080, 1920), LogicBucket.VERTICAL_SQUARE)
@@ -73,6 +77,22 @@ class ChooseExpansionStrategyTests(unittest.TestCase):
         )
         self.assertEqual(decision.strategy, ExpansionStrategy.PILLOW_EXTEND)
         self.assertFalse(decision.requires_ai)
+
+    def test_close_square_ratio_uses_non_ai_fit_fallback(self):
+        decision = choose_expansion_strategy(
+            analysis(width=1080, height=1080, background_type=BackgroundType.PHOTOGRAPHIC, complexity=0.9),
+            target(1200, 1200, LogicBucket.VERTICAL_SQUARE),
+        )
+        self.assertEqual(decision.strategy, ExpansionStrategy.BLURRED_FIT_FALLBACK)
+        self.assertFalse(decision.requires_ai)
+
+    def test_textured_background_with_moderate_ratio_change_uses_outpaint(self):
+        decision = choose_expansion_strategy(
+            analysis(width=1100, height=1000, background_type=BackgroundType.TEXTURED, complexity=0.52),
+            target(1200, 1200, LogicBucket.VERTICAL_SQUARE),
+        )
+        self.assertEqual(decision.strategy, ExpansionStrategy.OPENAI_OUTPAINT)
+        self.assertTrue(decision.requires_ai)
 
 
 if __name__ == "__main__":
