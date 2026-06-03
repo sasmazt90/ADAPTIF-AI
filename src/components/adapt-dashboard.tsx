@@ -45,7 +45,7 @@ import { derivePreviewMetadata, placementPreviewTemplates, type PreviewMetadata 
 import { getSupabaseBrowser, hasSupabaseBrowserConfig } from "@/lib/supabase-client";
 
 type Mode = "adapt" | "resize";
-type AuthMode = "sign-in" | "sign-up" | "forgot-password" | "reset-password";
+type AuthMode = "sign-in" | "sign-up";
 type ConsentChoice = "necessary" | "all" | null;
 type Device = "mobile" | "desktop";
 type FitMode = "contain" | "cover" | "fill";
@@ -260,7 +260,6 @@ function AuthPanel({
   authPassword,
   setAuthPassword,
   authError,
-  authNotice,
   authPending,
   submitAuth,
 }: {
@@ -271,42 +270,30 @@ function AuthPanel({
   authPassword: string;
   setAuthPassword: (value: string) => void;
   authError: string | null;
-  authNotice: string | null;
   authPending: boolean;
   submitAuth: (event: FormEvent<HTMLFormElement>) => void;
 }) {
-  const isSignIn = authMode === "sign-in";
-  const isSignUp = authMode === "sign-up";
-  const isForgot = authMode === "forgot-password";
-  const isReset = authMode === "reset-password";
-  const eyebrow = isSignIn ? "Welcome back" : isSignUp ? "Start free" : isForgot ? "Recover access" : "Secure reset";
-  const title = isSignIn ? "Sign in" : isSignUp ? "Create account" : isForgot ? "Reset password" : "Set new password";
-  const buttonLabel = isSignIn ? "Sign in" : isSignUp ? "Sign up and enter app" : isForgot ? "Send reset email" : "Update password";
-
   return (
     <form id="auth" onSubmit={submitAuth} className="rounded-md border border-[#151515]/10 bg-white p-5 shadow-sm">
       <div className="flex items-center justify-between">
         <div>
-          <p className="text-xs font-semibold uppercase text-[#0f766e]">{eyebrow}</p>
-          <h2 className="text-2xl font-semibold">{title}</h2>
+          <p className="text-xs font-semibold uppercase text-[#0f766e]">{authMode === "sign-in" ? "Welcome back" : "Start free"}</p>
+          <h2 className="text-2xl font-semibold">{authMode === "sign-in" ? "Sign in" : "Create account"}</h2>
         </div>
         <LogIn className="h-5 w-5 text-[#0f766e]" />
       </div>
       <div className="mt-5 space-y-3">
-        {!isReset && <label className="block text-sm font-semibold">Email<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/15 px-3 outline-none focus:border-[#0f766e]" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} required /></label>}
-        {!isForgot && <label className="block text-sm font-semibold">Password<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/15 px-3 outline-none focus:border-[#0f766e]" type="password" autoComplete={isSignIn ? "current-password" : "new-password"} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} required minLength={6} /></label>}
+        <label className="block text-sm font-semibold">Email<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/15 px-3 outline-none focus:border-[#0f766e]" type="email" autoComplete="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} required /></label>
+        <label className="block text-sm font-semibold">Password<input className="mt-1 h-11 w-full rounded-md border border-[#151515]/15 px-3 outline-none focus:border-[#0f766e]" type="password" autoComplete={authMode === "sign-in" ? "current-password" : "new-password"} value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} required minLength={6} /></label>
       </div>
-      {authNotice && <p className="mt-3 rounded-md bg-[#e8f7f1] p-3 text-sm text-[#064e46]">{authNotice}</p>}
       {authError && <p className="mt-3 rounded-md bg-[#fff0d8] p-3 text-sm text-[#6b3b00]">{authError}</p>}
       <button type="submit" disabled={authPending} className="mt-5 flex h-11 w-full items-center justify-center gap-2 rounded-md bg-[#151515] font-semibold text-white disabled:bg-[#d6d0c4]">
         {authPending ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
-        {buttonLabel}
+        {authMode === "sign-in" ? "Sign in" : "Sign up and enter app"}
       </button>
-      <div className="mt-3 grid gap-2 text-center text-sm font-semibold text-[#0f766e]">
-        {isSignIn && <button type="button" onClick={() => setAuthMode("forgot-password")}>Forgot password?</button>}
-        {!isReset && <button type="button" onClick={() => setAuthMode(isSignUp ? "sign-in" : "sign-up")}>{isSignUp ? "Already have an account? Sign in" : "Need an account? Sign up"}</button>}
-        {(isForgot || isReset) && <button type="button" onClick={() => setAuthMode("sign-in")}>Back to sign in</button>}
-      </div>
+      <button type="button" onClick={() => setAuthMode(authMode === "sign-in" ? "sign-up" : "sign-in")} className="mt-3 w-full text-sm font-semibold text-[#0f766e]">
+        {authMode === "sign-in" ? "Need an account? Sign up" : "Already have an account? Sign in"}
+      </button>
     </form>
   );
 }
@@ -319,7 +306,6 @@ function LandingPage({
   authPassword,
   setAuthPassword,
   authError,
-  authNotice,
   authPending,
   submitAuth,
 }: {
@@ -330,7 +316,6 @@ function LandingPage({
   authPassword: string;
   setAuthPassword: (value: string) => void;
   authError: string | null;
-  authNotice: string | null;
   authPending: boolean;
   submitAuth: (event: FormEvent<HTMLFormElement>) => void;
 }) {
@@ -370,7 +355,7 @@ function LandingPage({
               <button type="button" onClick={() => chooseAuth("sign-in")} className="h-12 rounded-md border border-[#151515]/15 bg-white px-5 font-semibold">Open workspace</button>
             </div>
           </div>
-          <AuthPanel authMode={authMode} setAuthMode={setAuthMode} authEmail={authEmail} setAuthEmail={setAuthEmail} authPassword={authPassword} setAuthPassword={setAuthPassword} authError={authError} authNotice={authNotice} authPending={authPending} submitAuth={submitAuth} />
+          <AuthPanel authMode={authMode} setAuthMode={setAuthMode} authEmail={authEmail} setAuthEmail={setAuthEmail} authPassword={authPassword} setAuthPassword={setAuthPassword} authError={authError} authPending={authPending} submitAuth={submitAuth} />
         </div>
       </section>
 
@@ -1219,7 +1204,6 @@ export function AdaptDashboard() {
   const [sessionToken, setSessionToken] = useState<string | null>(null);
   const [authReady, setAuthReady] = useState(!supabaseConfigured);
   const [authError, setAuthError] = useState<string | null>(null);
-  const [authNotice, setAuthNotice] = useState<string | null>(null);
   const [authPending, setAuthPending] = useState(false);
   const [showCreditStore, setShowCreditStore] = useState(false);
   const [showAdminPanel, setShowAdminPanel] = useState(false);
@@ -1354,16 +1338,10 @@ export function AdaptDashboard() {
       if (data.session?.user.email) setUserId(data.session.user.email);
       setAuthReady(true);
     });
-    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
       setAuthUser(session?.user ?? null);
       setSessionToken(session?.access_token ?? null);
       if (session?.user.email) setUserId(session.user.email);
-      if (event === "PASSWORD_RECOVERY") {
-        setAuthMode("reset-password");
-        setAuthPassword("");
-        setAuthNotice("Enter a new password to finish account recovery.");
-        setAuthError(null);
-      }
     });
     return () => { mounted = false; data.subscription.unsubscribe(); };
   }, [supabase]);
@@ -1520,33 +1498,9 @@ export function AdaptDashboard() {
     event.preventDefault();
     if (!supabase) return;
     setAuthError(null);
-    setAuthNotice(null);
     setAuthPending(true);
     try {
       const email = authEmail.trim().toLowerCase();
-      if (authMode === "forgot-password") {
-        if (!email || !email.includes("@")) throw new Error("A valid email is required.");
-        const { error } = await supabase.auth.resetPasswordForEmail(email, {
-          redirectTo: `${globalThis.location.origin}/`,
-        });
-        if (error) throw error;
-        setAuthMode("sign-in");
-        setAuthPassword("");
-        setAuthNotice("Password reset email sent. Open the link in your email, then set a new password.");
-        return;
-      }
-
-      if (authMode === "reset-password") {
-        if (authPassword.length < 6) throw new Error("Password must be at least 6 characters.");
-        const { error } = await supabase.auth.updateUser({ password: authPassword });
-        if (error) throw error;
-        await supabase.auth.signOut();
-        setAuthMode("sign-in");
-        setAuthPassword("");
-        setAuthNotice("Password updated. Please sign in with your new password.");
-        return;
-      }
-
       if (authMode === "sign-up") {
         const response = await fetch("/api/auth/signup", {
           method: "POST",
@@ -1608,9 +1562,9 @@ export function AdaptDashboard() {
 
   if (!authReady) return <main className="grid min-h-screen place-items-center bg-[#faf9f5]"><Loader2 className="h-7 w-7 animate-spin text-[#0f766e]" /></main>;
 
-  if (supabaseConfigured && (!authUser || authMode === "reset-password")) {
+  if (supabaseConfigured && !authUser) {
     return (
-      <LandingPage authMode={authMode} setAuthMode={setAuthMode} authEmail={authEmail} setAuthEmail={setAuthEmail} authPassword={authPassword} setAuthPassword={setAuthPassword} authError={authError} authNotice={authNotice} authPending={authPending} submitAuth={submitAuth} />
+      <LandingPage authMode={authMode} setAuthMode={setAuthMode} authEmail={authEmail} setAuthEmail={setAuthEmail} authPassword={authPassword} setAuthPassword={setAuthPassword} authError={authError} authPending={authPending} submitAuth={submitAuth} />
     );
   }
 
