@@ -12593,6 +12593,35 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
     draw = ImageDraw.Draw(canvas)
     for block in blocks:
         text = block.translated_text or block.text
+        translated_lines = [line.strip() for line in text.splitlines() if line.strip()]
+        source_line_boxes = list(block.line_boxes or [])
+        if source_line_boxes and translated_lines and len(translated_lines) <= len(source_line_boxes):
+            for line_text, line_box in zip(translated_lines, source_line_boxes):
+                line_pad_x = max(2, int((line_box[2] - line_box[0]) * 0.02))
+                line_pad_y = max(1, int((line_box[3] - line_box[1]) * 0.04))
+                render_box = (
+                    line_box[0] + line_pad_x,
+                    line_box[1] + line_pad_y,
+                    line_box[2] - line_pad_x,
+                    line_box[3] - line_pad_y,
+                )
+                preferred_size = max(8, min(120, int((render_box[3] - render_box[1]) * 0.72)))
+                text_lines, size, line_height = fit_plain_text_for_box(
+                    draw,
+                    line_text,
+                    render_box,
+                    bold=block.font_weight >= 700,
+                    preferred_size=preferred_size,
+                )
+                y = render_box[1] + max(0, (render_box[3] - render_box[1] - len(text_lines) * line_height) // 2)
+                for fitted_line in text_lines:
+                    font = get_font(size, bold=block.font_weight >= 700)
+                    bbox = draw.textbbox((0, 0), fitted_line, font=font)
+                    text_width_px = bbox[2] - bbox[0]
+                    x = render_box[0] if block.align == "left" else render_box[0] + max(0, (render_box[2] - render_box[0] - text_width_px) // 2)
+                    draw.text((x, y), fitted_line, fill=block.color or "#111111", font=font)
+                    y += line_height
+            continue
         box = block.bbox
         pad_x = max(2, int((box[2] - box[0]) * 0.02))
         pad_y = max(1, int((box[3] - box[1]) * 0.02))
