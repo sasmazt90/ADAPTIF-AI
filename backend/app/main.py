@@ -13806,6 +13806,11 @@ def download_output(job_id: str, filename: str) -> FileResponse:
     return FileResponse(path, filename=safe_file, media_type="application/octet-stream")
 
 
+@app.get("/api/download/{job_id}/{filename}")
+def download_output_api_alias(job_id: str, filename: str) -> FileResponse:
+    return download_output(job_id, filename)
+
+
 @app.post("/adapt", response_model=AdaptResponse)
 async def adapt(
     background_tasks: BackgroundTasks,
