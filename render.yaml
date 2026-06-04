@@ -25,7 +25,7 @@ services:
       - key: REPLICATE_API_TOKEN
         sync: false
       - key: REPLICATE_LAMA_MODEL
-        value: fofr/lama
+        value: twn39/lama:2b91ca2340801c2a5be745612356fac36a17f698354a07f48a62d564d3b3a7a0
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: VERTEX_AI_PROJECT_ID

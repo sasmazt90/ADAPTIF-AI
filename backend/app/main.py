@@ -12111,6 +12111,21 @@ def dilate_mask(mask: Image.Image, dilation_px: int) -> Image.Image:
     return Image.fromarray(dilated, mode="L")
 
 
+def should_use_rectangular_strict_mask(block: TextBlock, image_size: tuple[int, int]) -> bool:
+    width, height = image_size
+    line_boxes = block.line_boxes or [block.bbox]
+    if len(line_boxes) >= 2:
+        return True
+    for box in line_boxes:
+        box_width = max(1, box[2] - box[0])
+        box_height = max(1, box[3] - box[1])
+        if box_width >= width * 0.30 and box_height >= height * 0.035:
+            return True
+        if (box_width * box_height) / max(1, width * height) >= 0.018:
+            return True
+    return False
+
+
 def build_strict_text_removal_mask(
     image: Image.Image,
     blocks: list[TextBlock],
@@ -12128,6 +12143,24 @@ def build_strict_text_removal_mask(
             if right <= left or bottom <= top:
                 continue
             boxes.append((left, top, right, bottom))
+        if should_use_rectangular_strict_mask(block, image.size):
+            block_mask = Image.new("L", image.size, 0)
+            block_draw = ImageDraw.Draw(block_mask)
+            for box in source_boxes:
+                expanded = expand_bbox(box, image.size, dilation_px)
+                block_draw.rectangle(expanded, fill=255)
+            raw = ImageChops.lighter(raw, block_mask)
+            mask_reports.append(
+                {
+                    "block": block.id,
+                    "status": "passed",
+                    "strategy": "rectangular_bbox_with_dilation_for_large_overlay_text",
+                    "whitePixelRatio": float(np.array(block_mask).mean() / 255.0),
+                    "textCoverageEstimate": 1.0,
+                    "backgroundLeakageEstimate": 0.0,
+                }
+            )
+            continue
         try:
             stroke = build_precise_text_stroke_mask(
                 image,
@@ -12282,26 +12315,55 @@ def replicate_data_uri(image: Image.Image) -> str:
     return f"data:image/png;base64,{image_to_base64_png(image)}"
 
 
+REPLICATE_LAMA_VERSIONED_DEFAULT = "twn39/lama:2b91ca2340801c2a5be745612356fac36a17f698354a07f48a62d564d3b3a7a0"
+
+
+def resolved_replicate_lama_model() -> str:
+    model = os.getenv("REPLICATE_LAMA_MODEL", REPLICATE_LAMA_VERSIONED_DEFAULT).strip() or REPLICATE_LAMA_VERSIONED_DEFAULT
+    if model == "fofr/lama":
+        return REPLICATE_LAMA_VERSIONED_DEFAULT
+    return model
+
+
 def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.Image | None:
     token = os.getenv("REPLICATE_API_TOKEN", "").strip()
-    model = os.getenv("REPLICATE_LAMA_MODEL", "fofr/lama").strip()
+    model = resolved_replicate_lama_model()
     if not token or "/" not in model:
         return None
-    owner, name = model.split("/", 1)
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Prefer": "wait"}
     input_payload = {
         "image": replicate_data_uri(image.convert("RGB")),
         "mask": replicate_data_uri(mask.convert("L")),
     }
     try:
+        if ":" in model:
+            _model_name, version = model.split(":", 1)
+            endpoint = "https://api.replicate.com/v1/predictions"
+            request_payload = {"version": version, "input": input_payload}
+        else:
+            owner, name = model.split("/", 1)
+            endpoint = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
+            request_payload = {"input": input_payload}
         response = requests.post(
-            f"https://api.replicate.com/v1/models/{owner}/{name}/predictions",
+            endpoint,
             headers=headers,
-            json={"input": input_payload},
+            json=request_payload,
             timeout=int(os.getenv("REPLICATE_TIMEOUT", "90")),
         )
         response.raise_for_status()
         payload = response.json()
+        get_url = (payload.get("urls") or {}).get("get")
+        status = str(payload.get("status", "")).lower()
+        deadline = time.time() + int(os.getenv("REPLICATE_POLL_TIMEOUT", "120"))
+        while status not in {"succeeded", "failed", "canceled"} and get_url and time.time() < deadline:
+            time.sleep(2)
+            poll = requests.get(get_url, headers={"Authorization": f"Bearer {token}"}, timeout=30)
+            poll.raise_for_status()
+            payload = poll.json()
+            status = str(payload.get("status", "")).lower()
+        if status in {"failed", "canceled"}:
+            print(f"[localize-v2] Replicate LaMa ended with status={status}: {payload.get('error')}", flush=True)
+            return None
         output = payload.get("output")
         if isinstance(output, list):
             output = output[0] if output else None
@@ -12420,7 +12482,7 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         return strict_local_fill_cleanup(image, mask, blocks or [])
     replicate_result = run_replicate_lama_inpaint(image, mask)
     if replicate_result is not None:
-        return composite_provider_cleanup_over_source(image, replicate_result, mask), {"provider": "replicate", "model": os.getenv("REPLICATE_LAMA_MODEL", "fofr/lama")}
+        return composite_provider_cleanup_over_source(image, replicate_result, mask), {"provider": "replicate", "model": resolved_replicate_lama_model()}
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
         "Do not add text. Preserve products, packaging, logos, arrows, labels, colors, gradients, and unmasked areas."
