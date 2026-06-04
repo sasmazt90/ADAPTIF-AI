@@ -12120,6 +12120,10 @@ def should_use_rectangular_strict_mask(block: TextBlock, image_size: tuple[int, 
     for box in line_boxes:
         box_width = max(1, box[2] - box[0])
         box_height = max(1, box[3] - box[1])
+        if block.role == "cta" and box_width >= width * 0.08 and box_height >= height * 0.045:
+            return True
+        if len(normalize_ocr_text(block.text)) <= 5 and block.text.strip().upper() == block.text.strip() and box_height >= height * 0.045:
+            return True
         if box_width >= width * 0.30 and box_height >= height * 0.035:
             return True
         if (box_width * box_height) / max(1, width * height) >= 0.018:
