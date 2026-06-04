@@ -12253,6 +12253,10 @@ def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[Text
             line_norm = normalize_ocr_text(line.text)
             if not line_norm:
                 continue
+            line_tokens = text_tokens(line.text)
+            block_token_set = text_tokens(block.text)
+            if len(line_norm) <= 3 and line_norm != normalized_block and not (line_tokens & block_token_set):
+                continue
             text_match = (
                 any(
                     text_similarity(line.text, source_line) >= 0.48
@@ -12264,8 +12268,8 @@ def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[Text
                 or (len(line_norm) >= 4 and line_norm in normalized_block)
             )
             if not text_match:
-                token_overlap = text_tokens(line.text) & text_tokens(block.text)
-                text_match = len(token_overlap) >= 1 and max(len(text_tokens(line.text)), len(text_tokens(block.text))) <= 4
+                token_overlap = line_tokens & block_token_set
+                text_match = len(token_overlap) >= 1 and max(len(line_tokens), len(block_token_set)) <= 4
             layout_match = (
                 overlap_fraction(line.bbox, expanded) >= 0.05
                 or overlap_fraction(expanded, line.bbox) >= 0.05
