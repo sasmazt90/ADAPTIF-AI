@@ -20,12 +20,20 @@ services:
         value: gpt-image-2
       - key: ADAPTIFAI_OPENAI_IMAGE_QUALITY
         value: medium
+      - key: ADAPTIFAI_LOCALIZE_PIPELINE
+        value: v2
+      - key: REPLICATE_API_TOKEN
+        sync: false
+      - key: REPLICATE_LAMA_MODEL
+        value: fofr/lama
       - key: GOOGLE_SERVICE_ACCOUNT_JSON
         sync: false
       - key: VERTEX_AI_PROJECT_ID
         value: adaptif-ai-1780483603776
       - key: VERTEX_AI_LOCATION
         value: us-central1
+      - key: VERTEX_GEMINI_MODEL
+        value: gemini-1.5-pro
       - key: VERTEX_IMAGEN_EDIT_MODEL
         value: imagen-3.0-capability-001
       - key: VERTEX_IMAGEN_MODEL
