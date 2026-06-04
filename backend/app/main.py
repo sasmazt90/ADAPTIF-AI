@@ -12005,16 +12005,18 @@ def analyze_localize_v2(image: Image.Image, target_language: str) -> dict[str, A
     try:
         if vertex_available():
             parsed = generate_vertex_gemini_json(prompt, image, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
-            if isinstance(parsed.get("blocks"), list):
+            if isinstance(parsed.get("blocks"), list) and parsed.get("blocks"):
                 parsed["analysis_provider"] = "vertex-gemini"
                 return parsed
+            print("[localize-v2] Vertex Gemini analysis returned no editable marketing blocks; trying OpenAI vision fallback", flush=True)
     except Exception as exc:
         print(f"[localize-v2] Vertex Gemini analysis failed: {exc}", flush=True)
     try:
         parsed = analyze_localize_v2_with_openai(image, target_language)
-        if isinstance(parsed.get("blocks"), list):
+        if isinstance(parsed.get("blocks"), list) and parsed.get("blocks"):
             parsed["analysis_provider"] = "openai-vision"
             return parsed
+        print("[localize-v2] OpenAI vision analysis returned no editable marketing blocks", flush=True)
     except Exception as exc:
         print(f"[localize-v2] OpenAI vision analysis failed: {exc}", flush=True)
     return {"source_language": "unknown", "blocks": [], "analysis_provider": "none"}
