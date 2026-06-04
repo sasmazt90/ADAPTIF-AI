@@ -191,6 +191,7 @@ OCR_MODEL_LOCK = threading.Lock()
 ADAPT_PROCESSING_SEMAPHORE = asyncio.Semaphore(int(os.getenv("ADAPTIFAI_MAX_ACTIVE_JOBS", "1")))
 HF_CLEANUP_SESSION = None
 HF_CLEANUP_SESSION_LOCK = threading.Lock()
+LAST_REPLICATE_LAMA_ERROR = ""
 HF_INPAINT_MODELS = [
     "runwayml/stable-diffusion-inpainting",
     "stabilityai/stable-diffusion-2-inpainting",
@@ -12326,9 +12327,12 @@ def resolved_replicate_lama_model() -> str:
 
 
 def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.Image | None:
+    global LAST_REPLICATE_LAMA_ERROR
+    LAST_REPLICATE_LAMA_ERROR = ""
     token = os.getenv("REPLICATE_API_TOKEN", "").strip()
     model = resolved_replicate_lama_model()
     if not token or "/" not in model:
+        LAST_REPLICATE_LAMA_ERROR = "missing_REPLICATE_API_TOKEN" if not token else "invalid_REPLICATE_LAMA_MODEL"
         return None
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Prefer": "wait"}
     input_payload = {
@@ -12337,9 +12341,8 @@ def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.I
     }
     try:
         if ":" in model:
-            _model_name, version = model.split(":", 1)
             endpoint = "https://api.replicate.com/v1/predictions"
-            request_payload = {"version": version, "input": input_payload}
+            request_payload = {"version": model, "input": input_payload}
         else:
             owner, name = model.split("/", 1)
             endpoint = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
@@ -12362,7 +12365,8 @@ def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.I
             payload = poll.json()
             status = str(payload.get("status", "")).lower()
         if status in {"failed", "canceled"}:
-            print(f"[localize-v2] Replicate LaMa ended with status={status}: {payload.get('error')}", flush=True)
+            LAST_REPLICATE_LAMA_ERROR = f"status={status}; error={payload.get('error')}"
+            print(f"[localize-v2] Replicate LaMa ended with {LAST_REPLICATE_LAMA_ERROR}", flush=True)
             return None
         output = payload.get("output")
         if isinstance(output, list):
@@ -12372,6 +12376,7 @@ def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.I
             image_response.raise_for_status()
             return Image.open(io.BytesIO(image_response.content)).convert("RGB").resize(image.size, Image.Resampling.LANCZOS)
     except Exception as exc:
+        LAST_REPLICATE_LAMA_ERROR = str(exc)[:500]
         print(f"[localize-v2] Replicate LaMa failed: {exc}", flush=True)
     return None
 
@@ -12480,22 +12485,51 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
     # providers can hallucinate residual letters even when instructed not to.
     if env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "0"):
         return strict_local_fill_cleanup(image, mask, blocks or [])
+    if blocks:
+        large_blocks = [block for block in blocks if should_use_rectangular_strict_mask(block, image.size)]
+        small_blocks = [block for block in blocks if block not in large_blocks]
+        working = image
+        small_meta: dict[str, Any] | None = None
+        provider_mask = mask
+        if small_blocks:
+            small_mask, small_mask_meta = build_strict_text_removal_mask(image, small_blocks)
+            working, small_meta = strict_local_fill_cleanup(image, small_mask, small_blocks)
+            small_meta = {**small_meta, "strictMasking": small_mask_meta}
+        if large_blocks:
+            provider_mask, _large_mask_meta = build_strict_text_removal_mask(image, large_blocks)
+            image = working
+            mask = provider_mask
+        elif small_meta is not None:
+            return working, {"provider": "split-local-fill", "smallOverlayCleanup": small_meta}
     replicate_result = run_replicate_lama_inpaint(image, mask)
     if replicate_result is not None:
-        return composite_provider_cleanup_over_source(image, replicate_result, mask), {"provider": "replicate", "model": resolved_replicate_lama_model()}
+        meta: dict[str, Any] = {"provider": "replicate", "model": resolved_replicate_lama_model()}
+        if blocks:
+            meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "replicate"}
+        return composite_provider_cleanup_over_source(image, replicate_result, mask), meta
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
         "Do not add text. Preserve products, packaging, logos, arrows, labels, colors, gradients, and unmasked areas."
     )
     vertex_result = run_vertex_full_image_cleanup(image, mask, vertex_prompt)
     if vertex_result.get("success") and isinstance(vertex_result.get("image"), Image.Image):
-        return composite_provider_cleanup_over_source(image, vertex_result["image"], mask), {
+        meta = {
             "provider": "vertex",
             "model": vertex_imagen_edit_model(),
         }
+        if LAST_REPLICATE_LAMA_ERROR:
+            meta["replicateFallbackReason"] = LAST_REPLICATE_LAMA_ERROR
+        if blocks:
+            meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "vertex"}
+        return composite_provider_cleanup_over_source(image, vertex_result["image"], mask), meta
     openai_result = run_openai_localize_v2_cleanup(image, mask)
     if openai_result is not None:
-        return composite_provider_cleanup_over_source(image, openai_result, mask), {"provider": "openai", "model": os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2")}
+        meta = {"provider": "openai", "model": os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2")}
+        if LAST_REPLICATE_LAMA_ERROR:
+            meta["replicateFallbackReason"] = LAST_REPLICATE_LAMA_ERROR
+        if blocks:
+            meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "openai"}
+        return composite_provider_cleanup_over_source(image, openai_result, mask), meta
     import cv2
 
     source = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
@@ -12503,7 +12537,12 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
     radius = int(os.getenv("ADAPTIFAI_LOCALIZE_V2_OPENCV_RADIUS", "5"))
     cleaned = cv2.inpaint(source, mask_np, radius, cv2.INPAINT_TELEA)
     result = Image.fromarray(cv2.cvtColor(cleaned, cv2.COLOR_BGR2RGB))
-    return result, {"provider": "opencv", "radius": radius}
+    meta = {"provider": "opencv", "radius": radius}
+    if LAST_REPLICATE_LAMA_ERROR:
+        meta["replicateFallbackReason"] = LAST_REPLICATE_LAMA_ERROR
+    if blocks:
+        meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "opencv"}
+    return result, meta
 
 
 def wrap_plain_text_for_box(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:
@@ -13716,6 +13755,8 @@ def health() -> dict[str, str]:
         "inpainting_backend": os.getenv("ADAPTIFAI_INPAINT_BACKEND", "stable-diffusion"),
         "inpainting": os.getenv("ADAPTIFAI_INPAINT_MODEL", "runwayml/stable-diffusion-inpainting"),
         "resize_fit": os.getenv("ADAPTIFAI_RESIZE_FIT", "cover"),
+        "replicate_lama_configured": "true" if bool(os.getenv("REPLICATE_API_TOKEN", "").strip()) else "false",
+        "replicate_lama_model": resolved_replicate_lama_model(),
     }
 
 
