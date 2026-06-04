@@ -226,6 +226,53 @@ class TextBlock(BaseModel):
     render_strategy: str = "clean_replace"
 
 
+LOCALIZE_V2_RICH_TEXT_PROMPT_RULES = [
+    "Analyze the original overlay marketing text at word/phrase level, including font weight, color, and typographic casing.",
+    "Return translated copy as rich text segments, not only as one flat string.",
+    "Map style by meaning, not by source position. If a styled source phrase moves to another position in the target language, apply that style to the translated phrase that carries the same meaning.",
+    "Preserve emphasis from bold, heavier weight, distinctive color, all-caps, numeric claims, discount percentages, and key benefit phrases.",
+    "Do not apply a source style to the wrong translated word just because it is in the same visual position.",
+    "Keep translated_text as the plain concatenation of segments for fallback rendering.",
+]
+
+
+LOCALIZE_V2_RICH_TEXT_SCHEMA = {
+    "source_language": "detected source language code",
+    "blocks": [
+        {
+            "source_text": "exact visible overlay marketing copy; preserve intended line breaks",
+            "translated_text": "plain fallback localized copy, equal to concatenated segment text",
+            "x": "left percent",
+            "y": "top percent",
+            "w": "width percent",
+            "h": "height percent",
+            "align": "left | center",
+            "font_weight": "regular | bold",
+            "color": "dominant fallback text color as hex",
+            "source_style_segments": [
+                {
+                    "text": "source word or phrase",
+                    "is_bold": True,
+                    "color": "#052b52",
+                    "is_uppercase": False,
+                    "semantic_role": "discount | modifier | product_condition | benefit | cta | other",
+                }
+            ],
+            "segments": [
+                {
+                    "text": "translated word or phrase including needed trailing space",
+                    "is_bold": True,
+                    "color": "#052b52",
+                    "is_uppercase": False,
+                    "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
+                    "semantic_role": "discount | modifier | product_condition | benefit | cta | other",
+                }
+            ],
+        }
+    ],
+}
+
+
 class OutputAsset(BaseModel):
     placement_id: str | None = None
     filename: str
@@ -11927,24 +11974,9 @@ def analyze_localize_v2_with_openai(image: Image.Image, target_language: str) ->
         return {}
     client = OpenAI()
     prompt = {
-        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured JSON. Do not include product packaging, product labels, logos, SKU text, legal microcopy, URLs, QR text, units, SPF/50+/UVA/ml/oz labels, or brand names as editable marketing text.",
+        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured rich-text JSON. Do not include product packaging, product labels, logos, SKU text, legal microcopy, URLs, QR text, units, SPF/50+/UVA/ml/oz labels, or brand names as editable marketing text.",
         "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
-        "schema": {
-            "source_language": "detected source language code",
-            "blocks": [
-                {
-                    "source_text": "exact visible overlay marketing copy; preserve intended line breaks",
-                    "translated_text": "localized copy in target language",
-                    "x": "left percent",
-                    "y": "top percent",
-                    "w": "width percent",
-                    "h": "height percent",
-                    "align": "left or center",
-                    "font_weight": "regular or bold",
-                    "color": "dominant text color as hex if confident",
-                }
-            ],
-        },
+        "schema": LOCALIZE_V2_RICH_TEXT_SCHEMA,
         "rules": [
             "Return compact JSON only.",
             "Each block must tightly cover one semantic overlay copy region.",
@@ -11952,6 +11984,7 @@ def analyze_localize_v2_with_openai(image: Image.Image, target_language: str) ->
             "Translate sentence meaning as a whole even when words are stacked visually.",
             "Do not add claims or product names not present in the source.",
             "If a text is printed on a product/bottle/package, exclude it.",
+            *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
     response = client.chat.completions.create(
@@ -11974,24 +12007,9 @@ def analyze_localize_v2_with_openai(image: Image.Image, target_language: str) ->
 
 def analyze_localize_v2(image: Image.Image, target_language: str) -> dict[str, Any]:
     prompt = {
-        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured JSON.",
+        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured rich-text JSON.",
         "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
-        "schema": {
-            "source_language": "detected source language code",
-            "blocks": [
-                {
-                    "source_text": "exact visible overlay marketing copy; preserve intended line breaks",
-                    "translated_text": "localized copy in target language",
-                    "x": "left percent",
-                    "y": "top percent",
-                    "w": "width percent",
-                    "h": "height percent",
-                    "align": "left | center",
-                    "font_weight": "regular | bold",
-                    "color": "hex color or empty string",
-                }
-            ],
-        },
+        "schema": LOCALIZE_V2_RICH_TEXT_SCHEMA,
         "strictRules": [
             "Return compact JSON only.",
             "Detect and translate marketing overlay copy only.",
@@ -12000,6 +12018,7 @@ def analyze_localize_v2(image: Image.Image, target_language: str) -> dict[str, A
             "Do not merge distant regions into one block.",
             "Translate meaning as one sentence/block, not word-by-word.",
             "Preserve metrics exactly, e.g. 24h, 48H, 84%, 50+.",
+            *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
     try:
@@ -12022,6 +12041,70 @@ def analyze_localize_v2(image: Image.Image, target_language: str) -> dict[str, A
     return {"source_language": "unknown", "blocks": [], "analysis_provider": "none"}
 
 
+def normalize_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "bold", "uppercase", "all_caps"}
+
+
+def plain_text_from_segments(segments: Any) -> str:
+    if not isinstance(segments, list):
+        return ""
+    parts: list[str] = []
+    for raw in segments:
+        if not isinstance(raw, dict):
+            continue
+        text = str(raw.get("text") or raw.get("translatedText") or "").strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, translated: bool) -> list[dict[str, Any]]:
+    if not isinstance(raw_segments, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    base_style = default_typography_style(block)
+    for raw in raw_segments:
+        if not isinstance(raw, dict):
+            continue
+        text = repair_mojibake(str(raw.get("text") or raw.get("translatedText") or raw.get("sourceText") or "")).strip()
+        if not text:
+            continue
+        color = str(raw.get("color") or base_style["color"]).strip()
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            color = base_style["color"]
+        is_bold = normalize_bool(raw.get("is_bold", raw.get("bold", base_style["fontWeight"] >= 700)))
+        is_uppercase = normalize_bool(raw.get("is_uppercase", raw.get("all_caps", text.isupper())))
+        role = str(raw.get("semantic_role") or raw.get("role") or classify_semantic_role(text)).strip() or "benefit"
+        style = dict(base_style)
+        style.update(
+            {
+                "fontWeight": max(base_style["fontWeight"], 800) if is_bold else min(base_style["fontWeight"], 500),
+                "color": color,
+                "casing": "uppercase" if is_uppercase else "mixed",
+            }
+        )
+        segment_text = text.upper() if is_uppercase else text
+        normalized.append(
+            {
+                "translatedText" if translated else "sourceText": segment_text,
+                "matchedSourceRole" if translated else "semanticRole": role,
+                "style": style,
+                "sourceSegmentHint": str(raw.get("source_segment_hint") or raw.get("sourceText") or raw.get("source_text") or "").strip(),
+                "forceBreakAfter": bool(raw.get("forceBreakAfter", raw.get("force_break_after", False))),
+                "color": color,
+                "fontWeight": style["fontWeight"],
+                "casing": style["casing"],
+                "semanticStyleKey": f"{role}:{normalize_ocr_text(str(raw.get('source_segment_hint') or text))}",
+                "styleTransferMode": "model_word_level_semantic_mapping",
+            }
+        )
+    return normalized
+
+
 def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -> list[TextBlock]:
     blocks: list[TextBlock] = []
     seen: set[str] = set()
@@ -12030,6 +12113,8 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
             continue
         source_text = repair_mojibake(str(item.get("source_text") or item.get("text") or "").strip())
         translated_text = repair_mojibake(str(item.get("translated_text") or item.get("translation") or "").strip())
+        if not translated_text:
+            translated_text = repair_mojibake(plain_text_from_segments(item.get("segments")))
         if not source_text or not translated_text:
             continue
         key = normalize_ocr_text(source_text)
@@ -12060,23 +12145,34 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
         font_weight = 800 if str(item.get("font_weight", "")).lower() in {"bold", "700", "800", "900"} or source_text.isupper() else 700
         font_size_estimate = estimate_font_size_from_bbox(bbox)
         line_height_estimate = estimate_line_height_from_bbox(bbox)
+        block = TextBlock(
+            id=f"v2-block-{index}",
+            text=source_text,
+            translated_text=translated_text,
+            role=classify_text_role(source_text),
+            translate=True,
+            bbox=bbox,
+            clean_box=mask_bbox,
+            color=color,
+            font_weight=font_weight,
+            font_size_estimate=font_size_estimate,
+            line_height_estimate=line_height_estimate,
+            align=align,
+            surface="overlay",
+            line_boxes=[bbox],
+            line_texts=[source_text],
+        )
+        source_style_spans = normalize_rich_text_segments(item.get("source_style_segments"), block=block, translated=False)
+        translated_style_spans = normalize_rich_text_segments(item.get("segments"), block=block, translated=True)
+        if not translated_style_spans:
+            source_style_spans = source_style_spans or infer_source_style_spans(source_text, block)
+            translated_style_spans = infer_translated_style_spans(source_text, translated_text, source_style_spans, block)
         blocks.append(
-            TextBlock(
-                id=f"v2-block-{index}",
-                text=source_text,
-                translated_text=translated_text,
-                role=classify_text_role(source_text),
-                translate=True,
-                bbox=bbox,
-                clean_box=mask_bbox,
-                color=color,
-                font_weight=font_weight,
-                font_size_estimate=font_size_estimate,
-                line_height_estimate=line_height_estimate,
-                align=align,
-                surface="overlay",
-                line_boxes=[bbox],
-                line_texts=[source_text],
+            block.model_copy(
+                update={
+                    "source_style_spans": source_style_spans,
+                    "translated_style_spans": translated_style_spans,
+                }
             )
         )
     return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
@@ -12594,11 +12690,38 @@ def fit_plain_text_for_box(
     return wrap_plain_text_for_box(draw, text, font, max_width), 8, 10
 
 
+def block_has_rich_text_segments(block: TextBlock) -> bool:
+    spans = block.translated_style_spans or []
+    if not spans:
+        return False
+    if any(span.get("styleTransferMode") == "model_word_level_semantic_mapping" for span in spans):
+        return True
+    colors = {str((span.get("style") or {}).get("color") or span.get("color") or "").lower() for span in spans}
+    weights = {int((span.get("style") or {}).get("fontWeight") or span.get("fontWeight") or block.font_weight) for span in spans}
+    return len({color for color in colors if color}) > 1 or len(weights) > 1
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGB")
     draw = ImageDraw.Draw(canvas)
     for block in blocks:
         text = block.translated_text or block.text
+        if block_has_rich_text_segments(block):
+            box = block.bbox
+            pad_x = max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = max(1, int((box[3] - box[1]) * 0.02))
+            render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
+            preferred_line_count = max(1, len(block.line_boxes) or len([line for line in block.text.splitlines() if line.strip()]) or 1)
+            base_typography = default_typography_style(block)
+            layout = fit_styled_spans(
+                draw,
+                block.translated_style_spans,
+                render_box,
+                base_typography,
+                preferred_line_count=preferred_line_count,
+            )
+            render_styled_spans(draw, layout, render_box, alignment=block.align)
+            continue
         translated_lines = [line.strip() for line in text.splitlines() if line.strip()]
         source_line_boxes = list(block.line_boxes or [])
         if source_line_boxes and translated_lines and len(translated_lines) <= len(source_line_boxes):
