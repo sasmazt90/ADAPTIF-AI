@@ -237,6 +237,7 @@ class OutputAsset(BaseModel):
     source_language: str | None = None
     translated_text: str = ""
     extracted_blocks: list[TextBlock] = []
+    debug: dict[str, Any] | None = None
 
 
 class AdaptResponse(BaseModel):
@@ -665,6 +666,11 @@ def overlap_fraction(left: tuple[int, int, int, int], right: tuple[int, int, int
 
 def text_tokens(text: str) -> set[str]:
     return {token for token in re.split(r"[^a-z0-9]+", normalize_ocr_text(text)) if len(token) >= 3}
+
+
+def loose_word_tokens(text: str) -> set[str]:
+    ascii_text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+    return {token for token in re.findall(r"[a-z0-9]{3,}", ascii_text)}
 
 
 PACKAGING_CUE_TERMS = (
@@ -12049,6 +12055,8 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
             color = estimate_text_color(image.crop(bbox))
         font_weight = 800 if str(item.get("font_weight", "")).lower() in {"bold", "700", "800", "900"} or source_text.isupper() else 700
+        font_size_estimate = estimate_font_size_from_bbox(bbox)
+        line_height_estimate = estimate_line_height_from_bbox(bbox)
         blocks.append(
             TextBlock(
                 id=f"v2-block-{index}",
@@ -12060,6 +12068,8 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
                 clean_box=mask_bbox,
                 color=color,
                 font_weight=font_weight,
+                font_size_estimate=font_size_estimate,
+                line_height_estimate=line_height_estimate,
                 align=align,
                 surface="overlay",
                 line_boxes=[bbox],
@@ -12107,22 +12117,50 @@ def build_strict_text_removal_mask(
     protected_blocks: list[TextBlock] | None = None,
 ) -> tuple[Image.Image, dict[str, Any]]:
     raw = Image.new("L", image.size, 0)
-    draw = ImageDraw.Draw(raw)
     boxes: list[tuple[int, int, int, int]] = []
+    mask_reports: list[dict[str, Any]] = []
+    dilation_px = strict_mask_dilation_px(image.size)
+    feather_px = int(round(strict_mask_feather_px(image.size)))
     for block in blocks:
         source_boxes = list(block.line_boxes or []) or [block.bbox]
-        if block.clean_box:
-            source_boxes.append(block.clean_box)
-        if len((block.text or "").split()) >= 5:
-            source_boxes.append(block.bbox)
         for box in source_boxes:
             left, top, right, bottom = box
             if right <= left or bottom <= top:
                 continue
             boxes.append((left, top, right, bottom))
-            draw.rectangle((left, top, right, bottom), fill=255)
-    dilation_px = strict_mask_dilation_px(image.size)
-    dilated = dilate_mask(raw, dilation_px)
+        try:
+            stroke = build_precise_text_stroke_mask(
+                image,
+                block,
+                dilation_px=dilation_px,
+                feather_px=max(1, feather_px),
+                allow_protected_overlap=False,
+            )
+            block_mask = stroke.get("inpaintMask_binary") or stroke.get("final")
+            if isinstance(block_mask, Image.Image) and block_mask.getbbox():
+                raw = ImageChops.lighter(raw, block_mask.convert("L").resize(image.size))
+                mask_reports.append(
+                    {
+                        "block": block.id,
+                        "status": stroke.get("maskQualityStatus"),
+                        "failure": stroke.get("maskFailureReason"),
+                        "whitePixelRatio": stroke.get("whitePixelRatio"),
+                        "textCoverageEstimate": stroke.get("textCoverageEstimate"),
+                        "backgroundLeakageEstimate": stroke.get("backgroundLeakageEstimate"),
+                    }
+                )
+                continue
+        except Exception as exc:
+            mask_reports.append({"block": block.id, "status": "precise_mask_failed", "failure": str(exc)[:160]})
+        fallback = Image.new("L", image.size, 0)
+        fallback_draw = ImageDraw.Draw(fallback)
+        for box in source_boxes:
+            left, top, right, bottom = box
+            if right <= left or bottom <= top:
+                continue
+            fallback_draw.rectangle((left, top, right, bottom), fill=255)
+        raw = ImageChops.lighter(raw, dilate_mask(fallback, dilation_px))
+    dilated = raw.convert("L")
     protected_boxes: list[tuple[int, int, int, int]] = []
     if protected_blocks:
         protected = Image.new("L", image.size, 0)
@@ -12149,11 +12187,14 @@ def build_strict_text_removal_mask(
             dilated = ImageChops.multiply(dilated, ImageOps.invert(protected.convert("L")))
     return dilated, {
         "mode": "strict_text_removal_mask",
+        "shape": "glyph_stroke_mask_with_dilation",
         "dilationPx": dilation_px,
+        "featherPx": strict_mask_feather_px(image.size),
         "rawWhitePixelRatio": float(np.array(raw).mean() / 255.0),
         "dilatedWhitePixelRatio": float(np.array(dilated).mean() / 255.0),
         "boxes": [list(box) for box in boxes],
         "protectedBoxes": [list(box) for box in protected_boxes],
+        "blockMaskReports": mask_reports,
         "strictPreservation": "provider output is composited only through this dilated mask; all other pixels remain source-original",
     }
 
@@ -12165,6 +12206,7 @@ def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[Text
     for block in blocks:
         source_lines = [line for line in re.split(r"\n+", block.text) if normalize_ocr_text(line)]
         normalized_block = normalize_ocr_text(block.text)
+        block_words = loose_word_tokens(block.text)
         candidates: list[TextBlock] = []
         expanded = expand_bbox(block.bbox, image_size, max(24, int(max(block.bbox[2] - block.bbox[0], block.bbox[3] - block.bbox[1]) * 0.45)))
         for line in ocr_lines:
@@ -12188,11 +12230,31 @@ def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[Text
                 overlap_fraction(line.bbox, expanded) >= 0.05
                 or overlap_fraction(expanded, line.bbox) >= 0.05
             )
-            if text_match and layout_match:
+            strong_text_match = (
+                len(line_norm) >= 4
+                and (
+                    line_norm in normalized_block
+                    or any(
+                        (
+                            len(line_word) >= 4
+                            and len(block_word) >= 4
+                            and (
+                                text_similarity(line_word, block_word) >= 0.72
+                                or (len(line_word) >= 5 and len(block_word) >= 5 and (line_word in block_word or block_word in line_word))
+                            )
+                        )
+                        for line_word in loose_word_tokens(line.text)
+                        for block_word in block_words
+                    )
+                )
+                and not has_packaging_cues(line.text)
+            )
+            if (text_match and layout_match) or strong_text_match:
                 candidates.append(line)
         if candidates:
             ordered = sorted(candidates, key=lambda item: (item.bbox[1], item.bbox[0]))
             bbox = union_bbox([item.bbox for item in ordered]) or block.bbox
+            font_size_estimate = estimate_font_size_from_bbox(bbox)
             snapped.append(
                 block.model_copy(
                     update={
@@ -12200,6 +12262,8 @@ def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[Text
                         "clean_box": compute_clean_box(bbox, image_size, large_block=(bbox[2] - bbox[0]) > image_size[0] * 0.45),
                         "line_boxes": [item.bbox for item in ordered],
                         "line_texts": [item.text for item in ordered],
+                        "font_size_estimate": font_size_estimate,
+                        "line_height_estimate": estimate_line_height_from_bbox(bbox),
                         "align": infer_alignment(bbox, image_size[0]) if block.align not in {"left", "center"} else block.align,
                     }
                 )
@@ -12494,6 +12558,17 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 source_language=str(payload.get("source_language", "")) or None,
                 translated_text="\n\n".join(block.translated_text or "" for block in blocks if block.translated_text),
                 extracted_blocks=blocks,
+                debug={
+                    "pipeline": "v2",
+                    "analysisProvider": payload.get("analysis_provider"),
+                    "cleanupMeta": cleanup_meta,
+                    "strictMasking": mask_meta,
+                    "artifacts": {
+                        "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
+                        "mask": f"/api/download/{job_dir.name}/{mask_filename}",
+                        "cleanBase": f"/api/download/{job_dir.name}/{clean_filename}",
+                    },
+                },
             )
             outputs.append(asset)
             manifest_assets.append(
