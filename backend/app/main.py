@@ -219,6 +219,7 @@ class TextBlock(BaseModel):
     overflow_warning: bool = False
     source_style_spans: list[dict[str, Any]] = Field(default_factory=list)
     translated_style_spans: list[dict[str, Any]] = Field(default_factory=list)
+    source_word_styles: list[dict[str, Any]] = Field(default_factory=list)
     translation_candidates: list[dict[str, str]] = Field(default_factory=list)
     target_language: str | None = None
     cleanup_confidence: float = 1.0
@@ -229,9 +230,9 @@ class TextBlock(BaseModel):
 LOCALIZE_V2_RICH_TEXT_PROMPT_RULES = [
     "Analyze the original overlay marketing text at word/phrase level, including font weight, color, and typographic casing.",
     "Return translated copy as rich text segments, not only as one flat string.",
-    "Map style by meaning, not by source position. If a styled source phrase moves to another position in the target language, apply that style to the translated phrase that carries the same meaning.",
+    "Map style by meaning, not by source position or source line. If a styled source phrase moves to another target line because of target-language syntax, apply that style to the translated phrase that carries the same meaning on its new line.",
     "Preserve emphasis from bold, heavier weight, distinctive color, all-caps, numeric claims, discount percentages, and key benefit phrases.",
-    "Do not apply a source style to the wrong translated word just because it is in the same visual position.",
+    "Do not apply a source style to the wrong translated word just because it is in the same visual position or same line.",
     "Keep translated_text as the plain concatenation of segments for fallback rendering.",
 ]
 
@@ -279,12 +280,22 @@ LOCALIZE_V212_TRANSLATION_SCHEMA = {
             "id": "ocr-block-id from input",
             "translate": True,
             "translated_text": "plain fallback localized copy, equal to concatenated segment text",
+            "lines": [
+                {
+                    "segments": [
+                        {
+                            "text": "translated word or phrase",
+                            "source_word_id": "id from input_blocks[].source_words[].id whose meaning/style this target segment inherited",
+                            "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
+                        }
+                    ]
+                }
+            ],
             "segments": [
                 {
                     "text": "translated word or phrase",
-                    "is_bold": True,
-                    "color": "#052b52",
                     "is_uppercase": False,
+                    "source_word_id": "id from input_blocks[].source_words[].id whose meaning/style this target segment inherited",
                     "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
                     "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
                 }
@@ -1626,6 +1637,231 @@ def estimate_text_color(image: Image.Image) -> str:
     if color.mean() < 50:
         return "#111111"
     return "#{:02x}{:02x}{:02x}".format(*(int(channel) for channel in color))
+
+
+def sample_deterministic_text_color(image: Image.Image, bbox: tuple[int, int, int, int], fallback: str = "#111111") -> str:
+    left, top, right, bottom = bbox
+    left = max(0, min(image.width, left))
+    right = max(0, min(image.width, right))
+    top = max(0, min(image.height, top))
+    bottom = max(0, min(image.height, bottom))
+    if right <= left or bottom <= top:
+        return fallback if re.fullmatch(r"#[0-9a-fA-F]{6}", fallback or "") else "#111111"
+    crop = np.array(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.uint8)
+    pixels = crop.reshape(-1, 3)
+    if len(pixels) == 0:
+        return fallback if re.fullmatch(r"#[0-9a-fA-F]{6}", fallback or "") else "#111111"
+    brightness = pixels.mean(axis=1).astype(np.float32)
+    chroma = (pixels.max(axis=1) - pixels.min(axis=1)).astype(np.float32)
+    bg_brightness = float(np.median(brightness))
+    bg_chroma = float(np.median(chroma))
+    non_background = pixels[~((brightness >= 225) & (chroma <= 22))]
+    if len(non_background) >= 8:
+        pixels = non_background
+        brightness = pixels.mean(axis=1).astype(np.float32)
+        chroma = (pixels.max(axis=1) - pixels.min(axis=1)).astype(np.float32)
+    saturated = pixels[(chroma >= 28) & (brightness <= 230)]
+    dark = pixels[brightness <= min(165, bg_brightness - 18 if bg_brightness >= 180 else 120)]
+    if len(saturated) >= 8:
+        candidates = saturated
+    elif len(dark) >= 8:
+        candidates = dark
+    elif bg_brightness >= 180:
+        candidates = pixels[(brightness <= bg_brightness - 12) | (chroma >= max(16, bg_chroma + 8))]
+    elif bg_brightness <= 90:
+        candidates = pixels[(brightness >= bg_brightness + 12) | (chroma >= max(16, bg_chroma + 8))]
+    else:
+        candidates = pixels[np.abs(brightness - bg_brightness) >= 10]
+    if len(candidates) < 8:
+        candidates = pixels[np.argsort(chroma + np.abs(brightness - bg_brightness))[-max(8, min(len(pixels), len(pixels) // 8)) :]]
+    rounded = (candidates.astype(np.uint16) // 8) * 8
+    colors, counts = np.unique(rounded.reshape(-1, 3), axis=0, return_counts=True)
+    dominant = colors[int(np.argmax(counts))]
+    return "#{:02x}{:02x}{:02x}".format(*(int(min(255, value)) for value in dominant))
+
+
+def source_word_id(block_id: str | None, line_index: int, word_index: int, text: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "-", normalize_ocr_text(text)).strip("-") or "word"
+    return f"{block_id or 'block'}-l{line_index + 1}-w{word_index + 1}-{normalized[:24]}"
+
+
+def split_line_text_to_word_boxes(text: str, box: tuple[int, int, int, int]) -> list[dict[str, Any]]:
+    words = [match for match in re.finditer(r"\S+", text or "")]
+    if not words:
+        return []
+    left, top, right, bottom = box
+    width = max(1, right - left)
+    text_len = max(1, len(text))
+    output: list[dict[str, Any]] = []
+    for index, match in enumerate(words):
+        start_ratio = match.start() / text_len
+        end_ratio = max(start_ratio, match.end() / text_len)
+        word_left = int(round(left + width * start_ratio))
+        word_right = int(round(left + width * end_ratio))
+        if word_right <= word_left:
+            word_right = min(right, word_left + max(2, width // max(1, len(words))))
+        output.append({"text": match.group(0), "wordIndex": index, "bbox": (word_left, top, min(right, word_right), bottom)})
+    return output
+
+
+def choose_foreground_text_mask(crop_rgb: np.ndarray) -> np.ndarray:
+    import cv2
+
+    if crop_rgb.size == 0:
+        return np.zeros(crop_rgb.shape[:2], dtype=bool)
+    gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+    if gray.size == 0:
+        return np.zeros_like(gray, dtype=bool)
+    try:
+        _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    except Exception:
+        otsu = np.where(gray >= np.median(gray), 255, 0).astype(np.uint8)
+    adaptive = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        max(3, min(31, (min(gray.shape[:2]) // 2) * 2 + 1)),
+        3,
+    )
+    h, w = gray.shape[:2]
+    border = np.concatenate([crop_rgb[0, :, :], crop_rgb[-1, :, :], crop_rgb[:, 0, :], crop_rgb[:, -1, :]], axis=0)
+    bg_median = np.median(border, axis=0).astype(np.float32) if len(border) else np.median(crop_rgb.reshape(-1, 3), axis=0).astype(np.float32)
+    candidates = [
+        otsu == 0,
+        otsu == 255,
+        adaptive == 0,
+        adaptive == 255,
+    ]
+    best_mask = np.zeros((h, w), dtype=bool)
+    best_score = -1.0
+    crop_area = max(1, h * w)
+    for mask in candidates:
+        count = int(mask.sum())
+        ratio = count / crop_area
+        if count < 2 or ratio <= 0.004 or ratio >= 0.88:
+            continue
+        pixels = crop_rgb[mask].astype(np.float32)
+        fg_median = np.median(pixels, axis=0)
+        distance = float(np.linalg.norm(fg_median - bg_median))
+        chroma = float(np.median(pixels.max(axis=1) - pixels.min(axis=1)))
+        compactness_penalty = abs(ratio - 0.18) * 18
+        score = distance + chroma * 0.35 - compactness_penalty
+        if score > best_score:
+            best_score = score
+            best_mask = mask
+    if best_mask.any():
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        best_mask = cv2.morphologyEx(best_mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel, iterations=1) > 0
+    return best_mask
+
+
+def sample_word_foreground_style(
+    image: Image.Image,
+    bbox: tuple[int, int, int, int],
+    *,
+    fallback_color: str = "#111111",
+    fallback_weight: int = 700,
+) -> dict[str, Any]:
+    left, top, right, bottom = expand_bbox(bbox, image.size, 1)
+    if right <= left or bottom <= top:
+        return {"color": fallback_color, "fontWeight": fallback_weight, "isBold": fallback_weight >= 700}
+    crop_rgb = np.array(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.uint8)
+    mask = choose_foreground_text_mask(crop_rgb)
+    if mask.any():
+        row_has_ink = mask.any(axis=1)
+        clusters: list[tuple[int, int]] = []
+        start: int | None = None
+        for row_index, has_ink in enumerate(row_has_ink):
+            if has_ink and start is None:
+                start = row_index
+            elif not has_ink and start is not None:
+                clusters.append((start, row_index))
+                start = None
+        if start is not None:
+            clusters.append((start, len(row_has_ink)))
+        if len(clusters) > 1:
+            best_start, best_end = max(clusters, key=lambda item: int(mask[item[0] : item[1], :].sum()))
+            clustered = np.zeros_like(mask, dtype=bool)
+            clustered[best_start:best_end, :] = mask[best_start:best_end, :]
+            mask = clustered
+        pixels = crop_rgb[mask].reshape(-1, 3)
+        bg_color = np.median(crop_rgb.reshape(-1, 3), axis=0)
+        distances = np.linalg.norm(pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
+        if len(distances) >= 8:
+            pixels = pixels[distances >= np.percentile(distances, 35)]
+        median = np.median(pixels, axis=0)
+        color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in median))
+        density = float(mask.sum()) / max(1, mask.shape[0] * mask.shape[1])
+        ys, xs = np.where(mask)
+        foreground_bbox = (
+            left + int(xs.min()),
+            top + int(ys.min()),
+            left + int(xs.max()) + 1,
+            top + int(ys.max()) + 1,
+        )
+    else:
+        color = sample_deterministic_text_color(image, bbox, fallback_color)
+        density = 0.0
+        foreground_bbox = bbox
+    is_bold = fallback_weight >= 700 or density >= 0.24
+    return {
+        "color": color,
+        "fontWeight": 800 if is_bold else 500,
+        "isBold": is_bold,
+        "foregroundDensity": round(density, 4),
+        "foregroundBbox": foreground_bbox,
+    }
+
+
+def build_source_word_styles(block: TextBlock, image: Image.Image) -> list[dict[str, Any]]:
+    line_boxes = list(block.line_boxes or []) or [block.bbox]
+    line_texts = list(block.line_texts or []) or [block.text]
+    styles: list[dict[str, Any]] = []
+    for line_index, line_box in enumerate(line_boxes):
+        line_text = line_texts[line_index] if line_index < len(line_texts) else block.text
+        word_boxes = split_line_text_to_word_boxes(line_text, tuple(line_box))
+        for word_index, word in enumerate(word_boxes):
+            text = str(word["text"]).strip()
+            if not text:
+                continue
+            style = sample_word_foreground_style(
+                image,
+                tuple(word["bbox"]),
+                fallback_color=block.color,
+                fallback_weight=block.font_weight,
+            )
+            styles.append(
+                {
+                    "id": source_word_id(block.id, line_index, word_index, text),
+                    "text": text,
+                    "lineIndex": line_index,
+                    "wordIndex": word_index,
+                    "bbox": list(style.get("foregroundBbox") or word["bbox"]),
+                    "estimatedBbox": list(word["bbox"]),
+                    "color": style["color"],
+                    "fontWeight": style["fontWeight"],
+                    "isBold": style["isBold"],
+                    "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
+                    "semanticRole": classify_semantic_role(text),
+                    "foregroundDensity": style.get("foregroundDensity", 0.0),
+                }
+            )
+    return styles
+
+
+def source_word_style_lookup(block: TextBlock) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    for word in block.source_word_styles or []:
+        if not isinstance(word, dict):
+            continue
+        word_id = str(word.get("id") or "").strip()
+        if word_id:
+            lookup[word_id] = word
+        text_key = normalize_ocr_text(str(word.get("text") or ""))
+        if text_key:
+            lookup.setdefault(text_key, word)
+    return lookup
 
 
 def run_trocr_ocr_on_image(image_path: Path) -> list[TextBlock]:
@@ -12106,6 +12342,21 @@ def plain_text_from_segments(segments: Any) -> str:
     return " ".join(parts).strip()
 
 
+def plain_text_from_translation_item(item: dict[str, Any]) -> str:
+    lines = item.get("lines")
+    if isinstance(lines, list):
+        line_texts: list[str] = []
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            text = plain_text_from_segments(line.get("segments"))
+            if text:
+                line_texts.append(text)
+        if line_texts:
+            return "\n".join(line_texts).strip()
+    return plain_text_from_segments(item.get("segments"))
+
+
 def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, translated: bool) -> list[dict[str, Any]]:
     if not isinstance(raw_segments, list):
         return []
@@ -12123,6 +12374,7 @@ def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, transla
         is_bold = normalize_bool(raw.get("is_bold", raw.get("bold", base_style["fontWeight"] >= 700)))
         is_uppercase = normalize_bool(raw.get("is_uppercase", raw.get("all_caps", text.isupper())))
         role = str(raw.get("semantic_role") or raw.get("role") or classify_semantic_role(text)).strip() or "benefit"
+        source_word_hint = str(raw.get("source_word_id") or raw.get("sourceWordId") or "").strip()
         style = dict(base_style)
         style.update(
             {
@@ -12138,12 +12390,75 @@ def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, transla
                 "matchedSourceRole" if translated else "semanticRole": role,
                 "style": style,
                 "sourceSegmentHint": str(raw.get("source_segment_hint") or raw.get("sourceText") or raw.get("source_text") or "").strip(),
+                "sourceWordId": source_word_hint,
                 "forceBreakAfter": bool(raw.get("forceBreakAfter", raw.get("force_break_after", False))),
                 "color": color,
                 "fontWeight": style["fontWeight"],
                 "casing": style["casing"],
                 "semanticStyleKey": f"{role}:{normalize_ocr_text(str(raw.get('source_segment_hint') or text))}",
                 "styleTransferMode": "model_word_level_semantic_mapping",
+            }
+        )
+    return normalized
+
+
+def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: TextBlock) -> list[dict[str, Any]]:
+    base_style = default_typography_style(block)
+    lookup = source_word_style_lookup(block)
+    raw_lines = item.get("lines")
+    flattened: list[tuple[dict[str, Any], bool]] = []
+    if isinstance(raw_lines, list) and raw_lines:
+        for line in raw_lines:
+            if not isinstance(line, dict):
+                continue
+            segments = [segment for segment in line.get("segments", []) if isinstance(segment, dict)]
+            for segment_index, segment in enumerate(segments):
+                flattened.append((segment, segment_index == len(segments) - 1))
+    if not flattened:
+        raw_segments = item.get("segments")
+        if isinstance(raw_segments, list):
+            flattened = [(segment, bool(segment.get("forceBreakAfter", segment.get("force_break_after", False)))) for segment in raw_segments if isinstance(segment, dict)]
+    normalized: list[dict[str, Any]] = []
+    for raw, force_break in flattened:
+        text = repair_mojibake(str(raw.get("text") or raw.get("translatedText") or "").strip())
+        if not text:
+            continue
+        source_id = str(raw.get("source_word_id") or raw.get("sourceWordId") or "").strip()
+        hint = str(raw.get("source_segment_hint") or raw.get("sourceText") or raw.get("source_text") or "").strip()
+        source_style = lookup.get(source_id) if source_id else None
+        if source_style is None and hint:
+            source_style = lookup.get(normalize_ocr_text(hint))
+        if source_style is None:
+            first_token = normalize_ocr_text(text.split()[0]) if text.split() else ""
+            source_style = lookup.get(first_token) if first_token else None
+        color = str((source_style or {}).get("color") or base_style["color"])
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+            color = base_style["color"]
+        font_weight = int((source_style or {}).get("fontWeight") or base_style["fontWeight"])
+        is_uppercase = bool((source_style or {}).get("isUppercase", normalize_bool(raw.get("is_uppercase", raw.get("all_caps", False)))))
+        role = str(raw.get("semantic_role") or raw.get("role") or (source_style or {}).get("semanticRole") or classify_semantic_role(text)).strip() or "benefit"
+        style = dict(base_style)
+        style.update(
+            {
+                "fontWeight": max(800, font_weight) if font_weight >= 700 else min(500, font_weight),
+                "color": color,
+                "casing": "uppercase" if is_uppercase else "mixed",
+            }
+        )
+        segment_text = text.upper() if is_uppercase else text
+        normalized.append(
+            {
+                "translatedText": segment_text,
+                "matchedSourceRole": role,
+                "style": style,
+                "sourceSegmentHint": hint or str((source_style or {}).get("text") or ""),
+                "sourceWordId": source_id or str((source_style or {}).get("id") or ""),
+                "forceBreakAfter": force_break,
+                "color": color,
+                "fontWeight": style["fontWeight"],
+                "casing": style["casing"],
+                "semanticStyleKey": f"{role}:{normalize_ocr_text(source_id or hint or text)}",
+                "styleTransferMode": "deterministic_source_word_foreground_style_cross_line",
             }
         )
     return normalized
@@ -12185,7 +12500,7 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
             align = infer_alignment(bbox, image.width)
         color = str(item.get("color") or "").strip()
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
-            color = estimate_text_color(image.crop(bbox))
+            color = sample_deterministic_text_color(image, bbox, estimate_text_color(image.crop(bbox)))
         font_weight = 800 if str(item.get("font_weight", "")).lower() in {"bold", "700", "800", "900"} or source_text.isupper() else 700
         font_size_estimate = estimate_font_size_from_bbox(bbox)
         line_height_estimate = estimate_line_height_from_bbox(bbox)
@@ -12272,7 +12587,8 @@ def should_preserve_ocr_structure(block: TextBlock, image_size: tuple[int, int])
     return not should_translate_ocr_overlay_block(block, image_size)
 
 
-def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image: Image.Image) -> list[TextBlock]:
+    image_size = image.size
     blocks: list[TextBlock] = []
     seen: set[tuple[str, tuple[int, int, int, int]]] = set()
     for index, source in enumerate(sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
@@ -12285,23 +12601,54 @@ def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[
             continue
         seen.add(key)
         translate = should_translate_ocr_overlay_block(source, image_size)
-        blocks.append(
-            source.model_copy(
+        sampled_color = sample_deterministic_text_color(image, bbox, source.color)
+        line_boxes = (list(source.line_boxes or []) or [bbox]) if translate else []
+        line_texts = (list(source.line_texts or []) or [text]) if translate else []
+        updated = source.model_copy(
+            update={
+                "id": f"ocr-v212-{index}",
+                "text": text,
+                "translated_text": text,
+                "translate": translate,
+                "surface": "overlay" if translate else source.surface,
+                "line_boxes": line_boxes,
+                "line_texts": line_texts,
+                "clean_box": compute_clean_box(bbox, image_size, large_block=False) if translate else None,
+                "color": sampled_color,
+                "font_size_estimate": estimate_font_size_from_bbox(bbox),
+                "line_height_estimate": estimate_line_height_from_bbox(bbox),
+                "align": infer_alignment(bbox, image_size[0]),
+            }
+        )
+        if translate:
+            source_word_styles = build_source_word_styles(updated, image)
+            source_style_spans = [
+                {
+                    "sourceText": word["text"],
+                    "semanticRole": word["semanticRole"],
+                    "sourceWordId": word["id"],
+                    "style": {
+                        **default_typography_style(updated),
+                        "color": word["color"],
+                        "fontWeight": word["fontWeight"],
+                        "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                    },
+                    "color": word["color"],
+                    "fontWeight": word["fontWeight"],
+                    "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                    "forceBreakAfter": False,
+                }
+                for word in source_word_styles
+            ]
+            updated = updated.model_copy(
                 update={
-                    "id": f"ocr-v212-{index}",
-                    "text": text,
-                    "translated_text": text,
-                    "translate": translate,
-                    "surface": "overlay" if translate else source.surface,
-                    "line_boxes": (list(source.line_boxes or []) or [bbox]) if translate else [],
-                    "line_texts": (list(source.line_texts or []) or [text]) if translate else [],
-                    "clean_box": compute_clean_box(bbox, image_size, large_block=False) if translate else None,
-                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
-                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                    "align": infer_alignment(bbox, image_size[0]),
+                    "source_word_styles": source_word_styles,
+                    "source_style_spans": source_style_spans,
+                    "color": source_word_styles[0]["color"] if source_word_styles else sampled_color,
+                    "font_weight": max([int(word.get("fontWeight", 700)) for word in source_word_styles] or [updated.font_weight]),
                 }
             )
-        )
+        blocks.append(updated)
     return blocks
 
 
@@ -12433,6 +12780,72 @@ def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[
     return mapped
 
 
+def fallback_segments_from_translation(block: TextBlock, translated_text: str) -> list[dict[str, Any]]:
+    source_words = [word for word in block.source_word_styles if isinstance(word, dict)]
+    if not source_words:
+        source_words = [{"id": "", "text": block.text, "semanticRole": classify_semantic_role(block.text)}]
+    lines = [line.strip() for line in translated_text.splitlines() if line.strip()] or [translated_text.strip()]
+    output_lines: list[dict[str, Any]] = []
+    cursor = 0
+    for line in lines:
+        segments: list[dict[str, Any]] = []
+        words = [word for word in line.split() if word]
+        for target_word in words:
+            source_style = source_words[min(cursor, len(source_words) - 1)]
+            segments.append(
+                {
+                    "text": target_word,
+                    "source_word_id": source_style.get("id", ""),
+                    "source_segment_hint": source_style.get("text", ""),
+                    "semantic_role": source_style.get("semanticRole", classify_semantic_role(target_word)),
+                }
+            )
+            cursor += 1
+        if segments:
+            output_lines.append({"segments": segments})
+    return output_lines
+
+
+def ensure_v212_translation_coverage(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> dict[str, Any]:
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        items = []
+    mapped = {
+        str(item.get("id") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    missing: list[TextBlock] = []
+    for block in candidates:
+        item = mapped.get(block.id or "")
+        if not item or item.get("translate") is False:
+            missing.append(block)
+            continue
+        text = repair_mojibake(str(item.get("translated_text") or plain_text_from_translation_item(item) or "").strip())
+        if target_language.upper() != "EN" and normalize_ocr_text(text) == normalize_ocr_text(block.text) and not has_packaging_cues(block.text):
+            missing.append(block)
+    if not missing:
+        return {**payload, "blocks": items}
+    translations = translate_with_gpt4o(missing, [target_language]).get(target_language, [block.text for block in missing])
+    for block, translated_text in zip(missing, translations, strict=False):
+        translated_text = preserve_source_metric_tokens(block.text, repair_mojibake(str(translated_text or block.text).strip()))
+        if block.line_boxes and len([line for line in translated_text.splitlines() if line.strip()]) < len(block.line_boxes):
+            translated_text = split_text_across_lines(translated_text, len(block.line_boxes))
+        mapped[block.id or ""] = {
+            "id": block.id,
+            "translate": True,
+            "translated_text": translated_text,
+            "lines": fallback_segments_from_translation(block, translated_text),
+            "coverage_source": "backend_translation_fallback",
+        }
+    ordered: list[dict[str, Any]] = []
+    for block in candidates:
+        item = mapped.get(block.id or "")
+        if item:
+            ordered.append(item)
+    return {**payload, "blocks": ordered, "coverageFallbackApplied": True}
+
+
 def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_language: str) -> dict[str, Any]:
     candidates = [block for block in blocks if block.translate]
     prompt = {
@@ -12443,6 +12856,21 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             {
                 "id": block.id,
                 "source_text": block.text,
+                "source_words": [
+                    {
+                        "id": word.get("id"),
+                        "text": word.get("text"),
+                        "line_index": word.get("lineIndex"),
+                        "word_index": word.get("wordIndex"),
+                        "hex_color_from_foreground_pixels": word.get("color"),
+                        "is_bold": bool(word.get("isBold")),
+                        "font_weight": word.get("fontWeight"),
+                        "is_uppercase": bool(word.get("isUppercase")),
+                        "semantic_role": word.get("semanticRole"),
+                    }
+                    for word in (block.source_word_styles or [])
+                    if isinstance(word, dict)
+                ],
                 "style_hint": {
                     "color": block.color,
                     "is_bold": block.font_weight >= 700,
@@ -12458,6 +12886,10 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "Set translate=false only if the input is not marketing/instructional overlay copy.",
             "Never return x, y, w, h, bbox, or any coordinate.",
             "Translate each input block independently; keep decorative numbers out because they are not in input_blocks.",
+            "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
+            "For every target segment, set source_word_id to the source_words id whose meaning/emphasis the segment inherited.",
+            "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_id.",
+            "If one translated phrase inherits emphasis from multiple source words, split it into multiple adjacent segments so each part keeps the correct source_word_id.",
             *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
@@ -12468,7 +12900,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             parsed = generate_vertex_gemini_json(prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
             if isinstance(parsed.get("blocks"), list):
                 parsed["analysis_provider"] = "vertex-gemini-ocr-layout"
-                return parsed
+                return ensure_v212_translation_coverage(parsed, candidates, target_language)
     except Exception as exc:
         print(f"[localize-v2.1.2] Vertex Gemini OCR translation failed: {exc}", flush=True)
     try:
@@ -12486,10 +12918,10 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             parsed = extract_json_object(response.choices[0].message.content or "{}")
             if isinstance(parsed.get("blocks"), list):
                 parsed["analysis_provider"] = "openai-text-ocr-layout"
-                return parsed
+                return ensure_v212_translation_coverage(parsed, candidates, target_language)
     except Exception as exc:
         print(f"[localize-v2.1.2] OpenAI OCR translation failed: {exc}", flush=True)
-    return {"analysis_provider": "deterministic-ocr-fallback", "blocks": []}
+    return ensure_v212_translation_coverage({"analysis_provider": "deterministic-ocr-fallback", "blocks": []}, candidates, target_language)
 
 
 def apply_v212_translations(blocks: list[TextBlock], payload: dict[str, Any]) -> list[TextBlock]:
@@ -12505,20 +12937,14 @@ def apply_v212_translations(blocks: list[TextBlock], payload: dict[str, Any]) ->
             continue
         translated_text = repair_mojibake(str(item.get("translated_text") or "").strip())
         if not translated_text:
-            translated_text = repair_mojibake(plain_text_from_segments(item.get("segments"))) or block.text
-        translated_style_spans = normalize_rich_text_segments(item.get("segments"), block=block, translated=True)
+            translated_text = repair_mojibake(plain_text_from_translation_item(item)) or block.text
+        translated_style_spans = normalize_cross_line_rich_text_segments(item, block=block)
         source_style_spans = normalize_rich_text_segments(item.get("source_style_segments"), block=block, translated=False)
         if not translated_style_spans:
-            source_style_spans = source_style_spans or infer_source_style_spans(block.text, block)
+            source_style_spans = source_style_spans or block.source_style_spans or infer_source_style_spans(block.text, block)
             translated_style_spans = infer_translated_style_spans(block.text, translated_text, source_style_spans, block)
         elif not source_style_spans:
-            source_color = block.color if re.fullmatch(r"#[0-9a-fA-F]{6}", block.color or "") else "#111111"
-            recolored_spans: list[dict[str, Any]] = []
-            for span in translated_style_spans:
-                style = dict(span.get("style") or {})
-                style["color"] = source_color
-                recolored_spans.append({**span, "style": style, "color": source_color})
-            translated_style_spans = recolored_spans
+            source_style_spans = block.source_style_spans or infer_source_style_spans(block.text, block)
         updated.append(
             block.model_copy(
                 update={
@@ -12535,10 +12961,10 @@ def strict_mask_dilation_px(image_size: tuple[int, int]) -> int:
     configured = os.getenv("ADAPTIFAI_STRICT_MASK_DILATION_PX", "").strip()
     if configured:
         try:
-            return max(5, min(18, int(configured)))
+            return max(0, min(2, int(configured)))
         except ValueError:
             pass
-    return max(5, min(10, int(round(max(image_size) * 0.008))))
+    return 2
 
 
 def strict_mask_feather_px(image_size: tuple[int, int]) -> float:
@@ -12561,6 +12987,25 @@ def dilate_mask(mask: Image.Image, dilation_px: int) -> Image.Image:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     dilated = cv2.dilate(mask_np, kernel, iterations=1)
     return Image.fromarray(dilated, mode="L")
+
+
+def confinement_mask_for_boxes(image_size: tuple[int, int], boxes: list[tuple[int, int, int, int]], pad_px: int = 2) -> Image.Image:
+    mask = Image.new("L", image_size, 0)
+    draw = ImageDraw.Draw(mask)
+    width, height = image_size
+    for left, top, right, bottom in boxes:
+        if right <= left or bottom <= top:
+            continue
+        draw.rectangle(
+            (
+                max(0, left - pad_px),
+                max(0, top - pad_px),
+                min(width, right + pad_px),
+                min(height, bottom + pad_px),
+            ),
+            fill=255,
+        )
+    return mask
 
 
 def should_use_rectangular_strict_mask(block: TextBlock, image_size: tuple[int, int]) -> bool:
@@ -12600,11 +13045,33 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
     full = Image.new("L", image.size, 0)
     full_np = np.array(full)
     image_rgb = image.convert("RGB")
+    word_styles = [word for word in (block.source_word_styles or []) if isinstance(word, dict) and word.get("bbox")]
+    for word in word_styles:
+        try:
+            word_box = tuple(int(value) for value in word.get("bbox", [])[:4])
+        except Exception:
+            continue
+        if len(word_box) != 4:
+            continue
+        crop_box = expand_bbox(word_box, image.size, 2)
+        x1, y1, x2, y2 = crop_box
+        if x2 <= x1 or y2 <= y1:
+            continue
+        crop = np.array(image_rgb.crop(crop_box), dtype=np.uint8)
+        foreground = choose_foreground_text_mask(crop).astype(np.uint8) * 255
+        if foreground.max() == 0:
+            continue
+        kernel_size = max(3, min(2, dilation_px) * 2 + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        foreground = cv2.dilate(foreground, kernel, iterations=1)
+        word_confinement = np.array(confinement_mask_for_boxes(image.size, [word_box], pad_px=2).crop(crop_box).convert("L"))
+        foreground = cv2.bitwise_and(foreground, word_confinement)
+        full_np[y1:y2, x1:x2] = np.maximum(full_np[y1:y2, x1:x2], foreground[: y2 - y1, : x2 - x1])
     for box in list(block.line_boxes or []) or [block.bbox]:
         left, top, right, bottom = box
         if right <= left or bottom <= top:
             continue
-        crop_box = expand_bbox((left, top, right, bottom), image.size, max(2, min(6, dilation_px)))
+        crop_box = expand_bbox((left, top, right, bottom), image.size, 2)
         crop = np.array(image_rgb.crop(crop_box))
         if crop.size == 0:
             continue
@@ -12646,8 +13113,7 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
             filtered[labels == label] = 255
         if filtered.max() == 0:
             filtered = candidate
-        dynamic_dilation = dilation_px + (2 if np.percentile(local_delta, 90) <= 22 else 1)
-        kernel_size = max(3, dynamic_dilation * 2 + 1)
+        kernel_size = max(3, min(2, dilation_px) * 2 + 1)
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         filtered = cv2.dilate(filtered, dilate_kernel, iterations=1)
         x1, y1, x2, y2 = crop_box
@@ -12689,6 +13155,10 @@ def build_strict_text_removal_mask(
             elif contour_mask.getbbox():
                 block_mask = contour_mask
             if isinstance(block_mask, Image.Image) and block_mask.getbbox():
+                block_mask = ImageChops.multiply(
+                    block_mask.convert("L").resize(image.size),
+                    confinement_mask_for_boxes(image.size, source_boxes, pad_px=2),
+                )
                 raw = ImageChops.lighter(raw, block_mask.convert("L").resize(image.size))
                 mask_reports.append(
                     {
@@ -12705,6 +13175,7 @@ def build_strict_text_removal_mask(
         except Exception as exc:
             mask_reports.append({"block": block.id, "status": "precise_mask_failed", "failure": str(exc)[:160]})
         contour = build_ocr_contour_text_mask(image, block, dilation_px)
+        contour = ImageChops.multiply(contour.convert("L"), confinement_mask_for_boxes(image.size, source_boxes, pad_px=2))
         raw = ImageChops.lighter(raw, contour)
         mask_reports.append(
             {
@@ -13062,7 +13533,6 @@ def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: li
             fill_rgb = dominant_background_fill_color(sample, local_mask)
             patch = Image.new("RGB", (sample_box[2] - sample_box[0], sample_box[3] - sample_box[1]), fill_rgb)
             patch_mask = mask_l.crop(sample_box)
-            patch_mask = dilate_mask(patch_mask, max(1, min(3, strict_mask_dilation_px(source.size) // 2)))
             if env_flag("ADAPTIFAI_LOCALIZE_V213_SEAMLESS_LOCAL_FILL", "0"):
                 region_base = result.crop(sample_box)
                 patch_candidate = Image.new("RGB", region_base.size, fill_rgb)
@@ -13348,7 +13818,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             if should_preserve_ocr_structure(block, source_image.size)
         ]
         for language in languages:
-            ocr_layout_blocks = deterministic_v212_ocr_blocks(ocr_lines, source_image.size)
+            ocr_layout_blocks = deterministic_v212_ocr_blocks(ocr_lines, source_image)
             payload = analyze_localize_v212_ocr_translations(ocr_layout_blocks, language)
             blocks = [block for block in apply_v212_translations(ocr_layout_blocks, payload) if block.translate]
             translations_summary[language] = [block.translated_text or block.text for block in blocks]
