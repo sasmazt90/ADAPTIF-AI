@@ -1930,7 +1930,7 @@ def sample_word_foreground_style(
     is_bold = fallback_weight >= 700 or density >= 0.24
     return {
         "color": color,
-        "fontWeight": 800 if is_bold else 500,
+        "fontWeight": 700 if is_bold else 400,
         "isBold": is_bold,
         "fontCategory": "sans-serif",
         "foregroundDensity": round(density, 4),
@@ -2024,6 +2024,7 @@ def sample_polygon_foreground_style(
     density = float(foreground.sum()) / max(1, int(polygon_region.sum()))
     core_density = float(core.sum()) / max(1, int(polygon_region.sum()))
     height = max(1, bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])
+    font_size = max(8, int(height))
     outline_like = (
         height >= 28
         and density <= 0.18
@@ -2033,7 +2034,9 @@ def sample_polygon_foreground_style(
     is_bold = fallback_weight >= 700 or density >= 0.24 or outline_like
     return {
         "color": color,
-        "fontWeight": 800 if is_bold else 500,
+        "fontWeight": 700 if is_bold else 400,
+        "fontSize": font_size,
+        "lineHeight": max(font_size + 2, int(round(font_size * 1.12))),
         "isBold": is_bold,
         "fontCategory": "sans-serif",
         "foregroundDensity": round(density, 4),
@@ -2076,6 +2079,8 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
                 "symbolPolygons": [[list(point) for point in polygon] for polygon in (word.symbol_polygons or [word.polygon])],
                 "color": style["color"],
                 "fontWeight": style["fontWeight"],
+                "fontSize": style.get("fontSize", max(8, word.bbox[3] - word.bbox[1])),
+                "lineHeight": style.get("lineHeight", max(10, int((word.bbox[3] - word.bbox[1]) * 1.12))),
                 "fontCategory": style.get("fontCategory", "sans-serif"),
                 "isBold": style["isBold"],
                 "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
@@ -2122,7 +2127,29 @@ def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[
     dominant.update(
         {
             "color": str(dominant_color_style.get("color") or base_style["color"]),
-            "fontWeight": 800 if max_weight >= 700 else min(500, max_weight),
+            "fontWeight": 700 if max_weight >= 700 else 400,
+            "fontSize": max(
+                8,
+                int(
+                    round(
+                        max(
+                            float(item.get("fontSize") or item.get("font_size") or base_style.get("fontSize") or 16)
+                            for item in source_styles
+                        )
+                    )
+                ),
+            ),
+            "lineHeight": max(
+                10,
+                int(
+                    round(
+                        max(
+                            float(item.get("lineHeight") or item.get("line_height") or base_style.get("lineHeight") or 18)
+                            for item in source_styles
+                        )
+                    )
+                ),
+            ),
             "casing": "uppercase" if uppercase_votes > len(source_styles) / 2 else "mixed",
             "fontCategory": str(dominant_color_style.get("fontCategory") or base_style.get("fontCategory") or "sans-serif"),
             "strokeWidth": max(int(item.get("strokeWidth") or 0) for item in source_styles),
@@ -8240,16 +8267,16 @@ def get_font_for_style(style: dict[str, Any], size: int):
 
 
 def span_token_width(draw: ImageDraw.ImageDraw, token: dict[str, Any], *, first_in_line: bool, scale_factor: float) -> float:
-    base_size = max(10, int(token["style"].get("fontSize", 16)))
-    size = max(10, int(round(base_size * scale_factor)))
+    base_size = max(8, int(token["style"].get("fontSize", 16)))
+    size = max(8, int(round(base_size * scale_factor)))
     font = get_font_for_style(token["style"], size)
     text = token["text"] if first_in_line else f" {token['text']}"
     return text_width(draw, text, font)
 
 
 def span_token_metrics(token: dict[str, Any], scale_factor: float) -> dict[str, Any]:
-    base_size = max(10, int(token["style"].get("fontSize", 16)))
-    size = max(10, int(round(base_size * scale_factor)))
+    base_size = max(8, int(token["style"].get("fontSize", 16)))
+    size = max(8, int(round(base_size * scale_factor)))
     font = get_font_for_style(token["style"], size)
     try:
         ascent, descent = font.getmetrics()
@@ -10131,6 +10158,13 @@ def google_vision_word_blocks(image_path: Path, image_size: tuple[int, int]) -> 
     return words
 
 
+def is_v5_numeric_bypass_text(text: str) -> bool:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return False
+    return bool(re.fullmatch(r"[\d]+(?:[.)])?", cleaned))
+
+
 def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[list[TextBlock], list[TextBlock], dict[str, Any]]:
     if not words:
         return [], [], {"provider": "google-cloud-vision", "wordCount": 0, "mode": "polygon"}
@@ -10144,7 +10178,9 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         else:
             overlay_words.append(word.model_copy(update={"translate": True, "surface": "overlay"}))
 
-    ordered = sorted(overlay_words, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0]))
+    numeric_bypass_words = [word for word in overlay_words if is_v5_numeric_bypass_text(word.text)]
+    textual_overlay_words = [word for word in overlay_words if not is_v5_numeric_bypass_text(word.text)]
+    ordered = sorted(textual_overlay_words, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0]))
     lines: list[list[TextBlock]] = []
     for word in ordered:
         cy = (word.bbox[1] + word.bbox[3]) / 2
@@ -10189,6 +10225,61 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
             groups.append(line)
 
     blocks: list[TextBlock] = []
+    for numeric_index, word in enumerate(sorted(numeric_bypass_words, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
+        block = TextBlock(
+            id=f"v5-numeric-{numeric_index}",
+            text=word.text,
+            role="numeric_claim",
+            translate=False,
+            bbox=word.bbox,
+            clean_box=word.bbox,
+            polygon=list(word.polygon or []),
+            line_polygons=[list(word.polygon or [])] if word.polygon else [],
+            symbol_polygons=list(word.symbol_polygons or []),
+            line_boxes=[word.bbox],
+            line_texts=[word.text],
+            color=sample_deterministic_text_color(image, word.bbox, "#111111"),
+            font_weight=word.font_weight or 700,
+            font_size_estimate=max(8, word.bbox[3] - word.bbox[1]),
+            line_height_estimate=max(10, int((word.bbox[3] - word.bbox[1]) * 1.12)),
+            align="left",
+            surface="overlay",
+            translated_text=word.text,
+            render_strategy="v5_numeric_bypass",
+        )
+        source_word_styles = build_v5_polygon_source_word_styles([word], block, image)
+        if source_word_styles:
+            block = block.model_copy(
+                update={
+                    "source_word_styles": source_word_styles,
+                    "source_style_spans": [
+                        {
+                            "sourceText": source_word_styles[0]["text"],
+                            "semanticRole": "numeric_claim",
+                            "sourceWordId": source_word_styles[0]["id"],
+                            "style": {
+                                **default_typography_style(block),
+                                "color": source_word_styles[0]["color"],
+                                "fontWeight": source_word_styles[0]["fontWeight"],
+                                "fontSize": source_word_styles[0].get("fontSize", block.font_size_estimate),
+                                "lineHeight": source_word_styles[0].get("lineHeight", block.line_height_estimate),
+                                "fontCategory": source_word_styles[0].get("fontCategory", "sans-serif"),
+                                "casing": "uppercase" if source_word_styles[0].get("isUppercase") else "mixed",
+                            },
+                            "color": source_word_styles[0]["color"],
+                            "fontWeight": source_word_styles[0]["fontWeight"],
+                            "fontCategory": source_word_styles[0].get("fontCategory", "sans-serif"),
+                            "casing": "uppercase" if source_word_styles[0].get("isUppercase") else "mixed",
+                            "forceBreakAfter": False,
+                        }
+                    ],
+                    "color": source_word_styles[0]["color"],
+                    "font_weight": int(source_word_styles[0].get("fontWeight") or block.font_weight),
+                    "font_size_estimate": int(source_word_styles[0].get("fontSize") or block.font_size_estimate),
+                    "line_height_estimate": int(source_word_styles[0].get("lineHeight") or block.line_height_estimate),
+                }
+            )
+        blocks.append(block)
     for index, group in enumerate(groups, start=1):
         group = sorted(group, key=lambda item: (item.bbox[1], item.bbox[0]))
         line_groups: list[list[TextBlock]] = []
@@ -10239,6 +10330,8 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                     **default_typography_style(block),
                     "color": word["color"],
                     "fontWeight": word["fontWeight"],
+                    "fontSize": word.get("fontSize", block.font_size_estimate),
+                    "lineHeight": word.get("lineHeight", block.line_height_estimate),
                     "fontCategory": word.get("fontCategory", "sans-serif"),
                     "strokeWidth": word.get("strokeWidth", 0),
                     "strokeFill": word.get("strokeFill"),
@@ -10269,6 +10362,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         "preserveDecision": "polygon_to_product_mask_overlap_only",
         "wordCount": len(words),
         "overlayWordCount": len(overlay_words),
+        "numericBypassWordCount": len(numeric_bypass_words),
         "protectedWordCount": len(protected_words),
         "blockCount": len(blocks),
     }
@@ -13040,7 +13134,9 @@ def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, transla
         style = dict(base_style)
         style.update(
             {
-                "fontWeight": max(base_style["fontWeight"], 800) if is_bold else min(base_style["fontWeight"], 500),
+                "fontWeight": 700 if is_bold else 400,
+                "fontSize": max(8, int(round(float(raw.get("font_size") or raw.get("fontSize") or base_style.get("fontSize") or 16)))),
+                "lineHeight": max(10, int(round(float(raw.get("line_height") or raw.get("lineHeight") or base_style.get("lineHeight") or 18)))),
                 "color": color,
                 "casing": "uppercase" if is_uppercase else "mixed",
                 "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or base_style.get("fontCategory")),
@@ -13104,7 +13200,9 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
         style = dict(base_style)
         style.update(
             {
-                "fontWeight": max(800, font_weight) if font_weight >= 700 else min(500, font_weight),
+                "fontWeight": 700 if font_weight >= 700 else 400,
+                "fontSize": max(8, int(round(float(inherited_style.get("fontSize") or base_style.get("fontSize") or 16)))),
+                "lineHeight": max(10, int(round(float(inherited_style.get("lineHeight") or base_style.get("lineHeight") or 18)))),
                 "color": color,
                 "casing": "uppercase" if is_uppercase else "mixed",
                 "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or inherited_style.get("fontCategory") or base_style.get("fontCategory")),
@@ -14698,15 +14796,78 @@ def fit_styled_spans_strict(
     return best or {"scaleFactor": 1.0, "lines": [], "widest": 0, "totalHeight": 0, "overflow": max_width + max_height}
 
 
+def is_v5_block(block: TextBlock) -> bool:
+    return bool(block.id and str(block.id).startswith("v5-"))
+
+
+def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tuple[int, int, int, int]:
+    width, height = canvas_size
+    boxes = [
+        tuple(int(value) for value in (word.get("bbox") or word.get("estimatedBbox") or []))
+        for word in (block.source_word_styles or [])
+        if isinstance(word, dict) and len(word.get("bbox") or word.get("estimatedBbox") or []) == 4
+    ]
+    boxes = [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
+    if not boxes:
+        return block.bbox
+    if len(boxes) >= 3:
+        ordered = sorted(boxes, key=lambda item: item[0])
+        median_height = float(np.median([box[3] - box[1] for box in ordered]))
+        split_gap = max(24, int(round(median_height * 1.7)))
+        clusters: list[list[tuple[int, int, int, int]]] = [[ordered[0]]]
+        for box in ordered[1:]:
+            previous = clusters[-1][-1]
+            if box[0] - previous[2] > split_gap:
+                clusters.append([box])
+            else:
+                clusters[-1].append(box)
+        if len(clusters) > 1:
+            def cluster_score(cluster: list[tuple[int, int, int, int]]) -> tuple[int, int, int]:
+                area = sum(max(1, box[2] - box[0]) * max(1, box[3] - box[1]) for box in cluster)
+                right_edge = max(box[2] for box in cluster)
+                return (len(cluster), area, right_edge)
+
+            boxes = max(clusters, key=cluster_score)
+    left = min(box[0] for box in boxes)
+    top = min(box[1] for box in boxes)
+    right = max(box[2] for box in boxes)
+    bottom = max(box[3] for box in boxes)
+    pad_x = 1
+    pad_y = 1
+    return (
+        max(0, left + pad_x),
+        max(0, top + pad_y),
+        min(width, right - pad_x),
+        min(height, bottom - pad_y),
+    )
+
+
+def draw_v5_numeric_bypass(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
+    style = (block.source_word_styles or [{}])[0] if block.source_word_styles else {}
+    box = tuple(int(value) for value in (style.get("bbox") or block.bbox))
+    color = str(style.get("color") or block.color or "#111111")
+    font_size = max(8, int(style.get("fontSize") or block.font_size_estimate or max(8, box[3] - box[1])))
+    font_weight = int(style.get("fontWeight") or block.font_weight or 700)
+    font = get_font(font_size, bold=font_weight >= 700, category=str(style.get("fontCategory") or "sans-serif"))
+    text = block.text.strip()
+    text_box = draw.textbbox((0, 0), text, font=font)
+    x = box[0] - text_box[0]
+    y = box[1] - text_box[1]
+    draw.text((x, y), text, fill=color, font=font)
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     for block in blocks:
+        if block.render_strategy == "v5_numeric_bypass":
+            draw_v5_numeric_bypass(draw, block)
+            continue
         text = block.translated_text or block.text
         if block_has_rich_text_segments(block):
-            box = block.bbox
-            pad_x = max(2, int((box[2] - box[0]) * 0.02))
-            pad_y = max(1, int((box[3] - box[1]) * 0.02))
+            box = v5_strict_render_box(block, canvas.size) if is_v5_block(block) else block.bbox
+            pad_x = 1 if is_v5_block(block) else max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = 1 if is_v5_block(block) else max(1, int((box[3] - box[1]) * 0.02))
             render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
             base_typography = default_typography_style(block)
             layout = fit_styled_spans_strict(
@@ -14786,7 +14947,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
         ocr_layout_blocks, protected_ocr_lines, v5_meta = group_v5_polygon_words(vision_words, source_image)
         for language in languages:
             payload = analyze_localize_v212_ocr_translations(ocr_layout_blocks, language)
-            blocks = [block for block in apply_v212_translations(ocr_layout_blocks, payload) if block.translate]
+            blocks = [
+                block
+                for block in apply_v212_translations(ocr_layout_blocks, payload)
+                if block.translate or block.render_strategy == "v5_numeric_bypass"
+            ]
             translations_summary[language] = [block.translated_text or block.text for block in blocks]
             mask, mask_meta = build_strict_text_removal_mask(source_image, blocks, protected_ocr_lines)
             cleaned, cleanup_meta = inpaint_localize_v2_base(source_image, mask, blocks) if blocks else (source_image.copy(), {"provider": "none"})
