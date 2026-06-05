@@ -8582,8 +8582,6 @@ def render_styled_spans(
             x = box[0] + max(0, (box[2] - box[0] - line_width) // 2)
 
         baseline = y + int(line.get("maxAscent", 0))
-        line_font_size = line.get("lineFontSize", 16)
-
         for token_index, token in enumerate(line.get("tokens", [])):
             token_text = token["text"]
             font = token["font"]
@@ -8631,13 +8629,10 @@ def render_styled_spans(
 
             # V6.4 Kuralı: X-Advance için Explicit Space ekle
             # Explicit Space xAdvance
-            if precise_inline or "xAdvance" in token:
-                x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
-            else:
-                x += text_width(draw, token_text, font)
+            x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
 
         # KESİN MATEMATİK: Satır arası ezilmeyi engellemek için tipografik nefes payı (%25)
-        y += int(line.get("lineHeight", 0)) + int(line_font_size * 0.25)
+        y += int(line.get("lineHeight", 0))
 
     return rendered_spans, span_render_boxes
 
