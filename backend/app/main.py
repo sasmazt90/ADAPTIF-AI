@@ -762,6 +762,11 @@ PACKAGING_CUE_TERMS = (
     "sensibio",
     "atoderm",
     "sebium",
+    "sébium",
+    "serum",
+    "bioder",
+    "boder",
+    "toder",
     "naos",
     "laboratoire",
     "dermatologique",
@@ -12257,6 +12262,56 @@ def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[
     return blocks
 
 
+def merge_v212_ocr_fragments_into_lines(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+    if not ocr_lines:
+        return []
+    image_width, _ = image_size
+    numeric = [block for block in ocr_lines if is_decorative_or_numeric_only(block.text)]
+    textual = [block for block in ocr_lines if not is_decorative_or_numeric_only(block.text)]
+    ordered = sorted(textual, key=lambda block: ((block.bbox[1] + block.bbox[3]) / 2, block.bbox[0]))
+    groups: list[list[TextBlock]] = []
+    for block in ordered:
+        center_y = (block.bbox[1] + block.bbox[3]) / 2
+        height = max(1, block.bbox[3] - block.bbox[1])
+        matched: list[TextBlock] | None = None
+        for group in groups:
+            group_box = union_bbox([item.bbox for item in group]) or block.bbox
+            group_center_y = (group_box[1] + group_box[3]) / 2
+            group_height = max(1, group_box[3] - group_box[1])
+            horizontal_gap = max(0, block.bbox[0] - group_box[2], group_box[0] - block.bbox[2])
+            if abs(center_y - group_center_y) <= max(height, group_height) * 0.42 and horizontal_gap <= image_width * 0.085:
+                matched = group
+                break
+        if matched is None:
+            groups.append([block])
+        else:
+            matched.append(block)
+    merged: list[TextBlock] = []
+    for group in groups:
+        ordered_group = sorted(group, key=lambda item: item.bbox[0])
+        bbox = union_bbox([item.bbox for item in ordered_group]) or ordered_group[0].bbox
+        text = " ".join(item.text.strip() for item in ordered_group if item.text.strip())
+        if not text:
+            continue
+        merged.append(
+            ordered_group[0].model_copy(
+                update={
+                    "text": text,
+                    "bbox": bbox,
+                    "clean_box": compute_clean_box(bbox, image_size),
+                    "role": classify_text_role(text),
+                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
+                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
+                    "align": infer_alignment(bbox, image_size[0]),
+                    "line_boxes": [bbox],
+                    "line_texts": [text],
+                    "color": ordered_group[0].color,
+                }
+            )
+        )
+    return sorted([*numeric, *merged], key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
 def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     items = payload.get("blocks", [])
     if not isinstance(items, list):
@@ -12350,6 +12405,14 @@ def apply_v212_translations(blocks: list[TextBlock], payload: dict[str, Any]) ->
         if not translated_style_spans:
             source_style_spans = source_style_spans or infer_source_style_spans(block.text, block)
             translated_style_spans = infer_translated_style_spans(block.text, translated_text, source_style_spans, block)
+        elif not source_style_spans:
+            source_color = block.color if re.fullmatch(r"#[0-9a-fA-F]{6}", block.color or "") else "#111111"
+            recolored_spans: list[dict[str, Any]] = []
+            for span in translated_style_spans:
+                style = dict(span.get("style") or {})
+                style["color"] = source_color
+                recolored_spans.append({**span, "style": style, "color": source_color})
+            translated_style_spans = recolored_spans
         updated.append(
             block.model_copy(
                 update={
@@ -12518,6 +12581,7 @@ def build_strict_text_removal_mask(
                     {
                         "block": block.id,
                         "status": stroke.get("maskQualityStatus"),
+                        "strategy": "precise_text_stroke_contour_with_dilation",
                         "failure": stroke.get("maskFailureReason"),
                         "whitePixelRatio": stroke.get("whitePixelRatio"),
                         "textCoverageEstimate": stroke.get("textCoverageEstimate"),
@@ -12834,7 +12898,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
     # providers can hallucinate residual letters even when instructed not to.
     if env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "0"):
         return strict_local_fill_cleanup(image, mask, blocks or [])
-    if blocks:
+    split_small_overlay = not env_flag("ADAPTIFAI_LOCALIZE_V212_PROVIDER_CLEANUP", "1")
+    if blocks and split_small_overlay:
         large_blocks = [block for block in blocks if should_use_rectangular_strict_mask(block, image.size)]
         small_blocks = [block for block in blocks if block not in large_blocks]
         working = image
@@ -12854,7 +12919,7 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
     if replicate_result is not None:
         meta: dict[str, Any] = {"provider": "replicate", "model": resolved_replicate_lama_model()}
         if blocks:
-            meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "replicate"}
+            meta["splitCleanup"] = {"provider": "replicate", "maskMode": "contour" if not split_small_overlay else "split"}
         return composite_provider_cleanup_over_source(image, replicate_result, mask), meta
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
@@ -13060,7 +13125,10 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
     manifest_assets: list[dict[str, Any]] = []
     for image_path in image_paths(paths):
         source_image = Image.open(image_path).convert("RGB")
-        ocr_lines = explode_ocr_blocks_to_lines(run_trocr_ocr_on_image(image_path), source_image.size)
+        ocr_lines = merge_v212_ocr_fragments_into_lines(
+            explode_ocr_blocks_to_lines(run_trocr_ocr_on_image(image_path), source_image.size),
+            source_image.size,
+        )
         protected_ocr_lines = [
             block.model_copy(update={"translate": False, "surface": "packaging"})
             for block in ocr_lines
