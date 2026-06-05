@@ -1166,7 +1166,11 @@ def should_translate_split_overlay_line(
     height = max(1, bbox[3] - bbox[1])
     area_ratio = (width * height) / max(1, image_width * image_height)
     overlap_with_foreground = overlap_fraction(bbox, foreground_bbox) if foreground_bbox else 0.0
-    if has_packaging_cues(text):
+    instructional_context = any(
+        term in normalized
+        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
+    )
+    if has_packaging_cues(text) and not instructional_context:
         return False
     if overlap_with_foreground >= 0.18 and area_ratio <= 0.045:
         return False
@@ -2200,6 +2204,24 @@ def repair_mojibake(text: str) -> str:
         except (UnicodeEncodeError, UnicodeDecodeError):
             return text
     return repaired if repaired else text
+
+
+def repair_mojibake(text: str) -> str:
+    if not any(marker in text for marker in ("Ã", "Ä", "Å", "Â", "â€", "â€“", "â€™")):
+        return text
+    candidates = [text]
+    for encoding in ("latin1", "cp1252"):
+        try:
+            candidates.append(text.encode(encoding).decode("utf-8"))
+        except (UnicodeEncodeError, UnicodeDecodeError):
+            pass
+
+    def score(candidate: str) -> int:
+        penalty = sum(candidate.count(marker) for marker in ("Ã", "Ä", "Å", "Â", "�")) * 8
+        reward = sum(candidate.count(char) for char in "çğıöşüÇĞİÖŞÜ") * 2
+        return reward - penalty
+
+    return max(candidates, key=score)
 
 
 def text_changed(source: str, translated: str | None) -> bool:
@@ -12218,7 +12240,13 @@ def should_translate_ocr_overlay_block(block: TextBlock, image_size: tuple[int, 
     box_height = max(1, block.bbox[3] - block.bbox[1])
     image_width, image_height = image_size
     area_ratio = (box_width * box_height) / max(1, image_width * image_height)
-    if has_packaging_cues(text):
+    if block.bbox[1] >= image_height * 0.45 and box_height <= image_height * 0.09 and area_ratio <= 0.014:
+        return False
+    instructional_context = any(
+        term in normalized
+        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
+    )
+    if has_packaging_cues(text) and not instructional_context:
         return False
     if any(token in normalized for token in ("www.", ".com", ".de", "http", "qr", "ask.naos")):
         return False
@@ -12250,8 +12278,8 @@ def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[
                     "translated_text": text,
                     "translate": translate,
                     "surface": "overlay" if translate else source.surface,
-                    "line_boxes": [bbox] if translate else [],
-                    "line_texts": [text] if translate else [],
+                    "line_boxes": (list(source.line_boxes or []) or [bbox]) if translate else [],
+                    "line_texts": (list(source.line_texts or []) or [text]) if translate else [],
                     "clean_box": compute_clean_box(bbox, image_size, large_block=False) if translate else None,
                     "font_size_estimate": estimate_font_size_from_bbox(bbox),
                     "line_height_estimate": estimate_line_height_from_bbox(bbox),
@@ -12310,6 +12338,69 @@ def merge_v212_ocr_fragments_into_lines(ocr_lines: list[TextBlock], image_size: 
             )
         )
     return sorted([*numeric, *merged], key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
+def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+    if not ocr_lines:
+        return []
+    ordered = sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0]))
+    consumed: set[int] = set()
+    output: list[TextBlock] = []
+    instruction_terms = {
+        "with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak",
+        "ile", "uygula", "kullan", "durula", "temizle",
+    }
+    for index, block in enumerate(ordered):
+        if index in consumed:
+            continue
+        text_norm = normalize_ocr_text(block.text)
+        is_instruction = (
+            not is_decorative_or_numeric_only(block.text)
+            and not block.text.strip().isupper()
+            and any(term in text_norm for term in instruction_terms)
+        )
+        if not is_instruction:
+            output.append(block)
+            continue
+        block_h = max(1, block.bbox[3] - block.bbox[1])
+        block_w = max(1, block.bbox[2] - block.bbox[0])
+        attached: list[TextBlock] = [block]
+        for other_index, other in enumerate(ordered[index + 1 :], start=index + 1):
+            if other_index in consumed:
+                continue
+            if not has_packaging_cues(other.text):
+                continue
+            gap_y = other.bbox[1] - block.bbox[3]
+            overlap_x = max(0, min(block.bbox[2], other.bbox[2]) - max(block.bbox[0], other.bbox[0]))
+            near_same_copy = (
+                -block_h * 0.75 <= gap_y <= block_h * 0.85
+                and (overlap_x >= min(block_w, max(1, other.bbox[2] - other.bbox[0])) * 0.22 or abs(other.bbox[0] - block.bbox[0]) <= image_size[0] * 0.08)
+            )
+            if near_same_copy:
+                attached.append(other)
+                consumed.add(other_index)
+                break
+        if len(attached) == 1:
+            output.append(block)
+            continue
+        attached_sorted = sorted(attached, key=lambda item: (item.bbox[1], item.bbox[0]))
+        bbox = union_bbox([item.bbox for item in attached_sorted]) or block.bbox
+        text = " ".join(item.text.strip() for item in attached_sorted if item.text.strip())
+        output.append(
+            block.model_copy(
+                update={
+                    "text": text,
+                    "bbox": bbox,
+                    "clean_box": compute_clean_box(bbox, image_size),
+                    "line_boxes": [item.bbox for item in attached_sorted],
+                    "line_texts": [item.text.strip() for item in attached_sorted if item.text.strip()],
+                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
+                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
+                    "align": infer_alignment(bbox, image_size[0]),
+                }
+            )
+        )
+    return sorted(output, key=lambda item: (item.bbox[1], item.bbox[0]))
 
 
 def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -12575,6 +12666,11 @@ def build_strict_text_removal_mask(
                 allow_protected_overlap=False,
             )
             block_mask = stroke.get("inpaintMask_binary") or stroke.get("final")
+            contour_mask = build_ocr_contour_text_mask(image, block, dilation_px=dilation_px)
+            if isinstance(block_mask, Image.Image):
+                block_mask = ImageChops.lighter(block_mask.convert("L").resize(image.size), contour_mask.convert("L").resize(image.size))
+            elif contour_mask.getbbox():
+                block_mask = contour_mask
             if isinstance(block_mask, Image.Image) and block_mask.getbbox():
                 raw = ImageChops.lighter(raw, block_mask.convert("L").resize(image.size))
                 mask_reports.append(
@@ -12852,10 +12948,7 @@ def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: li
     result = base.copy()
     mask_l = mask.convert("L")
     for block in blocks:
-        boxes = []
-        if block.clean_box:
-            boxes.append(block.clean_box)
-        boxes.extend(block.line_boxes or [block.bbox])
+        boxes = list(block.line_boxes or [block.bbox])
         for box in boxes:
             left, top, right, bottom = box
             if right <= left or bottom <= top:
@@ -12877,6 +12970,17 @@ def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: li
             fill_rgb = tuple(int(value) for value in np.median(border_pixels.reshape(-1, 3), axis=0))
             patch = Image.new("RGB", (sample_box[2] - sample_box[0], sample_box[3] - sample_box[1]), fill_rgb)
             patch_mask = mask_l.crop(sample_box)
+            rect_mask = Image.new("L", patch.size, 0)
+            rect_draw = ImageDraw.Draw(rect_mask)
+            rel_box = (
+                max(0, left - sample_box[0] - 2),
+                max(0, top - sample_box[1] - 2),
+                min(patch.size[0], right - sample_box[0] + 2),
+                min(patch.size[1], bottom - sample_box[1] + 2),
+            )
+            if rel_box[2] > rel_box[0] and rel_box[3] > rel_box[1]:
+                rect_draw.rounded_rectangle(rel_box, radius=max(2, min(8, (rel_box[3] - rel_box[1]) // 4)), fill=245)
+                patch_mask = ImageChops.lighter(patch_mask, rect_mask.filter(ImageFilter.GaussianBlur(radius=0.8)))
             result.paste(patch, sample_box[:2], patch_mask)
     return result, {"provider": "local-fill", "strategy": "median_border_fill_inside_strict_mask"}
 
@@ -12893,10 +12997,22 @@ def strict_mask_region_is_flat(source: Image.Image, mask: Image.Image) -> bool:
     return channel_std <= float(os.getenv("ADAPTIFAI_LOCALIZE_V2_FLAT_STD_THRESHOLD", "48"))
 
 
+def polish_masked_cleanup_with_opencv(cleaned: Image.Image, mask: Image.Image) -> Image.Image:
+    import cv2
+
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    if int(np.count_nonzero(mask_np > 16)) == 0:
+        return cleaned.convert("RGB")
+    source = cv2.cvtColor(np.array(cleaned.convert("RGB")), cv2.COLOR_RGB2BGR)
+    radius = max(3, int(os.getenv("ADAPTIFAI_LOCALIZE_V212_POLISH_RADIUS", "4")))
+    polished = cv2.inpaint(source, mask_np, radius, cv2.INPAINT_TELEA)
+    return Image.fromarray(cv2.cvtColor(polished, cv2.COLOR_BGR2RGB))
+
+
 def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list[TextBlock] | None = None) -> tuple[Image.Image, dict[str, Any]]:
     # Flat graphic/text panels are safer with deterministic fill: generative
     # providers can hallucinate residual letters even when instructed not to.
-    if env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "0"):
+    if env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "1"):
         return strict_local_fill_cleanup(image, mask, blocks or [])
     split_small_overlay = not env_flag("ADAPTIFAI_LOCALIZE_V212_PROVIDER_CLEANUP", "1")
     if blocks and split_small_overlay:
@@ -12920,7 +13036,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         meta: dict[str, Any] = {"provider": "replicate", "model": resolved_replicate_lama_model()}
         if blocks:
             meta["splitCleanup"] = {"provider": "replicate", "maskMode": "contour" if not split_small_overlay else "split"}
-        return composite_provider_cleanup_over_source(image, replicate_result, mask), meta
+        cleaned = composite_provider_cleanup_over_source(image, replicate_result, mask)
+        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
         "Do not add text. Preserve products, packaging, logos, arrows, labels, colors, gradients, and unmasked areas."
@@ -12935,7 +13052,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
             meta["replicateFallbackReason"] = LAST_REPLICATE_LAMA_ERROR
         if blocks:
             meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "vertex"}
-        return composite_provider_cleanup_over_source(image, vertex_result["image"], mask), meta
+        cleaned = composite_provider_cleanup_over_source(image, vertex_result["image"], mask)
+        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
     openai_result = run_openai_localize_v2_cleanup(image, mask)
     if openai_result is not None:
         meta = {"provider": "openai", "model": os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2")}
@@ -12943,7 +13061,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
             meta["replicateFallbackReason"] = LAST_REPLICATE_LAMA_ERROR
         if blocks:
             meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "openai"}
-        return composite_provider_cleanup_over_source(image, openai_result, mask), meta
+        cleaned = composite_provider_cleanup_over_source(image, openai_result, mask)
+        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
     import cv2
 
     source = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
@@ -13129,6 +13248,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             explode_ocr_blocks_to_lines(run_trocr_ocr_on_image(image_path), source_image.size),
             source_image.size,
         )
+        ocr_lines = attach_adjacent_product_context_to_instruction_lines(ocr_lines, source_image.size)
         protected_ocr_lines = [
             block.model_copy(update={"translate": False, "surface": "packaging"})
             for block in ocr_lines
