@@ -246,43 +246,6 @@ LOCALIZE_V2_RICH_TEXT_PROMPT_RULES = [
 ]
 
 
-LOCALIZE_V2_RICH_TEXT_SCHEMA = {
-    "source_language": "detected source language code",
-    "blocks": [
-        {
-            "source_text": "exact visible overlay marketing copy; preserve intended line breaks",
-            "translated_text": "plain fallback localized copy, equal to concatenated segment text",
-            "x": "left percent",
-            "y": "top percent",
-            "w": "width percent",
-            "h": "height percent",
-            "align": "left | center",
-            "font_weight": "regular | bold",
-            "color": "dominant fallback text color as hex",
-            "source_style_segments": [
-                {
-                    "text": "source word or phrase",
-                    "is_bold": True,
-                    "color": "#052b52",
-                    "is_uppercase": False,
-                    "semantic_role": "discount | modifier | product_condition | benefit | cta | other",
-                }
-            ],
-            "segments": [
-                {
-                    "text": "translated word or phrase including needed trailing space",
-                    "is_bold": True,
-                    "color": "#052b52",
-                    "is_uppercase": False,
-                    "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
-                    "semantic_role": "discount | modifier | product_condition | benefit | cta | other",
-                }
-            ],
-        }
-    ],
-}
-
-
 LOCALIZE_V212_TRANSLATION_SCHEMA = {
     "blocks": [
         {
@@ -8290,6 +8253,8 @@ def build_styled_lines(
     spans: list[dict[str, Any]],
     max_width: int,
     scale_factor: float,
+    *,
+    honor_force_breaks: bool = True,
 ) -> list[list[dict[str, Any]]]:
     tokens: list[dict[str, Any]] = []
     for span in spans:
@@ -8306,7 +8271,7 @@ def build_styled_lines(
         else:
             lines[-1].append(token)
             cursor_x += width
-        if token.get("forceBreakAfter") and lines[-1]:
+        if honor_force_breaks and token.get("forceBreakAfter") and lines[-1]:
             lines.append([])
             cursor_x = 0.0
     return [line for line in lines if line]
@@ -12987,96 +12952,6 @@ def localization_v2_enabled() -> bool:
     return True
 
 
-def parse_percent_bbox(item: dict[str, Any], image_size: tuple[int, int]) -> tuple[int, int, int, int] | None:
-    width, height = image_size
-    try:
-        x = max(0.0, min(100.0, float(item.get("x", 0))))
-        y = max(0.0, min(100.0, float(item.get("y", 0))))
-        w = max(0.1, min(100.0, float(item.get("w", 0))))
-        h = max(0.1, min(100.0, float(item.get("h", 0))))
-    except (TypeError, ValueError):
-        return None
-    left = int(round(width * x / 100))
-    top = int(round(height * y / 100))
-    right = int(round(width * min(100.0, x + w) / 100))
-    bottom = int(round(height * min(100.0, y + h) / 100))
-    if right <= left or bottom <= top:
-        return None
-    return (left, top, right, bottom)
-
-
-def analyze_localize_v2_with_openai(image: Image.Image, target_language: str) -> dict[str, Any]:
-    if not os.getenv("OPENAI_API_KEY"):
-        return {}
-    client = OpenAI()
-    prompt = {
-        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured rich-text JSON. Do not include product packaging, product labels, logos, SKU text, legal microcopy, URLs, QR text, units, SPF/50+/UVA/ml/oz labels, or brand names as editable marketing text.",
-        "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
-        "schema": LOCALIZE_V2_RICH_TEXT_SCHEMA,
-        "rules": [
-            "Return compact JSON only.",
-            "Each block must tightly cover one semantic overlay copy region.",
-            "Never merge distant regions into one block.",
-            "Translate sentence meaning as a whole even when words are stacked visually.",
-            "Do not add claims or product names not present in the source.",
-            "If a text is printed on a product/bottle/package, exclude it.",
-            *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
-        ],
-    }
-    response = client.chat.completions.create(
-        model=os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o"),
-        temperature=0,
-        messages=[
-            {"role": "system", "content": "You are a strict creative-localization vision analyzer. Return JSON only."},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": json.dumps(prompt, ensure_ascii=False)},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_to_base64_png(image)}"}},
-                ],
-            },
-        ],
-        response_format={"type": "json_object"},
-    )
-    return extract_json_object(response.choices[0].message.content or "{}")
-
-
-def analyze_localize_v2(image: Image.Image, target_language: str) -> dict[str, Any]:
-    prompt = {
-        "task": "Localize a paid-media creative. Detect only overlay marketing text, translate it, and return structured rich-text JSON.",
-        "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
-        "schema": LOCALIZE_V2_RICH_TEXT_SCHEMA,
-        "strictRules": [
-            "Return compact JSON only.",
-            "Detect and translate marketing overlay copy only.",
-            "Exclude product packaging, bottle labels, logos, SKU text, ml/oz units, SPF/50+/UVA labels, legal microcopy, URLs, QR references, and brand/product names.",
-            "Each block must be one semantic copy region with a tight bounding box.",
-            "Do not merge distant regions into one block.",
-            "Translate meaning as one sentence/block, not word-by-word.",
-            "Preserve metrics exactly, e.g. 24h, 48H, 84%, 50+.",
-            *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
-        ],
-    }
-    try:
-        if vertex_available():
-            parsed = generate_vertex_gemini_json(prompt, image, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
-            if isinstance(parsed.get("blocks"), list) and parsed.get("blocks"):
-                parsed["analysis_provider"] = "vertex-gemini"
-                return parsed
-            print("[localize-v2] Vertex Gemini analysis returned no editable marketing blocks; trying OpenAI vision fallback", flush=True)
-    except Exception as exc:
-        print(f"[localize-v2] Vertex Gemini analysis failed: {exc}", flush=True)
-    try:
-        parsed = analyze_localize_v2_with_openai(image, target_language)
-        if isinstance(parsed.get("blocks"), list) and parsed.get("blocks"):
-            parsed["analysis_provider"] = "openai-vision"
-            return parsed
-        print("[localize-v2] OpenAI vision analysis returned no editable marketing blocks", flush=True)
-    except Exception as exc:
-        print(f"[localize-v2] OpenAI vision analysis failed: {exc}", flush=True)
-    return {"source_language": "unknown", "blocks": [], "analysis_provider": "none"}
-
-
 def normalize_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -13231,79 +13106,6 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
     return normalized
 
 
-def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -> list[TextBlock]:
-    blocks: list[TextBlock] = []
-    seen: set[str] = set()
-    for index, item in enumerate(payload.get("blocks", []), start=1):
-        if not isinstance(item, dict):
-            continue
-        source_text = repair_mojibake(str(item.get("source_text") or item.get("text") or "").strip())
-        translated_text = repair_mojibake(str(item.get("translated_text") or item.get("translation") or "").strip())
-        if not translated_text:
-            translated_text = repair_mojibake(plain_text_from_segments(item.get("segments")))
-        if not source_text or not translated_text:
-            continue
-        key = normalize_ocr_text(source_text)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        bbox = parse_percent_bbox(item, image.size)
-        if bbox is None:
-            continue
-        mask_bbox = bbox
-        source_line_count = max(1, len([line for line in source_text.splitlines() if line.strip()]))
-        source_word_count = len(source_text.split())
-        if source_word_count >= 5 and (bbox[3] - bbox[1]) > image.height * 0.075:
-            target_height = int(min(bbox[3] - bbox[1], max(image.height * 0.035, source_line_count * image.height * 0.026)))
-            center_y = (bbox[1] + bbox[3]) // 2
-            bbox = (
-                bbox[0],
-                max(0, center_y - target_height // 2),
-                bbox[2],
-                min(image.height, center_y + target_height // 2),
-            )
-        align = str(item.get("align", infer_alignment(bbox, image.width))).lower()
-        if align not in {"left", "center"}:
-            align = infer_alignment(bbox, image.width)
-        color = str(item.get("color") or "").strip()
-        if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
-            color = sample_deterministic_text_color(image, bbox, estimate_text_color(image.crop(bbox)))
-        font_weight = 800 if str(item.get("font_weight", "")).lower() in {"bold", "700", "800", "900"} or source_text.isupper() else 700
-        font_size_estimate = estimate_font_size_from_bbox(bbox)
-        line_height_estimate = estimate_line_height_from_bbox(bbox)
-        block = TextBlock(
-            id=f"v2-block-{index}",
-            text=source_text,
-            translated_text=translated_text,
-            role=classify_text_role(source_text),
-            translate=True,
-            bbox=bbox,
-            clean_box=mask_bbox,
-            color=color,
-            font_weight=font_weight,
-            font_size_estimate=font_size_estimate,
-            line_height_estimate=line_height_estimate,
-            align=align,
-            surface="overlay",
-            line_boxes=[bbox],
-            line_texts=[source_text],
-        )
-        source_style_spans = normalize_rich_text_segments(item.get("source_style_segments"), block=block, translated=False)
-        translated_style_spans = normalize_rich_text_segments(item.get("segments"), block=block, translated=True)
-        if not translated_style_spans:
-            source_style_spans = source_style_spans or infer_source_style_spans(source_text, block)
-            translated_style_spans = infer_translated_style_spans(source_text, translated_text, source_style_spans, block)
-        blocks.append(
-            block.model_copy(
-                update={
-                    "source_style_spans": source_style_spans,
-                    "translated_style_spans": translated_style_spans,
-                }
-            )
-        )
-    return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
-
-
 def is_decorative_or_numeric_only(text: str) -> bool:
     cleaned = text.strip()
     return bool(cleaned) and bool(re.fullmatch(r"[\d\s.,:/#%+-]+", cleaned))
@@ -13367,292 +13169,6 @@ def should_preserve_ocr_structure(block: TextBlock, image_size: tuple[int, int])
     if has_packaging_cues(text) and not is_instructional_context_text(text):
         return True
     return not should_translate_ocr_overlay_block(block, image_size)
-
-
-def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image: Image.Image) -> list[TextBlock]:
-    image_size = image.size
-    foreground_bbox = detect_foreground_bbox(image)
-    product_mask = build_sam_or_vision_product_mask(image)
-    blocks: list[TextBlock] = []
-    seen: set[tuple[str, tuple[int, int, int, int]]] = set()
-    for index, source in enumerate(sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
-        text = repair_mojibake(source.text.strip())
-        if not text:
-            continue
-        bbox = tuple(source.bbox)
-        key = (normalize_match_text(text), bbox)
-        if key in seen:
-            continue
-        seen.add(key)
-        translate = should_translate_ocr_overlay_block(source, image_size)
-        box_width = max(1, bbox[2] - bbox[0])
-        box_height = max(1, bbox[3] - bbox[1])
-        image_width, image_height = image_size
-        foreground_overlap = overlap_fraction(bbox, foreground_bbox) if foreground_bbox else 0.0
-        product_mask_overlap = mask_overlap_fraction(bbox, product_mask)
-        likely_product_surface_label = (
-            translate
-            and product_mask_overlap >= 0.34
-            and box_width <= image_width * 0.34
-            and box_height <= image_height * 0.22
-        )
-        if not likely_product_surface_label:
-            likely_product_surface_label = (
-                translate
-                and product_mask_overlap >= 0.22
-                and foreground_overlap >= 0.18
-                and bbox[1] >= image_height * 0.38
-                and box_width <= image_width * 0.34
-                and box_height <= image_height * 0.22
-            )
-        if likely_product_surface_label:
-            translate = False
-        sampled_color = sample_deterministic_text_color(image, bbox, source.color)
-        line_boxes = (list(source.line_boxes or []) or [bbox]) if translate else []
-        line_texts = (list(source.line_texts or []) or [text]) if translate else []
-        updated = source.model_copy(
-            update={
-                "id": f"ocr-v212-{index}",
-                "text": text,
-                "translated_text": text,
-                "translate": translate,
-                "surface": "overlay" if translate else source.surface,
-                "line_boxes": line_boxes,
-                "line_texts": line_texts,
-                "clean_box": compute_clean_box(bbox, image_size, large_block=False) if translate else None,
-                "color": sampled_color,
-                "font_size_estimate": estimate_font_size_from_bbox(bbox),
-                "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                "align": infer_alignment(bbox, image_size[0]),
-            }
-        )
-        if translate:
-            source_word_styles = build_source_word_styles(updated, image)
-            source_style_spans = [
-                {
-                    "sourceText": word["text"],
-                    "semanticRole": word["semanticRole"],
-                    "sourceWordId": word["id"],
-                    "style": {
-                    **default_typography_style(updated),
-                    "color": word["color"],
-                    "fontWeight": word["fontWeight"],
-                    "fontCategory": word.get("fontCategory", "sans-serif"),
-                    "casing": "uppercase" if word.get("isUppercase") else "mixed",
-                },
-                "color": word["color"],
-                "fontWeight": word["fontWeight"],
-                "fontCategory": word.get("fontCategory", "sans-serif"),
-                "casing": "uppercase" if word.get("isUppercase") else "mixed",
-                    "forceBreakAfter": False,
-                }
-                for word in source_word_styles
-            ]
-            updated = updated.model_copy(
-                update={
-                    "source_word_styles": source_word_styles,
-                    "source_style_spans": source_style_spans,
-                    "color": source_word_styles[0]["color"] if source_word_styles else sampled_color,
-                    "font_weight": max([int(word.get("fontWeight", 700)) for word in source_word_styles] or [updated.font_weight]),
-                }
-            )
-        blocks.append(updated)
-    return blocks
-
-
-def merge_v212_ocr_fragments_into_lines(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
-    if not ocr_lines:
-        return []
-    image_width, _ = image_size
-    numeric = [block for block in ocr_lines if is_decorative_or_numeric_only(block.text)]
-    textual = [block for block in ocr_lines if not is_decorative_or_numeric_only(block.text)]
-    ordered = sorted(textual, key=lambda block: ((block.bbox[1] + block.bbox[3]) / 2, block.bbox[0]))
-    groups: list[list[TextBlock]] = []
-    for block in ordered:
-        center_y = (block.bbox[1] + block.bbox[3]) / 2
-        height = max(1, block.bbox[3] - block.bbox[1])
-        matched: list[TextBlock] | None = None
-        for group in groups:
-            group_box = union_bbox([item.bbox for item in group]) or block.bbox
-            group_center_y = (group_box[1] + group_box[3]) / 2
-            group_height = max(1, group_box[3] - group_box[1])
-            horizontal_gap = max(0, block.bbox[0] - group_box[2], group_box[0] - block.bbox[2])
-            if abs(center_y - group_center_y) <= max(height, group_height) * 0.42 and horizontal_gap <= image_width * 0.085:
-                matched = group
-                break
-        if matched is None:
-            groups.append([block])
-        else:
-            matched.append(block)
-    merged: list[TextBlock] = []
-    for group in groups:
-        ordered_group = sorted(group, key=lambda item: item.bbox[0])
-        bbox = union_bbox([item.bbox for item in ordered_group]) or ordered_group[0].bbox
-        text = " ".join(item.text.strip() for item in ordered_group if item.text.strip())
-        if not text:
-            continue
-        merged.append(
-            ordered_group[0].model_copy(
-                update={
-                    "text": text,
-                    "bbox": bbox,
-                    "clean_box": compute_clean_box(bbox, image_size),
-                    "role": classify_text_role(text),
-                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
-                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                    "align": infer_alignment(bbox, image_size[0]),
-                    "line_boxes": [bbox],
-                    "line_texts": [text],
-                    "color": ordered_group[0].color,
-                }
-            )
-        )
-    return sorted([*numeric, *merged], key=lambda item: (item.bbox[1], item.bbox[0]))
-
-
-def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
-    if not ocr_lines:
-        return []
-    ordered = sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0]))
-    consumed: set[int] = set()
-    output: list[TextBlock] = []
-    instruction_terms = {
-        "with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak",
-        "ile", "uygula", "kullan", "durula", "temizle",
-    }
-    for index, block in enumerate(ordered):
-        if index in consumed:
-            continue
-        text_norm = normalize_ocr_text(block.text)
-        is_instruction = (
-            not is_decorative_or_numeric_only(block.text)
-            and not block.text.strip().isupper()
-            and any(term in text_norm for term in instruction_terms)
-        )
-        is_marketing_anchor = (
-            block.translate
-            and block.surface == "overlay"
-            and not is_decorative_or_numeric_only(block.text)
-        )
-        if not (is_instruction or is_marketing_anchor):
-            output.append(block)
-            continue
-        block_h = max(1, block.bbox[3] - block.bbox[1])
-        block_w = max(1, block.bbox[2] - block.bbox[0])
-        attached: list[TextBlock] = [block]
-        for other_index, other in enumerate(ordered[index + 1 :], start=index + 1):
-            if other_index in consumed:
-                continue
-            if not (has_packaging_cues(other.text) or is_short_product_context_token(other.text)):
-                continue
-            gap_y = other.bbox[1] - block.bbox[3]
-            overlap_x = max(0, min(block.bbox[2], other.bbox[2]) - max(block.bbox[0], other.bbox[0]))
-            near_same_copy = (
-                -block_h * 0.75 <= gap_y <= block_h * 0.85
-                and (overlap_x >= min(block_w, max(1, other.bbox[2] - other.bbox[0])) * 0.22 or abs(other.bbox[0] - block.bbox[0]) <= image_size[0] * 0.08)
-            )
-            if not is_instruction:
-                # Header/product suffixes such as "How to use" + "Sebium H2O"
-                # are marketing overlay copy and must be cleaned/redrawn together.
-                other_h = max(1, other.bbox[3] - other.bbox[1])
-                similar_scale = 0.45 <= (other_h / max(1, block_h)) <= 1.8
-                same_header_cluster = near_same_copy and similar_scale and other.bbox[1] <= block.bbox[3] + block_h
-                near_same_copy = same_header_cluster
-            if near_same_copy:
-                attached.append(other)
-                consumed.add(other_index)
-                break
-        if len(attached) == 1:
-            output.append(block)
-            continue
-        attached_sorted = sorted(attached, key=lambda item: (item.bbox[1], item.bbox[0]))
-        bbox = union_bbox([item.bbox for item in attached_sorted]) or block.bbox
-        text = " ".join(item.text.strip() for item in attached_sorted if item.text.strip())
-        output.append(
-            block.model_copy(
-                update={
-                    "text": text,
-                    "bbox": bbox,
-                    "clean_box": compute_clean_box(bbox, image_size),
-                    "line_boxes": [item.bbox for item in attached_sorted],
-                    "line_texts": [item.text.strip() for item in attached_sorted if item.text.strip()],
-                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
-                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                    "align": infer_alignment(bbox, image_size[0]),
-                }
-            )
-        )
-    return sorted(output, key=lambda item: (item.bbox[1], item.bbox[0]))
-
-
-def merge_adjacent_semantic_translation_blocks(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
-    if not ocr_lines:
-        return []
-    ordered = sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0]))
-    consumed: set[int] = set()
-    merged: list[TextBlock] = []
-    instruction_terms = {
-        "cleanse", "remove", "apply", "use", "soak", "rinse", "care", "prepare", "clean",
-        "temizle", "cikar", "uygula", "kullan", "durula", "bakim", "hazirla",
-    }
-    for index, block in enumerate(ordered):
-        if index in consumed:
-            continue
-        group = [block]
-        if should_translate_ocr_overlay_block(block, image_size) and not block.text.strip().isupper():
-            group_box = block.bbox
-            group_norm = normalize_ocr_text(block.text)
-            for other_index, other in enumerate(ordered[index + 1 :], start=index + 1):
-                if other_index in consumed:
-                    continue
-                if not should_translate_ocr_overlay_block(other, image_size):
-                    continue
-                if other.text.strip().isupper() and len(other.text.split()) <= 5:
-                    continue
-                gap_y = other.bbox[1] - group_box[3]
-                if gap_y < -max(8, max(group_box[3] - group_box[1], other.bbox[3] - other.bbox[1]) * 0.9):
-                    continue
-                if gap_y > max(14, max(group_box[3] - group_box[1], other.bbox[3] - other.bbox[1]) * 0.82):
-                    break
-                overlap_x = max(0, min(group_box[2], other.bbox[2]) - max(group_box[0], other.bbox[0]))
-                min_width = max(1, min(group_box[2] - group_box[0], other.bbox[2] - other.bbox[0]))
-                same_column = overlap_x >= min_width * 0.28 or abs(group_box[0] - other.bbox[0]) <= image_size[0] * 0.055
-                if not same_column:
-                    continue
-                other_norm = normalize_ocr_text(other.text)
-                semantic_pair = (
-                    any(term in group_norm for term in instruction_terms)
-                    or any(term in other_norm for term in instruction_terms)
-                    or len(group) > 1
-                )
-                if not semantic_pair:
-                    continue
-                group.append(other)
-                consumed.add(other_index)
-                group_box = union_bbox([item.bbox for item in group]) or group_box
-                group_norm = f"{group_norm} {other_norm}".strip()
-        if len(group) == 1:
-            merged.append(block)
-            continue
-        group_sorted = sorted(group, key=lambda item: (item.bbox[1], item.bbox[0]))
-        bbox = union_bbox([item.bbox for item in group_sorted]) or block.bbox
-        text = "\n".join(item.text.strip() for item in group_sorted if item.text.strip())
-        merged.append(
-            block.model_copy(
-                update={
-                    "text": text,
-                    "bbox": bbox,
-                    "clean_box": compute_clean_box(bbox, image_size),
-                    "line_boxes": [item.bbox for item in group_sorted],
-                    "line_texts": [item.text.strip() for item in group_sorted if item.text.strip()],
-                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
-                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                    "align": infer_alignment(bbox, image_size[0]),
-                    "role": classify_text_role(text),
-                }
-            )
-        )
-    return sorted(merged, key=lambda item: (item.bbox[1], item.bbox[0]))
 
 
 def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -14280,101 +13796,17 @@ def build_strict_text_removal_mask(
     }
 
 
-def snap_localize_v2_blocks_to_ocr(blocks: list[TextBlock], ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
-    if not blocks or not ocr_lines:
-        return blocks
-    snapped: list[TextBlock] = []
-    for block in blocks:
-        source_lines = [line for line in re.split(r"\n+", block.text) if normalize_ocr_text(line)]
-        normalized_block = normalize_ocr_text(block.text)
-        block_words = loose_word_tokens(block.text)
-        candidates: list[TextBlock] = []
-        expanded = expand_bbox(block.bbox, image_size, max(24, int(max(block.bbox[2] - block.bbox[0], block.bbox[3] - block.bbox[1]) * 0.45)))
-        for line in ocr_lines:
-            line_norm = normalize_ocr_text(line.text)
-            if not line_norm:
-                continue
-            line_tokens = text_tokens(line.text)
-            block_token_set = text_tokens(block.text)
-            if len(line_norm) <= 3 and line_norm != normalized_block and not (line_tokens & block_token_set):
-                continue
-            text_match = (
-                any(
-                    text_similarity(line.text, source_line) >= 0.48
-                    or (len(line_norm) >= 4 and line_norm in normalize_ocr_text(source_line))
-                    or (len(normalize_ocr_text(source_line)) >= 4 and normalize_ocr_text(source_line) in line_norm)
-                    for source_line in source_lines
-                )
-                or text_similarity(line.text, block.text) >= 0.45
-                or (len(line_norm) >= 4 and line_norm in normalized_block)
-            )
-            if not text_match:
-                token_overlap = line_tokens & block_token_set
-                text_match = len(token_overlap) >= 1 and max(len(line_tokens), len(block_token_set)) <= 4
-            layout_match = (
-                overlap_fraction(line.bbox, expanded) >= 0.05
-                or overlap_fraction(expanded, line.bbox) >= 0.05
-            )
-            strong_text_match = (
-                len(line_norm) >= 4
-                and (
-                    line_norm in normalized_block
-                    or any(
-                        (
-                            len(line_word) >= 4
-                            and len(block_word) >= 4
-                            and (
-                                text_similarity(line_word, block_word) >= 0.72
-                                or (len(line_word) >= 5 and len(block_word) >= 5 and (line_word in block_word or block_word in line_word))
-                            )
-                        )
-                        for line_word in loose_word_tokens(line.text)
-                        for block_word in block_words
-                    )
-                )
-                and not has_packaging_cues(line.text)
-            )
-            if (text_match and layout_match) or strong_text_match:
-                candidates.append(line)
-        if candidates:
-            ordered = sorted(candidates, key=lambda item: (item.bbox[1], item.bbox[0]))
-            bbox = union_bbox([item.bbox for item in ordered]) or block.bbox
-            font_size_estimate = estimate_font_size_from_bbox(bbox)
-            snapped.append(
-                block.model_copy(
-                    update={
-                        "bbox": bbox,
-                        "clean_box": compute_clean_box(bbox, image_size, large_block=(bbox[2] - bbox[0]) > image_size[0] * 0.45),
-                        "line_boxes": [item.bbox for item in ordered],
-                        "line_texts": [item.text for item in ordered],
-                        "font_size_estimate": font_size_estimate,
-                        "line_height_estimate": estimate_line_height_from_bbox(bbox),
-                        "align": infer_alignment(bbox, image_size[0]) if block.align not in {"left", "center"} else block.align,
-                    }
-                )
-            )
-        else:
-            snapped.append(block)
-    return sorted(snapped, key=lambda item: (item.bbox[1], item.bbox[0]))
-
-
-def build_localize_v2_mask(image: Image.Image, blocks: list[TextBlock]) -> Image.Image:
-    mask, _meta = build_strict_text_removal_mask(image, blocks)
-    return mask
+def resolved_replicate_lama_model() -> str:
+    return os.getenv(
+        "REPLICATE_LAMA_MODEL",
+        "twn39/lama:2b91ca2340801c2a5be745612356fac36a17f698354a07f48a62d564d3b3a7a0",
+    ).strip()
 
 
 def replicate_data_uri(image: Image.Image) -> str:
-    return f"data:image/png;base64,{image_to_base64_png(image)}"
-
-
-REPLICATE_LAMA_VERSIONED_DEFAULT = "twn39/lama:2b91ca2340801c2a5be745612356fac36a17f698354a07f48a62d564d3b3a7a0"
-
-
-def resolved_replicate_lama_model() -> str:
-    model = os.getenv("REPLICATE_LAMA_MODEL", REPLICATE_LAMA_VERSIONED_DEFAULT).strip() or REPLICATE_LAMA_VERSIONED_DEFAULT
-    if model == "fofr/lama":
-        return REPLICATE_LAMA_VERSIONED_DEFAULT
-    return model
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
 def run_replicate_lama_inpaint(image: Image.Image, mask: Image.Image) -> Image.Image | None:
@@ -14767,6 +14199,8 @@ def fit_styled_spans_strict(
     spans: list[dict[str, Any]],
     box: tuple[int, int, int, int],
     base_typography: dict[str, Any],
+    *,
+    honor_force_breaks: bool = True,
 ) -> dict[str, Any]:
     max_width = max(8, box[2] - box[0])
     max_height = max(8, box[3] - box[1])
@@ -14774,7 +14208,7 @@ def fit_styled_spans_strict(
     best: dict[str, Any] | None = None
     for scale_percent in range(100, 19, -5):
         scale_factor = scale_percent / 100.0
-        lines = build_styled_lines(draw, spans, max_width, scale_factor)
+        lines = build_styled_lines(draw, spans, max_width, scale_factor, honor_force_breaks=honor_force_breaks)
         if not lines:
             continue
         widest, total_height, line_layouts = measure_styled_layout(draw, lines, scale_factor, line_height_ratio)
@@ -14802,32 +14236,29 @@ def is_v5_block(block: TextBlock) -> bool:
 
 def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tuple[int, int, int, int]:
     width, height = canvas_size
+    referenced_ids: set[str] = set()
+    for span in block.translated_style_spans or []:
+        if not isinstance(span, dict):
+            continue
+        for key in ("sourceWordId", "source_word_id"):
+            value = str(span.get(key) or "").strip()
+            if value:
+                referenced_ids.add(value)
+        ids = span.get("sourceWordIds") or span.get("source_word_ids")
+        if isinstance(ids, list):
+            referenced_ids.update(str(value).strip() for value in ids if str(value).strip())
     boxes = [
         tuple(int(value) for value in (word.get("bbox") or word.get("estimatedBbox") or []))
         for word in (block.source_word_styles or [])
-        if isinstance(word, dict) and len(word.get("bbox") or word.get("estimatedBbox") or []) == 4
+        if (
+            isinstance(word, dict)
+            and len(word.get("bbox") or word.get("estimatedBbox") or []) == 4
+            and (not referenced_ids or str(word.get("id") or "") in referenced_ids)
+        )
     ]
     boxes = [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
     if not boxes:
         return block.bbox
-    if len(boxes) >= 3:
-        ordered = sorted(boxes, key=lambda item: item[0])
-        median_height = float(np.median([box[3] - box[1] for box in ordered]))
-        split_gap = max(24, int(round(median_height * 1.7)))
-        clusters: list[list[tuple[int, int, int, int]]] = [[ordered[0]]]
-        for box in ordered[1:]:
-            previous = clusters[-1][-1]
-            if box[0] - previous[2] > split_gap:
-                clusters.append([box])
-            else:
-                clusters[-1].append(box)
-        if len(clusters) > 1:
-            def cluster_score(cluster: list[tuple[int, int, int, int]]) -> tuple[int, int, int]:
-                area = sum(max(1, box[2] - box[0]) * max(1, box[3] - box[1]) for box in cluster)
-                right_edge = max(box[2] for box in cluster)
-                return (len(cluster), area, right_edge)
-
-            boxes = max(clusters, key=cluster_score)
     left = min(box[0] for box in boxes)
     top = min(box[1] for box in boxes)
     right = max(box[2] for box in boxes)
@@ -14875,6 +14306,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                 block.translated_style_spans,
                 render_box,
                 base_typography,
+                honor_force_breaks=not is_v5_block(block),
             )
             render_styled_spans(draw, layout, render_box, alignment=block.align)
             continue
@@ -14969,8 +14401,8 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 json.dumps(
                     {
                         **payload,
-                        "pipeline": "v5-polygon-vision-layout",
-                        "pipeline_version": "v5-absolute-polygon-nm-style",
+                        "pipeline": "v6-polygon-vision-layout",
+                        "pipeline_version": "v6-pure-math-rendering",
                         "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
@@ -14993,11 +14425,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 extracted_blocks=blocks,
                 debug={
                     "pipeline": "v5",
-                    "pipeline_version": "v5-absolute-polygon-nm-style",
+                    "pipeline_version": "v6-pure-math-rendering",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v5-google-vision-polygon-pillow-cursor-typesetting",
+                    "layoutEngine": "v6-google-vision-polygon-inline-flow-math-fence",
                     "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
@@ -15011,8 +14443,8 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 {
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
-                    "pipeline": "v5-polygon-vision-layout",
-                    "pipeline_version": "v5-absolute-polygon-nm-style",
+                    "pipeline": "v6-polygon-vision-layout",
+                    "pipeline_version": "v6-pure-math-rendering",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
