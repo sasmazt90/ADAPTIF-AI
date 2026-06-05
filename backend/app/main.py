@@ -1166,11 +1166,7 @@ def should_translate_split_overlay_line(
     height = max(1, bbox[3] - bbox[1])
     area_ratio = (width * height) / max(1, image_width * image_height)
     overlap_with_foreground = overlap_fraction(bbox, foreground_bbox) if foreground_bbox else 0.0
-    instructional_context = any(
-        term in normalized
-        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
-    )
-    if has_packaging_cues(text) and not instructional_context:
+    if has_packaging_cues(text) and not is_instructional_context_text(text):
         return False
     if overlap_with_foreground >= 0.18 and area_ratio <= 0.045:
         return False
@@ -12257,6 +12253,25 @@ def should_translate_ocr_overlay_block(block: TextBlock, image_size: tuple[int, 
     return True
 
 
+def is_instructional_context_text(text: str) -> bool:
+    normalized = normalize_ocr_text(text)
+    return any(
+        term in normalized
+        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
+    )
+
+
+def should_preserve_ocr_structure(block: TextBlock, image_size: tuple[int, int]) -> bool:
+    text = block.text.strip()
+    if not text:
+        return False
+    if is_decorative_or_numeric_only(text):
+        return True
+    if has_packaging_cues(text) and not is_instructional_context_text(text):
+        return True
+    return not should_translate_ocr_overlay_block(block, image_size)
+
+
 def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
     blocks: list[TextBlock] = []
     seen: set[tuple[str, tuple[int, int, int, int]]] = set()
@@ -12589,14 +12604,14 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
         left, top, right, bottom = box
         if right <= left or bottom <= top:
             continue
-        crop_box = expand_bbox((left, top, right, bottom), image.size, max(1, min(3, dilation_px // 3)))
+        crop_box = expand_bbox((left, top, right, bottom), image.size, max(2, min(6, dilation_px)))
         crop = np.array(image_rgb.crop(crop_box))
         if crop.size == 0:
             continue
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         blurred = cv2.GaussianBlur(gray, (0, 0), 1.2)
         local_delta = cv2.absdiff(gray, blurred)
-        edges = cv2.Canny(gray, 35, 135)
+        edges = cv2.Canny(gray, 24, 110)
         median = float(np.median(gray))
         rgb = crop.astype(np.int16)
         text_rgb = np.array(parse_hex_color(block.color), dtype=np.int16)
@@ -12604,14 +12619,15 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
         saturation = crop.max(axis=2).astype(np.int16) - crop.min(axis=2).astype(np.int16)
         text_brightness = float(np.mean(text_rgb))
         if text_brightness >= 210:
-            color_candidate = (color_dist <= 72) & (gray.astype(np.float32) >= median + 10)
+            color_candidate = (color_dist <= 96) & (gray.astype(np.float32) >= median + 4)
         elif text_brightness <= 70:
-            color_candidate = (color_dist <= 92) & (gray.astype(np.float32) <= median - 8)
+            color_candidate = (color_dist <= 118) & (gray.astype(np.float32) <= median - 4)
         else:
-            color_candidate = (color_dist <= 82) & (saturation >= max(12, int(np.median(saturation) + 8)))
-        contrast_candidate = local_delta >= max(12, int(np.percentile(local_delta, 82)))
+            color_candidate = (color_dist <= 112) & (saturation >= max(4, int(np.median(saturation) + 2)))
+        contrast_candidate = local_delta >= max(5, int(np.percentile(local_delta, 68)))
         edge_candidate = edges > 0
-        candidate = color_candidate | (edge_candidate & contrast_candidate)
+        shadow_candidate = (local_delta >= max(4, int(np.percentile(local_delta, 58)))) & (np.abs(gray.astype(np.float32) - median) >= 3)
+        candidate = color_candidate | (edge_candidate & contrast_candidate) | (edge_candidate & shadow_candidate)
         candidate = candidate.astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -12630,7 +12646,8 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
             filtered[labels == label] = 255
         if filtered.max() == 0:
             filtered = candidate
-        kernel_size = max(3, dilation_px * 2 + 1)
+        dynamic_dilation = dilation_px + (2 if np.percentile(local_delta, 90) <= 22 else 1)
+        kernel_size = max(3, dynamic_dilation * 2 + 1)
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         filtered = cv2.dilate(filtered, dilate_kernel, iterations=1)
         x1, y1, x2, y2 = crop_box
@@ -12938,15 +12955,93 @@ def run_openai_localize_v2_cleanup(image: Image.Image, mask: Image.Image) -> Ima
 def composite_provider_cleanup_over_source(source: Image.Image, provider_image: Image.Image, mask: Image.Image) -> Image.Image:
     provider_resized = provider_image.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
     hard_mask = mask.convert("L").resize(source.size)
+    if env_flag("ADAPTIFAI_LOCALIZE_V213_SEAMLESS_PROVIDER_BLEND", "1"):
+        blended = seamless_clone_local_patch(source.convert("RGB"), provider_resized, hard_mask)
+        return Image.composite(blended.convert("RGB"), source.convert("RGB"), hard_mask.filter(ImageFilter.GaussianBlur(radius=strict_mask_feather_px(source.size))))
     feather_px = strict_mask_feather_px(source.size)
     alpha = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
     return Image.composite(provider_resized, source.convert("RGB"), alpha)
+
+
+def seamless_clone_local_patch(base: Image.Image, patch: Image.Image, mask: Image.Image) -> Image.Image:
+    import cv2
+
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    bbox = Image.fromarray(mask_np, "L").getbbox()
+    if not bbox:
+        return Image.composite(patch.convert("RGB"), base.convert("RGB"), mask.convert("L"))
+    x1, y1, x2, y2 = bbox
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return Image.composite(patch.convert("RGB"), base.convert("RGB"), mask.convert("L"))
+    base_rgb = base.convert("RGB")
+    patch_rgb = patch.convert("RGB").resize(base.size, Image.Resampling.BICUBIC)
+    source_np = cv2.cvtColor(np.array(base_rgb), cv2.COLOR_RGB2BGR)
+    patch_np = cv2.cvtColor(np.array(patch_rgb), cv2.COLOR_RGB2BGR)
+    clone_mask = np.where(mask_np > 16, 255, 0).astype(np.uint8)
+    center = ((x1 + x2) // 2, (y1 + y2) // 2)
+    try:
+        cloned = cv2.seamlessClone(patch_np, source_np, clone_mask, center, cv2.NORMAL_CLONE)
+        return Image.fromarray(cv2.cvtColor(cloned, cv2.COLOR_BGR2RGB))
+    except Exception:
+        return Image.composite(patch_rgb, base_rgb, mask.convert("L"))
+
+
+def dominant_background_fill_color(sample: np.ndarray, local_mask: np.ndarray) -> tuple[int, int, int]:
+    if sample.size == 0:
+        return (255, 255, 255)
+    pixels = sample[~local_mask] if local_mask.shape[:2] == sample.shape[:2] and np.any(~local_mask) else sample.reshape(-1, 3)
+    if pixels.size == 0:
+        pixels = sample.reshape(-1, 3)
+    pixels = pixels.reshape(-1, 3)
+    brightness = pixels.mean(axis=1)
+    chroma = pixels.max(axis=1) - pixels.min(axis=1)
+    bright_neutral = pixels[(brightness >= 232) & (chroma <= 24)]
+    if len(bright_neutral) >= max(24, len(pixels) * 0.08):
+        chosen = np.median(bright_neutral, axis=0)
+    else:
+        chosen = np.median(pixels, axis=0)
+    return tuple(int(value) for value in np.clip(chosen, 0, 255))
+
+
+def fill_remaining_mask_components(result: Image.Image, source: Image.Image, mask: Image.Image) -> Image.Image:
+    import cv2
+
+    output = result.convert("RGB")
+    base = source.convert("RGB")
+    mask_np = np.array(mask.convert("L"), dtype=np.uint8)
+    binary = (mask_np > 16).astype(np.uint8)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if num_labels <= 1:
+        return output
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < 3 or w <= 0 or h <= 0:
+            continue
+        pad = max(5, min(16, int(round(max(w, h) * 0.18))))
+        sample_box = (
+            max(0, x - pad),
+            max(0, y - pad),
+            min(source.width, x + w + pad),
+            min(source.height, y + h + pad),
+        )
+        sample = np.array(base.crop(sample_box))
+        local_mask = np.array(mask.crop(sample_box).convert("L")) > 16
+        fill_rgb = dominant_background_fill_color(sample, local_mask)
+        patch = Image.new("RGB", (sample_box[2] - sample_box[0], sample_box[3] - sample_box[1]), fill_rgb)
+        patch_mask = mask.crop(sample_box).convert("L")
+        output.paste(patch, sample_box[:2], patch_mask)
+    return output
 
 
 def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: list[TextBlock]) -> tuple[Image.Image, dict[str, Any]]:
     base = source.convert("RGB")
     result = base.copy()
     mask_l = mask.convert("L")
+    seamless_used = 0
     for block in blocks:
         boxes = list(block.line_boxes or [block.bbox])
         for box in boxes:
@@ -12964,25 +13059,23 @@ def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: li
             local_mask = np.array(mask_l.crop(sample_box)) > 0
             if sample.size == 0:
                 continue
-            border_pixels = sample[~local_mask] if local_mask.shape[:2] == sample.shape[:2] and np.any(~local_mask) else sample.reshape(-1, 3)
-            if border_pixels.size == 0:
-                continue
-            fill_rgb = tuple(int(value) for value in np.median(border_pixels.reshape(-1, 3), axis=0))
+            fill_rgb = dominant_background_fill_color(sample, local_mask)
             patch = Image.new("RGB", (sample_box[2] - sample_box[0], sample_box[3] - sample_box[1]), fill_rgb)
             patch_mask = mask_l.crop(sample_box)
-            rect_mask = Image.new("L", patch.size, 0)
-            rect_draw = ImageDraw.Draw(rect_mask)
-            rel_box = (
-                max(0, left - sample_box[0] - 2),
-                max(0, top - sample_box[1] - 2),
-                min(patch.size[0], right - sample_box[0] + 2),
-                min(patch.size[1], bottom - sample_box[1] + 2),
-            )
-            if rel_box[2] > rel_box[0] and rel_box[3] > rel_box[1]:
-                rect_draw.rounded_rectangle(rel_box, radius=max(2, min(8, (rel_box[3] - rel_box[1]) // 4)), fill=245)
-                patch_mask = ImageChops.lighter(patch_mask, rect_mask.filter(ImageFilter.GaussianBlur(radius=0.8)))
+            patch_mask = dilate_mask(patch_mask, max(1, min(3, strict_mask_dilation_px(source.size) // 2)))
+            if env_flag("ADAPTIFAI_LOCALIZE_V213_SEAMLESS_LOCAL_FILL", "0"):
+                region_base = result.crop(sample_box)
+                patch_candidate = Image.new("RGB", region_base.size, fill_rgb)
+                region_pixels = np.array(region_base)
+                local_std = float(np.mean(np.std(region_pixels.reshape(-1, 3), axis=0))) if region_pixels.size else 0.0
+                if local_std > 6.0 and np.count_nonzero(np.array(patch_mask) > 16) >= 24:
+                    blended = seamless_clone_local_patch(region_base, patch_candidate, patch_mask)
+                    result.paste(blended, sample_box[:2], patch_mask)
+                    seamless_used += 1
+                    continue
             result.paste(patch, sample_box[:2], patch_mask)
-    return result, {"provider": "local-fill", "strategy": "median_border_fill_inside_strict_mask"}
+    result = fill_remaining_mask_components(result, source, mask_l)
+    return result, {"provider": "local-fill", "strategy": "median_border_fill_inside_strict_mask_hard_inner_feather_edge", "seamlessClonePatches": seamless_used}
 
 
 def strict_mask_region_is_flat(source: Image.Image, mask: Image.Image) -> bool:
@@ -13252,7 +13345,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
         protected_ocr_lines = [
             block.model_copy(update={"translate": False, "surface": "packaging"})
             for block in ocr_lines
-            if has_packaging_cues(block.text) or not block.translate
+            if should_preserve_ocr_structure(block, source_image.size)
         ]
         for language in languages:
             ocr_layout_blocks = deterministic_v212_ocr_blocks(ocr_lines, source_image.size)
