@@ -8214,6 +8214,7 @@ def draw_rich_line(draw: ImageDraw.ImageDraw, xy: tuple[int, int], segments: lis
 
 def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
     text = str(span.get("translatedText") or span.get("sourceText") or "").strip()
+    text = text.replace("[BOLD]", "").replace("[/BOLD]", "").strip()
     if not text:
         return []
     role = str(span.get("matchedSourceRole") or span.get("semanticRole") or "benefit")
@@ -13103,6 +13104,7 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
     normalized: list[dict[str, Any]] = []
     for raw, force_break in flattened:
         text = repair_mojibake(str(raw.get("text") or raw.get("translatedText") or "").strip())
+        text = text.replace("[BOLD]", "").replace("[/BOLD]", "").strip()
         if not text:
             continue
         source_id = str(raw.get("source_word_id") or raw.get("sourceWordId") or "").strip()
@@ -14448,28 +14450,56 @@ def is_v5_block(block: TextBlock) -> bool:
     return bool(block.id and str(block.id).startswith("v5-"))
 
 
+def v5_word_box(word: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    raw_box = word.get("bbox") or word.get("estimatedBbox") or []
+    if not (isinstance(raw_box, list) and len(raw_box) == 4):
+        return None
+    box = tuple(int(value) for value in raw_box)
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return None
+    return box
+
+
+def is_v5_isolated_step_marker_word(word: dict[str, Any], words: list[dict[str, Any]]) -> bool:
+    box = v5_word_box(word)
+    if box is None:
+        return False
+    text = str(word.get("text") or "").strip()
+    if len(text) > 2 and not is_decorative_or_numeric_only(text):
+        return False
+    other_boxes = [
+        other_box
+        for other in words
+        if other is not word and (other_box := v5_word_box(other)) is not None
+    ]
+    if not other_boxes:
+        return False
+    heights = sorted(max(1, other_box[3] - other_box[1]) for other_box in other_boxes)
+    median_height = heights[len(heights) // 2]
+    height = max(1, box[3] - box[1])
+    main_left = min(other_box[0] for other_box in other_boxes if other_box[3] > box[1] and other_box[1] < box[3]) if any(
+        other_box[3] > box[1] and other_box[1] < box[3] for other_box in other_boxes
+    ) else min(other_box[0] for other_box in other_boxes)
+    return height >= max(32, int(median_height * 1.75)) and box[2] < main_left - max(20, median_height * 2)
+
+
 def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tuple[int, int, int, int]:
     width, height = canvas_size
-    referenced_ids: set[str] = set()
-    for span in block.translated_style_spans or []:
-        if not isinstance(span, dict):
-            continue
-        for key in ("sourceWordId", "source_word_id"):
-            value = str(span.get(key) or "").strip()
-            if value:
-                referenced_ids.add(value)
-        ids = span.get("sourceWordIds") or span.get("source_word_ids")
-        if isinstance(ids, list):
-            referenced_ids.update(str(value).strip() for value in ids if str(value).strip())
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
     boxes = [
-        tuple(int(value) for value in (word.get("bbox") or word.get("estimatedBbox") or []))
-        for word in (block.source_word_styles or [])
-        if (
-            isinstance(word, dict)
-            and len(word.get("bbox") or word.get("estimatedBbox") or []) == 4
-            and (not referenced_ids or str(word.get("id") or "") in referenced_ids)
-        )
+        box
+        for word in source_words
+        if (box := v5_word_box(word)) is not None
+        and not is_v5_isolated_step_marker_word(word, source_words)
+        and not is_decorative_or_numeric_only(str(word.get("text") or ""))
     ]
+    if not boxes:
+        boxes = [
+            box
+            for word in source_words
+            if (box := v5_word_box(word)) is not None
+            and not is_v5_isolated_step_marker_word(word, source_words)
+        ]
     boxes = [box for box in boxes if box[2] > box[0] and box[3] > box[1]]
     if not boxes:
         return block.bbox
