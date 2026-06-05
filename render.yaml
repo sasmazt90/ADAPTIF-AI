@@ -61,7 +61,9 @@ services:
       - key: ADAPTIFAI_INPAINT_MODEL
         value: runwayml/stable-diffusion-inpainting
       - key: ADAPTIFAI_INPAINT_BACKEND
-        value: opencv
+        value: replicate
+      - key: ADAPTIFAI_LOCALIZE_V5_POLYGON
+        value: "1"
       - key: ADAPTIFAI_INPAINT_MAX_SIDE
         value: "384"
       - key: ADAPTIFAI_INPAINT_STEPS

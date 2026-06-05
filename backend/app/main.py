@@ -216,6 +216,9 @@ class TextBlock(BaseModel):
     surface: str = "overlay"
     line_boxes: list[tuple[int, int, int, int]] = Field(default_factory=list)
     line_texts: list[str] = Field(default_factory=list)
+    polygon: list[tuple[int, int]] = Field(default_factory=list)
+    line_polygons: list[list[tuple[int, int]]] = Field(default_factory=list)
+    symbol_polygons: list[list[tuple[int, int]]] = Field(default_factory=list)
     overflow_warning: bool = False
     source_style_spans: list[dict[str, Any]] = Field(default_factory=list)
     translated_style_spans: list[dict[str, Any]] = Field(default_factory=list)
@@ -228,11 +231,17 @@ class TextBlock(BaseModel):
 
 
 LOCALIZE_V2_RICH_TEXT_PROMPT_RULES = [
-    "Analyze the original overlay marketing text at word/phrase level, including font weight, color, and typographic casing.",
+    "Translate each OCR block semantically as one complete copy unit before deciding target line breaks; never translate line-by-line or word-by-word.",
+    "Analyze the original overlay marketing text at word/phrase level, including font weight, color, typographic casing, and punctuation.",
     "Return translated copy as rich text segments, not only as one flat string.",
     "Map style by meaning, not by source position or source line. If a styled source phrase moves to another target line because of target-language syntax, apply that style to the translated phrase that carries the same meaning on its new line.",
+    "Support N:M style inheritance: one source word may map to multiple target words, and multiple source words may map to one target word.",
+    "Preserve punctuation intent exactly. Exclamation marks, question marks, slashes, and other expressive punctuation must not be silently converted to periods or removed unless the target language requires equivalent punctuation.",
     "Preserve emphasis from bold, heavier weight, distinctive color, all-caps, numeric claims, discount percentages, and key benefit phrases.",
     "Do not apply a source style to the wrong translated word just because it is in the same visual position or same line.",
+    "Return font_category for each segment from the visual source style: sans-serif, serif, slab-serif, display, handwriting, or monospace.",
+    "Product or brand names that are part of overlay marketing/instruction copy are movable semantic tokens; do not lock them to their original coordinate or source line.",
+    "Never split a semantic instruction into literal line translations. Build the target sentence first, then lay it out.",
     "Keep translated_text as the plain concatenation of segments for fallback rendering.",
 ]
 
@@ -286,7 +295,9 @@ LOCALIZE_V212_TRANSLATION_SCHEMA = {
                         {
                             "text": "translated word or phrase",
                             "source_word_id": "id from input_blocks[].source_words[].id whose meaning/style this target segment inherited",
+                            "source_word_ids": ["one or more source word ids for N:M style inheritance"],
                             "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
+                            "font_category": "sans-serif | serif | slab-serif | display | handwriting | monospace",
                         }
                     ]
                 }
@@ -296,8 +307,10 @@ LOCALIZE_V212_TRANSLATION_SCHEMA = {
                     "text": "translated word or phrase",
                     "is_uppercase": False,
                     "source_word_id": "id from input_blocks[].source_words[].id whose meaning/style this target segment inherited",
+                    "source_word_ids": ["one or more source word ids for N:M style inheritance"],
                     "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
                     "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
+                    "font_category": "sans-serif | serif | slab-serif | display | handwriting | monospace",
                 }
             ],
         }
@@ -392,6 +405,14 @@ GOOGLE_FONTS_CATALOG_CACHE: dict[str, dict[str, Any]] | None = None
 GOOGLE_FONT_FILE_CACHE: dict[tuple[str, str], Path | None] = {}
 LOCAL_FONT_FILE_CACHE: dict[tuple[str, bool], Any] = {}
 DEFAULT_GOOGLE_FONT_STACK = ("Inter", "Roboto", "Montserrat", "Poppins", "Open Sans", "Lato")
+GOOGLE_FONT_CATEGORY_STACKS = {
+    "sans-serif": ("Inter", "Roboto", "Montserrat", "Poppins", "Open Sans", "Lato"),
+    "serif": ("Libre Baskerville", "Merriweather", "Lora", "Playfair Display", "Roboto Serif"),
+    "slab-serif": ("Roboto Slab", "Arvo", "Bitter", "Zilla Slab"),
+    "display": ("Montserrat", "Poppins", "Oswald", "Bebas Neue", "Anton"),
+    "handwriting": ("Caveat", "Patrick Hand", "Kalam"),
+    "monospace": ("Roboto Mono", "Source Code Pro", "IBM Plex Mono"),
+}
 
 
 def google_fonts_enabled() -> bool:
@@ -473,7 +494,22 @@ def load_google_fonts_catalog() -> dict[str, dict[str, Any]]:
         return GOOGLE_FONTS_CATALOG_CACHE
 
 
-def pick_google_font_family(requested_family: str | None, bold: bool) -> str | None:
+def normalize_font_category(value: str | None) -> str:
+    normalized = normalize_ocr_text(str(value or ""))
+    if "mono" in normalized:
+        return "monospace"
+    if "hand" in normalized or "script" in normalized:
+        return "handwriting"
+    if "slab" in normalized:
+        return "slab-serif"
+    if "serif" in normalized and "sans" not in normalized:
+        return "serif"
+    if "display" in normalized or "condensed" in normalized:
+        return "display"
+    return "sans-serif"
+
+
+def pick_google_font_family(requested_family: str | None, bold: bool, category: str | None = None) -> str | None:
     catalog = load_google_fonts_catalog()
     if not catalog:
         return None
@@ -486,9 +522,13 @@ def pick_google_font_family(requested_family: str | None, bold: bool) -> str | N
                 return str(catalog[key].get("family") or candidate)
 
     preferred = os.getenv("ADAPTIFAI_DEFAULT_GOOGLE_FONT", "").strip()
-    fallback_stack = (preferred,) + DEFAULT_GOOGLE_FONT_STACK if preferred else DEFAULT_GOOGLE_FONT_STACK
+    category_stack = GOOGLE_FONT_CATEGORY_STACKS.get(normalize_font_category(category), DEFAULT_GOOGLE_FONT_STACK)
+    fallback_stack = (preferred,) + category_stack if preferred else category_stack
     if bold:
-        fallback_stack = (preferred,) + ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato") if preferred else ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato")
+        bold_stack = GOOGLE_FONT_CATEGORY_STACKS.get(normalize_font_category(category), ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato"))
+        if normalize_font_category(category) == "sans-serif":
+            bold_stack = ("Montserrat", "Poppins", "Inter", "Roboto", "Open Sans", "Lato")
+        fallback_stack = (preferred,) + bold_stack if preferred else bold_stack
 
     for family in fallback_stack:
         if family and family.lower() in catalog:
@@ -510,10 +550,10 @@ def pick_google_font_variant(item: dict[str, Any], bold: bool) -> tuple[str, str
     return str(first_variant), str(first_url).replace("http://", "https://")
 
 
-def get_google_font_file(requested_family: str | None, bold: bool) -> Path | None:
+def get_google_font_file(requested_family: str | None, bold: bool, category: str | None = None) -> Path | None:
     if not google_fonts_enabled():
         return None
-    family = pick_google_font_family(requested_family, bold)
+    family = pick_google_font_family(requested_family, bold, category)
     if not family:
         return None
     cache_key = (family.lower(), "bold" if bold else "regular")
@@ -1704,7 +1744,7 @@ def split_line_text_to_word_boxes(text: str, box: tuple[int, int, int, int]) -> 
     return output
 
 
-def choose_foreground_text_mask(crop_rgb: np.ndarray) -> np.ndarray:
+def choose_raw_foreground_mask(crop_rgb: np.ndarray) -> np.ndarray:
     import cv2
 
     if crop_rgb.size == 0:
@@ -1750,21 +1790,21 @@ def choose_foreground_text_mask(crop_rgb: np.ndarray) -> np.ndarray:
         if score > best_score:
             best_score = score
             best_mask = mask
-    if best_mask.any():
-        best_mask = filter_character_like_contours(best_mask)
     return best_mask
 
 
-def filter_character_like_contours(mask: np.ndarray) -> np.ndarray:
+def split_character_and_graphic_contours(mask: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     import cv2
 
     if mask.size == 0:
-        return mask.astype(bool)
+        empty = mask.astype(bool)
+        return empty, empty
     binary = (mask.astype(np.uint8) > 0).astype(np.uint8) * 255
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    filtered = np.zeros_like(binary)
+    characters = np.zeros_like(binary)
+    graphics = np.zeros_like(binary)
     crop_h, crop_w = binary.shape[:2]
     crop_area = max(1, crop_h * crop_w)
     for contour in contours:
@@ -1789,11 +1829,32 @@ def filter_character_like_contours(mask: np.ndarray) -> np.ndarray:
         spans_most_width = w >= crop_w * 0.78 and h <= crop_h * 0.34
 
         if long_thin_horizontal or long_thin_vertical or large_frame_or_bar or solid_geometric_bar or spans_most_width:
+            cv2.drawContours(graphics, [contour], -1, 255, thickness=-1)
             continue
         if area / crop_area > 0.46:
+            cv2.drawContours(graphics, [contour], -1, 255, thickness=-1)
             continue
-        cv2.drawContours(filtered, [contour], -1, 255, thickness=-1)
-    return filtered > 0
+        cv2.drawContours(characters, [contour], -1, 255, thickness=-1)
+    return characters > 0, graphics > 0
+
+
+def filter_character_like_contours(mask: np.ndarray) -> np.ndarray:
+    characters, _graphics = split_character_and_graphic_contours(mask)
+    return characters
+
+
+def choose_foreground_text_mask(crop_rgb: np.ndarray) -> np.ndarray:
+    return filter_character_like_contours(choose_raw_foreground_mask(crop_rgb))
+
+
+def anti_ghost_text_dilation_px(image_size: tuple[int, int]) -> int:
+    configured = os.getenv("ADAPTIFAI_TEXT_ANTIGHOST_DILATION_PX", "").strip()
+    if configured:
+        try:
+            return max(3, min(8, int(configured)))
+        except ValueError:
+            pass
+    return max(6, min(8, int(round(max(image_size) * 0.014))))
 
 
 def sample_word_foreground_style(
@@ -1809,6 +1870,8 @@ def sample_word_foreground_style(
     crop_rgb = np.array(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.uint8)
     mask = choose_foreground_text_mask(crop_rgb)
     if mask.any():
+        import cv2
+
         row_has_ink = mask.any(axis=1)
         clusters: list[tuple[int, int]] = []
         start: int | None = None
@@ -1838,7 +1901,12 @@ def sample_word_foreground_style(
             clustered = np.zeros_like(mask, dtype=bool)
             clustered[best_start:best_end, :] = mask[best_start:best_end, :]
             mask = clustered
-        pixels = crop_rgb[mask].reshape(-1, 3)
+        mask_u8 = mask.astype(np.uint8) * 255
+        erosion_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        core_mask = cv2.erode(mask_u8, erosion_kernel, iterations=1) > 0
+        if int(core_mask.sum()) < max(3, int(mask.sum() * 0.18)):
+            core_mask = mask
+        pixels = crop_rgb[core_mask].reshape(-1, 3)
         bg_color = np.median(crop_rgb.reshape(-1, 3), axis=0)
         distances = np.linalg.norm(pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
         if len(distances) >= 8:
@@ -1846,6 +1914,7 @@ def sample_word_foreground_style(
         median = np.median(pixels, axis=0)
         color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in median))
         density = float(mask.sum()) / max(1, mask.shape[0] * mask.shape[1])
+        core_density = float(core_mask.sum()) / max(1, mask.shape[0] * mask.shape[1])
         ys, xs = np.where(mask)
         foreground_bbox = (
             left + int(xs.min()),
@@ -1856,13 +1925,16 @@ def sample_word_foreground_style(
     else:
         color = sample_deterministic_text_color(image, bbox, fallback_color)
         density = 0.0
+        core_density = 0.0
         foreground_bbox = bbox
     is_bold = fallback_weight >= 700 or density >= 0.24
     return {
         "color": color,
         "fontWeight": 800 if is_bold else 500,
         "isBold": is_bold,
+        "fontCategory": "sans-serif",
         "foregroundDensity": round(density, 4),
+        "coreForegroundDensity": round(core_density, 4),
         "foregroundBbox": foreground_bbox,
     }
 
@@ -1894,12 +1966,123 @@ def build_source_word_styles(block: TextBlock, image: Image.Image) -> list[dict[
                     "estimatedBbox": list(word["bbox"]),
                     "color": style["color"],
                     "fontWeight": style["fontWeight"],
+                    "fontCategory": style.get("fontCategory", "sans-serif"),
                     "isBold": style["isBold"],
                     "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
                     "semanticRole": classify_semantic_role(text),
                     "foregroundDensity": style.get("foregroundDensity", 0.0),
+                    "coreForegroundDensity": style.get("coreForegroundDensity", 0.0),
                 }
             )
+    return styles
+
+
+def sample_polygon_foreground_style(
+    image: Image.Image,
+    polygon: list[tuple[int, int]],
+    *,
+    fallback_color: str = "#111111",
+    fallback_weight: int = 700,
+) -> dict[str, Any]:
+    import cv2
+
+    if len(polygon) < 3:
+        return {"color": fallback_color, "fontWeight": fallback_weight, "isBold": fallback_weight >= 700}
+    envelope = expand_bbox(bbox_from_polygon(polygon), image.size, 3)
+    left, top, right, bottom = envelope
+    if right <= left or bottom <= top:
+        return {"color": fallback_color, "fontWeight": fallback_weight, "isBold": fallback_weight >= 700}
+    crop_rgb = np.array(image.crop(envelope).convert("RGB"), dtype=np.uint8)
+    local_polygon = [(max(0, x - left), max(0, y - top)) for x, y in polygon]
+    polygon_region = np.array(polygon_mask((right - left, bottom - top), [local_polygon]).convert("L")) > 0
+    if not polygon_region.any():
+        return sample_word_foreground_style(image, envelope, fallback_color=fallback_color, fallback_weight=fallback_weight)
+    raw_foreground = choose_foreground_text_mask(crop_rgb)
+    foreground = raw_foreground & polygon_region
+    if int(foreground.sum()) < 3:
+        gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
+        local = gray[polygon_region]
+        if local.size:
+            delta = np.abs(gray.astype(np.float32) - float(np.median(local)))
+            foreground = (delta >= max(4.0, float(np.percentile(delta[polygon_region], 70)))) & polygon_region
+    if int(foreground.sum()) < 3:
+        foreground = polygon_region
+    foreground_u8 = foreground.astype(np.uint8) * 255
+    core = cv2.erode(foreground_u8, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1) > 0
+    if int(core.sum()) < max(3, int(foreground.sum() * 0.12)):
+        core = foreground
+    pixels = crop_rgb[core].reshape(-1, 3)
+    if pixels.size == 0:
+        pixels = crop_rgb[foreground].reshape(-1, 3)
+    bg_pixels = crop_rgb[polygon_region & ~foreground]
+    bg_color = np.median(bg_pixels.reshape(-1, 3), axis=0) if bg_pixels.size else np.median(crop_rgb.reshape(-1, 3), axis=0)
+    distances = np.linalg.norm(pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
+    if len(distances) >= 8:
+        pixels = pixels[distances >= np.percentile(distances, 35)]
+    median = np.median(pixels, axis=0)
+    color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in median))
+    density = float(foreground.sum()) / max(1, int(polygon_region.sum()))
+    core_density = float(core.sum()) / max(1, int(polygon_region.sum()))
+    height = max(1, bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])
+    outline_like = density < 0.38 and core_density < max(0.09, density * 0.38) and height >= 18
+    stroke_width = max(2, min(9, int(round(height * 0.09)))) if outline_like else 0
+    is_bold = fallback_weight >= 700 or density >= 0.24 or outline_like
+    return {
+        "color": color,
+        "fontWeight": 800 if is_bold else 500,
+        "isBold": is_bold,
+        "fontCategory": "sans-serif",
+        "foregroundDensity": round(density, 4),
+        "coreForegroundDensity": round(core_density, 4),
+        "foregroundBbox": bbox_from_polygon(polygon),
+        "outline": bool(outline_like),
+        "strokeWidth": stroke_width,
+        "strokeFill": color if outline_like else None,
+    }
+
+
+def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock, image: Image.Image) -> list[dict[str, Any]]:
+    styles: list[dict[str, Any]] = []
+    ordered = sorted(group, key=lambda item: (item.bbox[1], item.bbox[0]))
+    for word_index, word in enumerate(ordered):
+        text = word.text.strip()
+        if not text or not word.polygon:
+            continue
+        line_index = 0
+        for index, line_box in enumerate(block.line_boxes or []):
+            word_center_y = (word.bbox[1] + word.bbox[3]) / 2
+            if line_box[1] - 2 <= word_center_y <= line_box[3] + 2:
+                line_index = index
+                break
+        style = sample_polygon_foreground_style(
+            image,
+            word.polygon,
+            fallback_color=block.color,
+            fallback_weight=word.font_weight or block.font_weight,
+        )
+        styles.append(
+            {
+                "id": source_word_id(block.id, line_index, word_index, text),
+                "text": text,
+                "lineIndex": line_index,
+                "wordIndex": word_index,
+                "bbox": list(style.get("foregroundBbox") or word.bbox),
+                "estimatedBbox": list(word.bbox),
+                "polygon": [list(point) for point in word.polygon],
+                "symbolPolygons": [[list(point) for point in polygon] for polygon in (word.symbol_polygons or [word.polygon])],
+                "color": style["color"],
+                "fontWeight": style["fontWeight"],
+                "fontCategory": style.get("fontCategory", "sans-serif"),
+                "isBold": style["isBold"],
+                "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
+                "semanticRole": classify_semantic_role(text),
+                "foregroundDensity": style.get("foregroundDensity", 0.0),
+                "coreForegroundDensity": style.get("coreForegroundDensity", 0.0),
+                "outline": bool(style.get("outline")),
+                "strokeWidth": int(style.get("strokeWidth") or 0),
+                "strokeFill": style.get("strokeFill"),
+            }
+        )
     return styles
 
 
@@ -1915,6 +2098,56 @@ def source_word_style_lookup(block: TextBlock) -> dict[str, dict[str, Any]]:
         if text_key:
             lookup.setdefault(text_key, word)
     return lookup
+
+
+def color_dominance_score(color: str) -> float:
+    rgb = np.array(parse_hex_color(color), dtype=np.float32)
+    brightness = float(np.mean(rgb))
+    chroma = float(np.max(rgb) - np.min(rgb))
+    neutral_penalty = 40.0 if chroma < 18 and (brightness < 48 or brightness > 215) else 0.0
+    return chroma * 2.0 + abs(brightness - 128.0) * 0.15 - neutral_penalty
+
+
+def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[str, Any]) -> dict[str, Any]:
+    if not source_styles:
+        return dict(base_style)
+    dominant_color_style = max(source_styles, key=lambda item: color_dominance_score(str(item.get("color") or base_style["color"])))
+    max_weight = max(int(item.get("fontWeight") or base_style["fontWeight"]) for item in source_styles)
+    uppercase_votes = sum(1 for item in source_styles if item.get("isUppercase"))
+    dominant = dict(base_style)
+    dominant.update(
+        {
+            "color": str(dominant_color_style.get("color") or base_style["color"]),
+            "fontWeight": 800 if max_weight >= 700 else min(500, max_weight),
+            "casing": "uppercase" if uppercase_votes > len(source_styles) / 2 else "mixed",
+            "fontCategory": str(dominant_color_style.get("fontCategory") or base_style.get("fontCategory") or "sans-serif"),
+            "strokeWidth": max(int(item.get("strokeWidth") or 0) for item in source_styles),
+            "strokeFill": next((item.get("strokeFill") for item in source_styles if item.get("strokeFill")), None),
+            "fillTransparent": any(bool(item.get("outline") or item.get("fillTransparent")) for item in source_styles),
+        }
+    )
+    return dominant
+
+
+def source_styles_for_segment(raw: dict[str, Any], lookup: dict[str, dict[str, Any]], text: str, hint: str) -> list[dict[str, Any]]:
+    raw_ids = raw.get("source_word_ids") or raw.get("sourceWordIds") or raw.get("source_word_id") or raw.get("sourceWordId") or []
+    if isinstance(raw_ids, str):
+        raw_ids = [raw_ids]
+    source_styles: list[dict[str, Any]] = []
+    for source_id in raw_ids if isinstance(raw_ids, list) else []:
+        source_id = str(source_id or "").strip()
+        if source_id and source_id in lookup:
+            source_styles.append(lookup[source_id])
+    if not source_styles and hint:
+        hinted = lookup.get(normalize_ocr_text(hint))
+        if hinted:
+            source_styles.append(hinted)
+    if not source_styles:
+        for token in text.split():
+            style = lookup.get(normalize_ocr_text(token))
+            if style:
+                source_styles.append(style)
+    return source_styles
 
 
 def run_trocr_ocr_on_image(image_path: Path) -> list[TextBlock]:
@@ -2933,6 +3166,7 @@ def preserve_source_metric_tokens(source_text: str, translated_text: str) -> str
 def default_typography_style(block: TextBlock) -> dict[str, Any]:
     return {
         "fontFamily": block.font_family,
+        "fontCategory": "sans-serif",
         "fontWeight": block.font_weight,
         "fontSize": block.font_size_estimate,
         "color": block.color if block.color.startswith("#") else "#111111",
@@ -2941,6 +3175,8 @@ def default_typography_style(block: TextBlock) -> dict[str, Any]:
         "lineHeight": block.line_height_estimate,
         "alignment": block.align,
         "casing": "uppercase" if block.text.isupper() else "mixed",
+        "strokeWidth": 0,
+        "strokeFill": None,
     }
 
 
@@ -7870,15 +8106,15 @@ def parse_bold_markup(text: str) -> list[tuple[str, bool]]:
     return [(segment, bold) for segment, bold in segments if segment]
 
 
-def get_font(size: int, bold: bool = False, family: str | None = None):
-    google_font = get_google_font_file(family, bold)
+def get_font(size: int, bold: bool = False, family: str | None = None, category: str | None = None):
+    google_font = get_google_font_file(family, bold, category)
     if google_font is not None:
         try:
             return ImageFont.truetype(str(google_font), size)
         except OSError as exc:
             print(f"[fonts] Google font load failed for {google_font}: {exc}", flush=True)
 
-    local_cache_key = (f"{family or ''}:{size}", bold)
+    local_cache_key = (f"{family or ''}:{normalize_font_category(category)}:{size}", bold)
     if local_cache_key in LOCAL_FONT_FILE_CACHE:
         return LOCAL_FONT_FILE_CACHE[local_cache_key]
 
@@ -7995,7 +8231,8 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
 def get_font_for_style(style: dict[str, Any], size: int):
     weight = int(style.get("fontWeight", 700))
     family = str(style.get("fontFamily") or "").strip() or None
-    return get_font(size, bold=weight >= 700, family=family)
+    category = str(style.get("fontCategory") or "sans-serif").strip() or "sans-serif"
+    return get_font(size, bold=weight >= 700, family=family, category=category)
 
 
 def span_token_width(draw: ImageDraw.ImageDraw, token: dict[str, Any], *, first_in_line: bool, scale_factor: float) -> float:
@@ -8029,18 +8266,18 @@ def build_styled_lines(
     if not tokens:
         return []
     lines: list[list[dict[str, Any]]] = [[]]
-    current_width = 0.0
+    cursor_x = 0.0
     for token in tokens:
         width = span_token_width(draw, token, first_in_line=not lines[-1], scale_factor=scale_factor)
-        if lines[-1] and current_width + width > max_width:
+        if lines[-1] and cursor_x + width > max_width:
             lines.append([token])
-            current_width = span_token_width(draw, token, first_in_line=True, scale_factor=scale_factor)
+            cursor_x = span_token_width(draw, token, first_in_line=True, scale_factor=scale_factor)
         else:
             lines[-1].append(token)
-            current_width += width
+            cursor_x += width
         if token.get("forceBreakAfter") and lines[-1]:
             lines.append([])
-            current_width = 0.0
+            cursor_x = 0.0
     return [line for line in lines if line]
 
 
@@ -8315,13 +8552,38 @@ def render_styled_spans(
         for token_index, token in enumerate(line.get("tokens", [])):
             token_text = token["text"] if token_index == 0 else f" {token['text']}"
             font = token["font"]
-            fill = token["style"].get("color", "#111111")
-            left, top, right, bottom = draw.textbbox((x, baseline - token["ascent"]), token_text, font=font)
+            token_style = token.get("style", {})
+            fill = token_style.get("color", "#111111")
+            stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
+            stroke_fill = token_style.get("strokeFill") or fill
+            if token_style.get("fillTransparent"):
+                fill = (0, 0, 0, 0)
+            left, top, right, bottom = draw.textbbox(
+                (x, baseline - token["ascent"]),
+                token_text,
+                font=font,
+                stroke_width=stroke_width,
+            )
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
                 draw.text((x + shadow_offset, baseline - token["ascent"] + shadow_offset), token_text, fill=shadow_fill, font=font)
-            draw.text((x, baseline - token["ascent"]), token_text, fill=fill, font=font)
+            text_y = baseline - token["ascent"]
+            if token_style.get("fillTransparent") and stroke_width > 0:
+                for distance in range(1, stroke_width + 1):
+                    for dx, dy in (
+                        (-distance, 0),
+                        (distance, 0),
+                        (0, -distance),
+                        (0, distance),
+                        (-distance, -distance),
+                        (-distance, distance),
+                        (distance, -distance),
+                        (distance, distance),
+                    ):
+                        draw.text((x + dx, text_y + dy), token_text, fill=stroke_fill, font=font)
+            else:
+                draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
             rendered_spans.append(
                 {
                     "lineIndex": line_index,
@@ -8337,7 +8599,7 @@ def render_styled_spans(
                     "bbox": [left, top, right, bottom],
                 }
             )
-            x = right
+            x += text_width(draw, token_text, font)
         y += int(line.get("lineHeight", 0))
     return rendered_spans, span_render_boxes
 
@@ -9739,6 +10001,275 @@ def union_bbox(boxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, i
     )
 
 
+def bbox_from_polygon(points: list[tuple[int, int]]) -> tuple[int, int, int, int]:
+    if not points:
+        return (0, 0, 1, 1)
+    xs = [int(point[0]) for point in points]
+    ys = [int(point[1]) for point in points]
+    return (min(xs), min(ys), max(xs) + 1, max(ys) + 1)
+
+
+def polygon_area(points: list[tuple[int, int]]) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for index, (x1, y1) in enumerate(points):
+        x2, y2 = points[(index + 1) % len(points)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) / 2.0
+
+
+def polygon_mask(image_size: tuple[int, int], polygons: list[list[tuple[int, int]]], *, dilation_px: int = 0) -> Image.Image:
+    import cv2
+
+    mask = Image.new("L", image_size, 0)
+    draw = ImageDraw.Draw(mask)
+    for polygon in polygons:
+        if len(polygon) >= 3:
+            draw.polygon([(int(x), int(y)) for x, y in polygon], fill=255)
+    if dilation_px > 0:
+        arr = np.array(mask, dtype=np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilation_px * 2 + 1, dilation_px * 2 + 1))
+        arr = cv2.dilate(arr, kernel, iterations=1)
+        mask = Image.fromarray(arr, "L")
+    return mask
+
+
+def polygon_mask_overlap_fraction(polygons: list[list[tuple[int, int]]], product_mask: Image.Image) -> float:
+    if not polygons:
+        return 0.0
+    text_mask = polygon_mask(product_mask.size, polygons)
+    text_arr = np.array(text_mask.convert("L")) > 16
+    if not np.any(text_arr):
+        return 0.0
+    product_arr = np.array(product_mask.convert("L")) > 16
+    return float(np.logical_and(text_arr, product_arr).sum() / max(1, text_arr.sum()))
+
+
+def google_vision_available() -> bool:
+    return bool(
+        os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "").strip()
+        or os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    )
+
+
+def google_vision_word_blocks(image_path: Path, image_size: tuple[int, int]) -> list[TextBlock]:
+    if not google_vision_available():
+        return []
+    try:
+        from google.cloud import vision  # type: ignore
+        from google.oauth2 import service_account  # type: ignore
+    except Exception as exc:
+        print(f"[vision] google-cloud-vision unavailable: {exc}", flush=True)
+        return []
+    try:
+        credentials = None
+        inline_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        if inline_json:
+            credentials = service_account.Credentials.from_service_account_info(json.loads(inline_json))
+        client = vision.ImageAnnotatorClient(credentials=credentials) if credentials else vision.ImageAnnotatorClient()
+        content = image_path.read_bytes()
+        response = client.document_text_detection(image=vision.Image(content=content))
+        if response.error.message:
+            print(f"[vision] document_text_detection error: {response.error.message}", flush=True)
+            return []
+    except Exception as exc:
+        print(f"[vision] document_text_detection failed: {exc}", flush=True)
+        return []
+
+    words: list[TextBlock] = []
+    word_index = 0
+    try:
+        pages = response.full_text_annotation.pages
+    except Exception:
+        pages = []
+    for page in pages:
+        for block in page.blocks:
+            for paragraph in block.paragraphs:
+                for word in paragraph.words:
+                    text = "".join(symbol.text for symbol in word.symbols).strip()
+                    if not text:
+                        continue
+                    vertices = word.bounding_box.vertices
+                    polygon = [(int(vertex.x or 0), int(vertex.y or 0)) for vertex in vertices]
+                    symbol_polygons: list[list[tuple[int, int]]] = []
+                    for symbol in word.symbols:
+                        symbol_vertices = symbol.bounding_box.vertices
+                        symbol_polygon = [(int(vertex.x or 0), int(vertex.y or 0)) for vertex in symbol_vertices]
+                        if len(symbol_polygon) >= 3 and polygon_area(symbol_polygon) > 1:
+                            symbol_polygons.append(symbol_polygon)
+                    if len(polygon) < 3 or polygon_area(polygon) <= 2:
+                        continue
+                    bbox = bbox_from_polygon(polygon)
+                    word_index += 1
+                    words.append(
+                        TextBlock(
+                            id=f"v5-word-{word_index}",
+                            text=text,
+                            role=classify_text_role(text),
+                            translate=True,
+                            bbox=bbox,
+                            clean_box=bbox,
+                            polygon=polygon,
+                            line_polygons=[polygon],
+                            symbol_polygons=symbol_polygons,
+                            line_boxes=[bbox],
+                            line_texts=[text],
+                            color="#111111",
+                            font_weight=800 if text.isupper() else 700,
+                            font_size_estimate=estimate_font_size_from_bbox(bbox),
+                            line_height_estimate=estimate_line_height_from_bbox(bbox),
+                            align=infer_alignment(bbox, image_size[0]),
+                            surface="overlay",
+                        )
+                    )
+    return words
+
+
+def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[list[TextBlock], list[TextBlock], dict[str, Any]]:
+    if not words:
+        return [], [], {"provider": "google-cloud-vision", "wordCount": 0, "mode": "polygon"}
+    product_mask = build_sam_or_vision_product_mask(image)
+    overlay_words: list[TextBlock] = []
+    protected_words: list[TextBlock] = []
+    for word in words:
+        overlap = polygon_mask_overlap_fraction([word.polygon] if word.polygon else [], product_mask)
+        if overlap >= float(os.getenv("ADAPTIFAI_V5_PRODUCT_POLYGON_OVERLAP", "0.55")):
+            protected_words.append(word.model_copy(update={"translate": False, "surface": "packaging"}))
+        else:
+            overlay_words.append(word.model_copy(update={"translate": True, "surface": "overlay"}))
+
+    ordered = sorted(overlay_words, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0]))
+    lines: list[list[TextBlock]] = []
+    for word in ordered:
+        cy = (word.bbox[1] + word.bbox[3]) / 2
+        h = max(1, word.bbox[3] - word.bbox[1])
+        matched: list[TextBlock] | None = None
+        for line in lines:
+            line_box = union_bbox([item.bbox for item in line]) or line[0].bbox
+            line_cy = (line_box[1] + line_box[3]) / 2
+            line_h = max(1, line_box[3] - line_box[1])
+            if abs(cy - line_cy) <= max(h, line_h) * 0.62:
+                matched = line
+                break
+        if matched is None:
+            lines.append([word])
+        else:
+            matched.append(word)
+
+    lines = [sorted(line, key=lambda item: item.bbox[0]) for line in lines]
+    lines.sort(key=lambda line: min(item.bbox[1] for item in line))
+    groups: list[list[TextBlock]] = []
+    for line in lines:
+        line_box = union_bbox([item.bbox for item in line]) or line[0].bbox
+        line_text = " ".join(item.text for item in line)
+        if not groups:
+            groups.append(line)
+            continue
+        prev = groups[-1]
+        prev_box = union_bbox([item.bbox for item in prev]) or prev[-1].bbox
+        prev_text = " ".join(item.text for item in prev)
+        gap_y = line_box[1] - prev_box[3]
+        overlap_x = max(0, min(line_box[2], prev_box[2]) - max(line_box[0], prev_box[0]))
+        min_width = max(1, min(line_box[2] - line_box[0], prev_box[2] - prev_box[0]))
+        same_column = overlap_x >= min_width * 0.20 or abs(line_box[0] - prev_box[0]) <= image.width * 0.075
+        semantic_continuation = (
+            not prev_text.strip().isupper()
+            or not line_text.strip().isupper()
+            or any(term in normalize_ocr_text(prev_text + " " + line_text) for term in ("use", "with", "apply", "remove", "cleanse", "rinse", "benefits", "look"))
+        )
+        if same_column and semantic_continuation and gap_y <= max(18, (line_box[3] - line_box[1]) * 0.95):
+            groups[-1].extend(line)
+        else:
+            groups.append(line)
+
+    blocks: list[TextBlock] = []
+    for index, group in enumerate(groups, start=1):
+        group = sorted(group, key=lambda item: (item.bbox[1], item.bbox[0]))
+        line_groups: list[list[TextBlock]] = []
+        for word in group:
+            cy = (word.bbox[1] + word.bbox[3]) / 2
+            matched = None
+            for line in line_groups:
+                line_box = union_bbox([item.bbox for item in line]) or line[0].bbox
+                if abs(cy - (line_box[1] + line_box[3]) / 2) <= max(4, (line_box[3] - line_box[1]) * 0.7):
+                    matched = line
+                    break
+            if matched is None:
+                line_groups.append([word])
+            else:
+                matched.append(word)
+        line_groups = [sorted(line, key=lambda item: item.bbox[0]) for line in line_groups]
+        line_groups.sort(key=lambda line: min(item.bbox[1] for item in line))
+        line_texts = [" ".join(item.text for item in line) for line in line_groups]
+        block_polygons = [item.polygon for item in group if item.polygon]
+        line_boxes = [union_bbox([item.bbox for item in line]) or line[0].bbox for line in line_groups]
+        bbox = union_bbox([item.bbox for item in group]) or group[0].bbox
+        text = "\n".join(line_texts)
+        block = TextBlock(
+            id=f"v5-block-{index}",
+            text=text,
+            role=classify_text_role(text),
+            translate=True,
+            bbox=bbox,
+            clean_box=bbox,
+            polygon=[point for polygon in block_polygons for point in polygon],
+            line_polygons=block_polygons,
+            line_boxes=line_boxes,
+            line_texts=line_texts,
+            color=sample_deterministic_text_color(image, bbox, "#111111"),
+            font_weight=max((item.font_weight for item in group), default=700),
+            font_size_estimate=estimate_font_size_from_bbox(bbox),
+            line_height_estimate=estimate_line_height_from_bbox(bbox),
+            align=infer_alignment(bbox, image.width),
+            surface="overlay",
+        )
+        source_word_styles = build_v5_polygon_source_word_styles(group, block, image)
+        source_style_spans = [
+            {
+                "sourceText": word["text"],
+                "semanticRole": word["semanticRole"],
+                "sourceWordId": word["id"],
+                "style": {
+                    **default_typography_style(block),
+                    "color": word["color"],
+                    "fontWeight": word["fontWeight"],
+                    "fontCategory": word.get("fontCategory", "sans-serif"),
+                    "strokeWidth": word.get("strokeWidth", 0),
+                    "strokeFill": word.get("strokeFill"),
+                    "fillTransparent": bool(word.get("outline")),
+                    "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                },
+                "color": word["color"],
+                "fontWeight": word["fontWeight"],
+                "fontCategory": word.get("fontCategory", "sans-serif"),
+                "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                "forceBreakAfter": False,
+            }
+            for word in source_word_styles
+        ]
+        block = block.model_copy(
+            update={
+                "source_word_styles": source_word_styles,
+                "source_style_spans": source_style_spans,
+                "color": source_word_styles[0]["color"] if source_word_styles else block.color,
+                "font_weight": max([int(word.get("fontWeight", 700)) for word in source_word_styles] or [block.font_weight]),
+            }
+        )
+        blocks.append(block)
+    return blocks, protected_words, {
+        "provider": "google-cloud-vision",
+        "mode": "polygon_word_grouping",
+        "legacyBboxHeuristics": "disabled",
+        "preserveDecision": "polygon_to_product_mask_overlap_only",
+        "wordCount": len(words),
+        "overlayWordCount": len(overlay_words),
+        "protectedWordCount": len(protected_words),
+        "blockCount": len(blocks),
+    }
+
+
 def detect_foreground_bbox(source: Image.Image) -> tuple[int, int, int, int] | None:
     rgb = np.array(source.convert("RGB"))
     if rgb.size == 0:
@@ -9752,6 +10283,80 @@ def detect_foreground_bbox(source: Image.Image) -> tuple[int, int, int, int] | N
     if len(xs) < 64 or len(ys) < 64:
         return None
     return (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+
+
+def build_sam_or_vision_product_mask(source: Image.Image) -> Image.Image:
+    checkpoint = os.getenv("ADAPTIFAI_SAM_CHECKPOINT", "").strip()
+    if checkpoint and Path(checkpoint).exists():
+        try:
+            from segment_anything import SamAutomaticMaskGenerator, sam_model_registry  # type: ignore
+
+            model_type = os.getenv("ADAPTIFAI_SAM_MODEL_TYPE", "vit_b").strip() or "vit_b"
+            sam = sam_model_registry[model_type](checkpoint=checkpoint)
+            sam.to(device=torch_device())
+            generator = SamAutomaticMaskGenerator(sam)
+            masks = generator.generate(np.array(source.convert("RGB")))
+            full = np.zeros((source.height, source.width), dtype=np.uint8)
+            image_area = max(1, source.width * source.height)
+            for item in masks:
+                seg = item.get("segmentation")
+                bbox = item.get("bbox") or [0, 0, 0, 0]
+                if seg is None:
+                    continue
+                x, y, w, h = [int(v) for v in bbox[:4]]
+                area = int(item.get("area") or np.count_nonzero(seg))
+                center_y = y + h / 2
+                if area >= image_area * 0.012 and h >= source.height * 0.12 and center_y >= source.height * 0.28:
+                    full[np.asarray(seg, dtype=bool)] = 255
+            if int(np.count_nonzero(full)) >= image_area * 0.01:
+                return Image.fromarray(full, "L")
+        except Exception as exc:
+            print(f"[sam] product segmentation unavailable, using vision fallback: {exc}", flush=True)
+
+    import cv2
+
+    rgb = np.array(source.convert("RGB"), dtype=np.uint8)
+    if rgb.size == 0:
+        return Image.new("L", source.size, 0)
+    border = np.concatenate([rgb[0, :, :], rgb[-1, :, :], rgb[:, 0, :], rgb[:, -1, :]], axis=0)
+    border_color = np.median(border, axis=0)
+    distance = np.linalg.norm(rgb.astype(np.float32) - border_color.astype(np.float32), axis=2)
+    saturation = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+    candidate = ((distance > max(22.0, float(np.percentile(distance, 82)))) | (saturation > max(24, int(np.percentile(saturation, 78)))))
+    candidate[: int(source.height * 0.18), :] = False
+    binary = candidate.astype(np.uint8) * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    full = np.zeros_like(binary)
+    image_area = max(1, source.width * source.height)
+    for label in range(1, num_labels):
+        x = int(stats[label, cv2.CC_STAT_LEFT])
+        y = int(stats[label, cv2.CC_STAT_TOP])
+        w = int(stats[label, cv2.CC_STAT_WIDTH])
+        h = int(stats[label, cv2.CC_STAT_HEIGHT])
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area < image_area * 0.006 or h < source.height * 0.09:
+            continue
+        if y + h / 2 < source.height * 0.30:
+            continue
+        if w > source.width * 0.88 and h < source.height * 0.18:
+            continue
+        full[labels == label] = 255
+    full = cv2.dilate(full, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)), iterations=1)
+    return Image.fromarray(full, "L")
+
+
+def mask_overlap_fraction(bbox: tuple[int, int, int, int], mask: Image.Image) -> float:
+    left, top, right, bottom = bbox
+    left = max(0, min(mask.width, left))
+    right = max(0, min(mask.width, right))
+    top = max(0, min(mask.height, top))
+    bottom = max(0, min(mask.height, bottom))
+    if right <= left or bottom <= top:
+        return 0.0
+    crop = np.array(mask.crop((left, top, right, bottom)).convert("L")) > 16
+    return float(crop.mean()) if crop.size else 0.0
 
 
 def bbox_from_luma_mask(mask: Image.Image, min_pixels: int = 64) -> tuple[int, int, int, int] | None:
@@ -12434,6 +13039,9 @@ def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, transla
                 "fontWeight": max(base_style["fontWeight"], 800) if is_bold else min(base_style["fontWeight"], 500),
                 "color": color,
                 "casing": "uppercase" if is_uppercase else "mixed",
+                "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or base_style.get("fontCategory")),
+                "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or 0),
+                "strokeFill": raw.get("stroke_fill") or raw.get("strokeFill"),
             }
         )
         segment_text = text.upper() if is_uppercase else text
@@ -12478,24 +13086,27 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
             continue
         source_id = str(raw.get("source_word_id") or raw.get("sourceWordId") or "").strip()
         hint = str(raw.get("source_segment_hint") or raw.get("sourceText") or raw.get("source_text") or "").strip()
-        source_style = lookup.get(source_id) if source_id else None
-        if source_style is None and hint:
-            source_style = lookup.get(normalize_ocr_text(hint))
-        if source_style is None:
-            first_token = normalize_ocr_text(text.split()[0]) if text.split() else ""
-            source_style = lookup.get(first_token) if first_token else None
-        color = str((source_style or {}).get("color") or base_style["color"])
+        source_styles = source_styles_for_segment(raw, lookup, text, hint)
+        inherited_style = dominant_source_style(source_styles, base_style)
+        source_ids = [str(style.get("id") or "") for style in source_styles if style.get("id")]
+        if not source_id and source_ids:
+            source_id = source_ids[0]
+        color = str(inherited_style.get("color") or base_style["color"])
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
             color = base_style["color"]
-        font_weight = int((source_style or {}).get("fontWeight") or base_style["fontWeight"])
-        is_uppercase = bool((source_style or {}).get("isUppercase", normalize_bool(raw.get("is_uppercase", raw.get("all_caps", False)))))
-        role = str(raw.get("semantic_role") or raw.get("role") or (source_style or {}).get("semanticRole") or classify_semantic_role(text)).strip() or "benefit"
+        font_weight = int(inherited_style.get("fontWeight") or base_style["fontWeight"])
+        is_uppercase = inherited_style.get("casing") == "uppercase" or normalize_bool(raw.get("is_uppercase", raw.get("all_caps", False)))
+        role = str(raw.get("semantic_role") or raw.get("role") or (source_styles[0] if source_styles else {}).get("semanticRole") or classify_semantic_role(text)).strip() or "benefit"
         style = dict(base_style)
         style.update(
             {
                 "fontWeight": max(800, font_weight) if font_weight >= 700 else min(500, font_weight),
                 "color": color,
                 "casing": "uppercase" if is_uppercase else "mixed",
+                "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or inherited_style.get("fontCategory") or base_style.get("fontCategory")),
+                "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or inherited_style.get("strokeWidth") or 0),
+                "strokeFill": raw.get("stroke_fill") or raw.get("strokeFill") or inherited_style.get("strokeFill"),
+                "fillTransparent": bool(raw.get("fill_transparent") or raw.get("fillTransparent") or inherited_style.get("fillTransparent")),
             }
         )
         segment_text = text.upper() if is_uppercase else text
@@ -12504,14 +13115,15 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "translatedText": segment_text,
                 "matchedSourceRole": role,
                 "style": style,
-                "sourceSegmentHint": hint or str((source_style or {}).get("text") or ""),
-                "sourceWordId": source_id or str((source_style or {}).get("id") or ""),
+                "sourceSegmentHint": hint or " ".join(str(source.get("text") or "") for source in source_styles).strip(),
+                "sourceWordId": source_id,
+                "sourceWordIds": source_ids or ([source_id] if source_id else []),
                 "forceBreakAfter": force_break,
                 "color": color,
                 "fontWeight": style["fontWeight"],
                 "casing": style["casing"],
                 "semanticStyleKey": f"{role}:{normalize_ocr_text(source_id or hint or text)}",
-                "styleTransferMode": "deterministic_source_word_foreground_style_cross_line",
+                "styleTransferMode": "deterministic_nm_source_word_foreground_style_cross_line",
             }
         )
     return normalized
@@ -12629,6 +13241,21 @@ def is_instructional_context_text(text: str) -> bool:
     )
 
 
+def is_short_product_context_token(text: str) -> bool:
+    normalized = normalize_ocr_text(text)
+    if not normalized or is_decorative_or_numeric_only(text):
+        return False
+    if any(token in normalized for token in ("www", "http", "com", "qr", "ingredients", "warning")):
+        return False
+    words = [part for part in re.split(r"\s+", normalized) if part]
+    if len(words) > 4 or len(normalized) > 36:
+        return False
+    has_digit_or_model_suffix = bool(re.search(r"\d|[a-z][a-z]*[0o][a-z0-9]?$", normalized))
+    has_brand_like_case = any(char.isupper() for char in text) and any(char.islower() for char in text)
+    has_product_noun = any(token in normalized for token in ("serum", "h2o", "hzo", "spf", "cream", "skincare", "lotion", "gel", "spray"))
+    return has_digit_or_model_suffix or has_brand_like_case or has_product_noun
+
+
 def should_preserve_ocr_structure(block: TextBlock, image_size: tuple[int, int]) -> bool:
     text = block.text.strip()
     if not text:
@@ -12642,6 +13269,8 @@ def should_preserve_ocr_structure(block: TextBlock, image_size: tuple[int, int])
 
 def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image: Image.Image) -> list[TextBlock]:
     image_size = image.size
+    foreground_bbox = detect_foreground_bbox(image)
+    product_mask = build_sam_or_vision_product_mask(image)
     blocks: list[TextBlock] = []
     seen: set[tuple[str, tuple[int, int, int, int]]] = set()
     for index, source in enumerate(sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
@@ -12654,6 +13283,28 @@ def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image: Image.Image
             continue
         seen.add(key)
         translate = should_translate_ocr_overlay_block(source, image_size)
+        box_width = max(1, bbox[2] - bbox[0])
+        box_height = max(1, bbox[3] - bbox[1])
+        image_width, image_height = image_size
+        foreground_overlap = overlap_fraction(bbox, foreground_bbox) if foreground_bbox else 0.0
+        product_mask_overlap = mask_overlap_fraction(bbox, product_mask)
+        likely_product_surface_label = (
+            translate
+            and product_mask_overlap >= 0.34
+            and box_width <= image_width * 0.34
+            and box_height <= image_height * 0.22
+        )
+        if not likely_product_surface_label:
+            likely_product_surface_label = (
+                translate
+                and product_mask_overlap >= 0.22
+                and foreground_overlap >= 0.18
+                and bbox[1] >= image_height * 0.38
+                and box_width <= image_width * 0.34
+                and box_height <= image_height * 0.22
+            )
+        if likely_product_surface_label:
+            translate = False
         sampled_color = sample_deterministic_text_color(image, bbox, source.color)
         line_boxes = (list(source.line_boxes or []) or [bbox]) if translate else []
         line_texts = (list(source.line_texts or []) or [text]) if translate else []
@@ -12681,14 +13332,16 @@ def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image: Image.Image
                     "semanticRole": word["semanticRole"],
                     "sourceWordId": word["id"],
                     "style": {
-                        **default_typography_style(updated),
-                        "color": word["color"],
-                        "fontWeight": word["fontWeight"],
-                        "casing": "uppercase" if word.get("isUppercase") else "mixed",
-                    },
+                    **default_typography_style(updated),
                     "color": word["color"],
                     "fontWeight": word["fontWeight"],
+                    "fontCategory": word.get("fontCategory", "sans-serif"),
                     "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                },
+                "color": word["color"],
+                "fontWeight": word["fontWeight"],
+                "fontCategory": word.get("fontCategory", "sans-serif"),
+                "casing": "uppercase" if word.get("isUppercase") else "mixed",
                     "forceBreakAfter": False,
                 }
                 for word in source_word_styles
@@ -12774,7 +13427,12 @@ def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlo
             and not block.text.strip().isupper()
             and any(term in text_norm for term in instruction_terms)
         )
-        if not is_instruction:
+        is_marketing_anchor = (
+            block.translate
+            and block.surface == "overlay"
+            and not is_decorative_or_numeric_only(block.text)
+        )
+        if not (is_instruction or is_marketing_anchor):
             output.append(block)
             continue
         block_h = max(1, block.bbox[3] - block.bbox[1])
@@ -12783,7 +13441,7 @@ def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlo
         for other_index, other in enumerate(ordered[index + 1 :], start=index + 1):
             if other_index in consumed:
                 continue
-            if not has_packaging_cues(other.text):
+            if not (has_packaging_cues(other.text) or is_short_product_context_token(other.text)):
                 continue
             gap_y = other.bbox[1] - block.bbox[3]
             overlap_x = max(0, min(block.bbox[2], other.bbox[2]) - max(block.bbox[0], other.bbox[0]))
@@ -12791,6 +13449,13 @@ def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlo
                 -block_h * 0.75 <= gap_y <= block_h * 0.85
                 and (overlap_x >= min(block_w, max(1, other.bbox[2] - other.bbox[0])) * 0.22 or abs(other.bbox[0] - block.bbox[0]) <= image_size[0] * 0.08)
             )
+            if not is_instruction:
+                # Header/product suffixes such as "How to use" + "Sebium H2O"
+                # are marketing overlay copy and must be cleaned/redrawn together.
+                other_h = max(1, other.bbox[3] - other.bbox[1])
+                similar_scale = 0.45 <= (other_h / max(1, block_h)) <= 1.8
+                same_header_cluster = near_same_copy and similar_scale and other.bbox[1] <= block.bbox[3] + block_h
+                near_same_copy = same_header_cluster
             if near_same_copy:
                 attached.append(other)
                 consumed.add(other_index)
@@ -12816,6 +13481,76 @@ def attach_adjacent_product_context_to_instruction_lines(ocr_lines: list[TextBlo
             )
         )
     return sorted(output, key=lambda item: (item.bbox[1], item.bbox[0]))
+
+
+def merge_adjacent_semantic_translation_blocks(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+    if not ocr_lines:
+        return []
+    ordered = sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0]))
+    consumed: set[int] = set()
+    merged: list[TextBlock] = []
+    instruction_terms = {
+        "cleanse", "remove", "apply", "use", "soak", "rinse", "care", "prepare", "clean",
+        "temizle", "cikar", "uygula", "kullan", "durula", "bakim", "hazirla",
+    }
+    for index, block in enumerate(ordered):
+        if index in consumed:
+            continue
+        group = [block]
+        if should_translate_ocr_overlay_block(block, image_size) and not block.text.strip().isupper():
+            group_box = block.bbox
+            group_norm = normalize_ocr_text(block.text)
+            for other_index, other in enumerate(ordered[index + 1 :], start=index + 1):
+                if other_index in consumed:
+                    continue
+                if not should_translate_ocr_overlay_block(other, image_size):
+                    continue
+                if other.text.strip().isupper() and len(other.text.split()) <= 5:
+                    continue
+                gap_y = other.bbox[1] - group_box[3]
+                if gap_y < -max(8, max(group_box[3] - group_box[1], other.bbox[3] - other.bbox[1]) * 0.9):
+                    continue
+                if gap_y > max(14, max(group_box[3] - group_box[1], other.bbox[3] - other.bbox[1]) * 0.82):
+                    break
+                overlap_x = max(0, min(group_box[2], other.bbox[2]) - max(group_box[0], other.bbox[0]))
+                min_width = max(1, min(group_box[2] - group_box[0], other.bbox[2] - other.bbox[0]))
+                same_column = overlap_x >= min_width * 0.28 or abs(group_box[0] - other.bbox[0]) <= image_size[0] * 0.055
+                if not same_column:
+                    continue
+                other_norm = normalize_ocr_text(other.text)
+                semantic_pair = (
+                    any(term in group_norm for term in instruction_terms)
+                    or any(term in other_norm for term in instruction_terms)
+                    or len(group) > 1
+                )
+                if not semantic_pair:
+                    continue
+                group.append(other)
+                consumed.add(other_index)
+                group_box = union_bbox([item.bbox for item in group]) or group_box
+                group_norm = f"{group_norm} {other_norm}".strip()
+        if len(group) == 1:
+            merged.append(block)
+            continue
+        group_sorted = sorted(group, key=lambda item: (item.bbox[1], item.bbox[0]))
+        bbox = union_bbox([item.bbox for item in group_sorted]) or block.bbox
+        text = "\n".join(item.text.strip() for item in group_sorted if item.text.strip())
+        merged.append(
+            block.model_copy(
+                update={
+                    "text": text,
+                    "bbox": bbox,
+                    "clean_box": compute_clean_box(bbox, image_size),
+                    "line_boxes": [item.bbox for item in group_sorted],
+                    "line_texts": [item.text.strip() for item in group_sorted if item.text.strip()],
+                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
+                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
+                    "align": infer_alignment(bbox, image_size[0]),
+                    "role": classify_text_role(text),
+                }
+            )
+        )
+    return sorted(merged, key=lambda item: (item.bbox[1], item.bbox[0]))
 
 
 def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -12849,6 +13584,7 @@ def fallback_segments_from_translation(block: TextBlock, translated_text: str) -
                 {
                     "text": target_word,
                     "source_word_id": source_style.get("id", ""),
+                    "source_word_ids": [source_style.get("id", "")] if source_style.get("id") else [],
                     "source_segment_hint": source_style.get("text", ""),
                     "semantic_role": source_style.get("semanticRole", classify_semantic_role(target_word)),
                 }
@@ -12899,10 +13635,72 @@ def ensure_v212_translation_coverage(payload: dict[str, Any], candidates: list[T
     return {**payload, "blocks": ordered, "coverageFallbackApplied": True}
 
 
+def expressive_punctuation(text: str) -> list[str]:
+    marks: list[str] = []
+    for mark in re.findall(r"[!?]", text or ""):
+        if mark not in marks:
+            marks.append(mark)
+    return marks
+
+
+def missing_expressive_punctuation(payload: dict[str, Any], candidates: list[TextBlock]) -> list[dict[str, Any]]:
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return []
+    mapped = {
+        str(item.get("id") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    missing: list[dict[str, Any]] = []
+    for block in candidates:
+        expected = expressive_punctuation(block.text)
+        if not expected:
+            continue
+        item = mapped.get(block.id or "")
+        translated = plain_text_from_translation_item(item or {}) if item else ""
+        for mark in expected:
+            if mark not in translated:
+                missing.append({"id": block.id, "mark": mark, "sourceText": block.text, "translatedText": translated})
+    return missing
+
+
+def repair_missing_expressive_punctuation(payload: dict[str, Any], candidates: list[TextBlock]) -> dict[str, Any]:
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return payload
+    by_id = {str(block.id or ""): block for block in candidates}
+    repaired = False
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        block = by_id.get(str(item.get("id") or ""))
+        if not block:
+            continue
+        translated = plain_text_from_translation_item(item)
+        for mark in expressive_punctuation(block.text):
+            if mark in translated:
+                continue
+            lines = item.get("lines")
+            if isinstance(lines, list) and lines:
+                last_line = next((line for line in reversed(lines) if isinstance(line, dict)), None)
+                segments = last_line.get("segments") if isinstance(last_line, dict) else None
+                last_segment = next((segment for segment in reversed(segments or []) if isinstance(segment, dict)), None)
+                if last_segment is not None:
+                    last_segment["text"] = f"{str(last_segment.get('text') or '').rstrip()}{mark}"
+                    repaired = True
+                    continue
+            item["translated_text"] = f"{str(item.get('translated_text') or translated).rstrip()}{mark}"
+            repaired = True
+    if repaired:
+        return {**payload, "punctuationRepairApplied": True, "blocks": items}
+    return payload
+
+
 def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_language: str) -> dict[str, Any]:
     candidates = [block for block in blocks if block.translate]
     prompt = {
-        "task": "Translate deterministic OCR overlay text lines for paid-media localization and return rich-text segments. Do not infer or modify coordinates.",
+        "task": "V5 polygon localize: translate Google Vision boundingPoly overlay text as semantic marketing/instruction blocks and return rich-text N:M style-mapped segments. Do not infer or modify coordinates.",
         "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
         "schema": LOCALIZE_V212_TRANSLATION_SCHEMA,
         "input_blocks": [
@@ -12918,6 +13716,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                         "hex_color_from_foreground_pixels": word.get("color"),
                         "is_bold": bool(word.get("isBold")),
                         "font_weight": word.get("fontWeight"),
+                        "font_category": word.get("fontCategory", "sans-serif"),
                         "is_uppercase": bool(word.get("isUppercase")),
                         "semantic_role": word.get("semanticRole"),
                     }
@@ -12938,11 +13737,15 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "Use exactly the ids from input_blocks; do not create new ids.",
             "Set translate=false only if the input is not marketing/instructional overlay copy.",
             "Never return x, y, w, h, bbox, or any coordinate.",
-            "Translate each input block independently; keep decorative numbers out because they are not in input_blocks.",
+            "HARD RULE: Translate each input block as one semantic unit, never as independent source lines or word-by-word fragments.",
+            "HARD RULE: Brand/product tokens such as Sébium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
+            "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
+            "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
-            "For every target segment, set source_word_id to the source_words id whose meaning/emphasis the segment inherited.",
-            "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_id.",
-            "If one translated phrase inherits emphasis from multiple source words, split it into multiple adjacent segments so each part keeps the correct source_word_id.",
+            "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
+            "HARD RULE: For 1-to-N mapping, repeat the same source word id across all target segments that inherit that source word style.",
+            "HARD RULE: For N-to-1 mapping, put all contributing source word ids in source_word_ids; the backend will apply dominant style.",
+            "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_ids.",
             *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
@@ -12952,8 +13755,15 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
         if vertex_available():
             parsed = generate_vertex_gemini_json(prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
             if isinstance(parsed.get("blocks"), list):
-                parsed["analysis_provider"] = "vertex-gemini-ocr-layout"
-                return ensure_v212_translation_coverage(parsed, candidates, target_language)
+                parsed["analysis_provider"] = "vertex-gemini-v5-polygon-nm-style"
+                parsed = ensure_v212_translation_coverage(parsed, candidates, target_language)
+                if missing_expressive_punctuation(parsed, candidates):
+                    retry_prompt = {**prompt, "retry_reason": "Previous response violated HARD punctuation preservation. Retry and preserve every source ! and ? in the target JSON."}
+                    retry = generate_vertex_gemini_json(retry_prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
+                    if isinstance(retry.get("blocks"), list):
+                        retry["analysis_provider"] = "vertex-gemini-v5-polygon-nm-style-retry-punctuation"
+                        parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
+                return repair_missing_expressive_punctuation(parsed, candidates)
     except Exception as exc:
         print(f"[localize-v2.1.2] Vertex Gemini OCR translation failed: {exc}", flush=True)
     try:
@@ -12970,11 +13780,29 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             )
             parsed = extract_json_object(response.choices[0].message.content or "{}")
             if isinstance(parsed.get("blocks"), list):
-                parsed["analysis_provider"] = "openai-text-ocr-layout"
-                return ensure_v212_translation_coverage(parsed, candidates, target_language)
+                parsed["analysis_provider"] = "openai-v5-polygon-nm-style-fallback"
+                parsed = ensure_v212_translation_coverage(parsed, candidates, target_language)
+                if missing_expressive_punctuation(parsed, candidates):
+                    response = client.chat.completions.create(
+                        model=os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o"),
+                        temperature=0,
+                        messages=[
+                            {"role": "system", "content": "You localize OCR text and return compact JSON only. This is a retry: preserve every source ! and ? in the target."},
+                            {"role": "user", "content": json.dumps({**prompt, "retry_reason": "Dropped required expressive punctuation."}, ensure_ascii=False)},
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                    retry = extract_json_object(response.choices[0].message.content or "{}")
+                    if isinstance(retry.get("blocks"), list):
+                        retry["analysis_provider"] = "openai-text-ocr-layout-retry-punctuation"
+                        parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
+                return repair_missing_expressive_punctuation(parsed, candidates)
     except Exception as exc:
         print(f"[localize-v2.1.2] OpenAI OCR translation failed: {exc}", flush=True)
-    return ensure_v212_translation_coverage({"analysis_provider": "deterministic-ocr-fallback", "blocks": []}, candidates, target_language)
+    return repair_missing_expressive_punctuation(
+        ensure_v212_translation_coverage({"analysis_provider": "deterministic-ocr-fallback", "blocks": []}, candidates, target_language),
+        candidates,
+    )
 
 
 def apply_v212_translations(blocks: list[TextBlock], payload: dict[str, Any]) -> list[TextBlock]:
@@ -13092,6 +13920,52 @@ def parse_hex_color(value: str, fallback: tuple[int, int, int] = (17, 17, 17)) -
         return fallback
 
 
+def build_v5_polygon_text_mask(image: Image.Image, block: TextBlock) -> tuple[Image.Image, dict[str, Any]]:
+    masks: list[Image.Image] = []
+    word_reports: list[dict[str, Any]] = []
+    for word in block.source_word_styles or []:
+        if not isinstance(word, dict):
+            continue
+        raw_polygons = word.get("symbolPolygons") or ([word.get("polygon")] if word.get("polygon") else [])
+        polygons: list[list[tuple[int, int]]] = []
+        for raw_polygon in raw_polygons:
+            if not isinstance(raw_polygon, list):
+                continue
+            polygon: list[tuple[int, int]] = []
+            for point in raw_polygon:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    polygon.append((int(point[0]), int(point[1])))
+            if len(polygon) >= 3 and polygon_area(polygon) > 1:
+                polygons.append(polygon)
+        if not polygons:
+            continue
+        stroke_width = int(word.get("strokeWidth") or 0)
+        dilation_px = stroke_width + 5 if word.get("outline") or stroke_width > 0 else int(os.getenv("ADAPTIFAI_V5_POLYGON_DILATION_PX", "5"))
+        dilation_px = max(3, min(16, dilation_px))
+        word_mask = polygon_mask(image.size, polygons, dilation_px=dilation_px)
+        masks.append(word_mask)
+        word_reports.append(
+            {
+                "word": word.get("text"),
+                "outline": bool(word.get("outline")),
+                "strokeWidth": stroke_width,
+                "dilationPx": dilation_px,
+                "polygonCount": len(polygons),
+            }
+        )
+    if not masks:
+        return Image.new("L", image.size, 0), {"strategy": "v5_polygon_mask", "status": "empty", "words": []}
+    mask = Image.new("L", image.size, 0)
+    for item in masks:
+        mask = ImageChops.lighter(mask, item.convert("L"))
+    return mask, {
+        "strategy": "v5_google_vision_symbol_polygon_mask",
+        "status": "passed" if mask.getbbox() else "empty",
+        "words": word_reports,
+        "whitePixelRatio": float(np.array(mask).mean() / 255.0),
+    }
+
+
 def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_px: int) -> Image.Image:
     import cv2
 
@@ -13099,6 +13973,7 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
     full_np = np.array(full)
     image_rgb = image.convert("RGB")
     word_styles = [word for word in (block.source_word_styles or []) if isinstance(word, dict) and word.get("bbox")]
+    antighost_px = anti_ghost_text_dilation_px(image.size)
     for word in word_styles:
         try:
             word_box = tuple(int(value) for value in word.get("bbox", [])[:4])
@@ -13106,18 +13981,29 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
             continue
         if len(word_box) != 4:
             continue
-        crop_box = expand_bbox(word_box, image.size, 2)
+        crop_box = expand_bbox(word_box, image.size, antighost_px + 2)
         x1, y1, x2, y2 = crop_box
         if x2 <= x1 or y2 <= y1:
             continue
         crop = np.array(image_rgb.crop(crop_box), dtype=np.uint8)
-        foreground = choose_foreground_text_mask(crop).astype(np.uint8) * 255
+        raw_foreground = choose_raw_foreground_mask(crop)
+        char_mask_bool, graphic_mask_bool = split_character_and_graphic_contours(raw_foreground)
+        foreground = char_mask_bool.astype(np.uint8) * 255
+        graphic = graphic_mask_bool.astype(np.uint8) * 255
         if foreground.max() == 0:
             continue
-        kernel_size = max(3, min(2, dilation_px) * 2 + 1)
+        kernel_size = max(3, antighost_px * 2 + 1)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
-        foreground = cv2.dilate(foreground, kernel, iterations=1)
-        word_confinement = np.array(confinement_mask_for_boxes(image.size, [word_box], pad_px=2).crop(crop_box).convert("L"))
+        expanded_text = cv2.dilate(foreground, kernel, iterations=1)
+        graphic_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        graphic_protection = cv2.dilate(graphic, graphic_kernel, iterations=1) if graphic.max() else graphic
+        foreground = cv2.subtract(expanded_text, graphic_protection)
+        estimated_box_values = word.get("estimatedBbox") if isinstance(word, dict) else None
+        try:
+            estimated_box = tuple(int(value) for value in (estimated_box_values or word_box)[:4])
+        except Exception:
+            estimated_box = word_box
+        word_confinement = np.array(confinement_mask_for_boxes(image.size, [estimated_box], pad_px=antighost_px + 2).crop(crop_box).convert("L"))
         foreground = cv2.bitwise_and(foreground, word_confinement)
         full_np[y1:y2, x1:x2] = np.maximum(full_np[y1:y2, x1:x2], foreground[: y2 - y1, : x2 - x1])
     if word_styles and full_np.max() > 0:
@@ -13153,8 +14039,9 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
         candidate = candidate.astype(np.uint8) * 255
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=1)
-        candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
-        candidate = filter_character_like_contours(candidate).astype(np.uint8) * 255
+        char_mask_bool, graphic_mask_bool = split_character_and_graphic_contours(candidate)
+        candidate = char_mask_bool.astype(np.uint8) * 255
+        graphic_mask = graphic_mask_bool.astype(np.uint8) * 255
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
         filtered = np.zeros_like(candidate)
         crop_area = max(1, candidate.shape[0] * candidate.shape[1])
@@ -13169,9 +14056,12 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
             filtered[labels == label] = 255
         if filtered.max() == 0:
             filtered = candidate
-        kernel_size = max(3, min(2, dilation_px) * 2 + 1)
+        kernel_size = max(3, antighost_px * 2 + 1)
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         filtered = cv2.dilate(filtered, dilate_kernel, iterations=1)
+        if graphic_mask.max():
+            graphic_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            filtered = cv2.subtract(filtered, cv2.dilate(graphic_mask, graphic_kernel, iterations=1))
         x1, y1, x2, y2 = crop_box
         full_np[y1:y2, x1:x2] = np.maximum(full_np[y1:y2, x1:x2], filtered[: y2 - y1, : x2 - x1])
     return Image.fromarray(full_np, "L")
@@ -13188,12 +14078,18 @@ def build_strict_text_removal_mask(
     dilation_px = strict_mask_dilation_px(image.size)
     feather_px = int(round(strict_mask_feather_px(image.size)))
     for block in blocks:
+        has_v5_polygons = any(isinstance(word, dict) and (word.get("symbolPolygons") or word.get("polygon")) for word in (block.source_word_styles or []))
         source_boxes = list(block.line_boxes or []) or [block.bbox]
         for box in source_boxes:
             left, top, right, bottom = box
             if right <= left or bottom <= top:
                 continue
             boxes.append((left, top, right, bottom))
+        if has_v5_polygons:
+            v5_mask, v5_report = build_v5_polygon_text_mask(image, block)
+            raw = ImageChops.lighter(raw, v5_mask.convert("L").resize(image.size))
+            mask_reports.append({"block": block.id, **v5_report})
+            continue
         if should_use_rectangular_strict_mask(block, image.size):
             pass
         try:
@@ -13482,9 +14378,12 @@ def run_openai_localize_v2_cleanup(image: Image.Image, mask: Image.Image) -> Ima
 def composite_provider_cleanup_over_source(source: Image.Image, provider_image: Image.Image, mask: Image.Image) -> Image.Image:
     provider_resized = provider_image.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
     hard_mask = mask.convert("L").resize(source.size)
-    feather_px = strict_mask_feather_px(source.size)
-    soft_edge = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
-    alpha = ImageChops.lighter(hard_mask, soft_edge)
+    if env_flag("ADAPTIFAI_LOCALIZE_V2_FEATHER_PROVIDER_COMPOSITE", "0"):
+        feather_px = strict_mask_feather_px(source.size)
+        soft_edge = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
+        alpha = ImageChops.lighter(hard_mask, soft_edge)
+    else:
+        alpha = Image.fromarray(np.where(np.array(hard_mask, dtype=np.uint8) > 16, 255, 0).astype(np.uint8), "L")
     if env_flag("ADAPTIFAI_LOCALIZE_V213_SEAMLESS_PROVIDER_BLEND", "1"):
         blended = seamless_clone_local_patch(source.convert("RGB"), provider_resized, hard_mask)
         return Image.composite(blended.convert("RGB"), source.convert("RGB"), alpha)
@@ -13549,7 +14448,7 @@ def fill_remaining_mask_components(result: Image.Image, source: Image.Image, mas
         area = int(stats[label, cv2.CC_STAT_AREA])
         if area < 3 or w <= 0 or h <= 0:
             continue
-        pad = max(5, min(16, int(round(max(w, h) * 0.18))))
+        pad = max(10, min(32, int(round(max(w, h) * 0.45))))
         sample_box = (
             max(0, x - pad),
             max(0, y - pad),
@@ -13560,8 +14459,9 @@ def fill_remaining_mask_components(result: Image.Image, source: Image.Image, mas
         local_mask = np.array(mask.crop(sample_box).convert("L")) > 16
         fill_rgb = dominant_background_fill_color(sample, local_mask)
         patch = Image.new("RGB", (sample_box[2] - sample_box[0], sample_box[3] - sample_box[1]), fill_rgb)
-        patch_mask = mask.crop(sample_box).convert("L")
-        output.paste(patch, sample_box[:2], patch_mask)
+        patch_mask_np = np.array(mask.crop(sample_box).convert("L"), dtype=np.uint8)
+        hard_patch_mask = Image.fromarray(np.where(patch_mask_np > 16, 255, 0).astype(np.uint8), "L")
+        output.paste(patch, sample_box[:2], hard_patch_mask)
     return output
 
 
@@ -13792,7 +14692,7 @@ def fit_styled_spans_strict(
 
 
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
-    canvas = base.convert("RGB")
+    canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     for block in blocks:
         text = block.translated_text or block.text
@@ -13864,7 +14764,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             x = render_box[0] if block.align == "left" else render_box[0] + max(0, (render_box[2] - render_box[0] - text_width_px) // 2)
             draw.text((x, y), line_text, fill=block.color or "#111111", font=font)
             y += line_height
-    return canvas
+    return canvas.convert("RGB")
 
 
 def build_localize_assets_v2(paths: list[Path], languages: list[str], output_format: str, job_dir: Path) -> tuple[list[OutputAsset], dict[str, list[str]], list[dict[str, Any]]]:
@@ -13873,18 +14773,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
     manifest_assets: list[dict[str, Any]] = []
     for image_path in image_paths(paths):
         source_image = Image.open(image_path).convert("RGB")
-        ocr_lines = merge_v212_ocr_fragments_into_lines(
-            explode_ocr_blocks_to_lines(run_trocr_ocr_on_image(image_path), source_image.size),
-            source_image.size,
-        )
-        ocr_lines = attach_adjacent_product_context_to_instruction_lines(ocr_lines, source_image.size)
-        protected_ocr_lines = [
-            block.model_copy(update={"translate": False, "surface": "packaging"})
-            for block in ocr_lines
-            if should_preserve_ocr_structure(block, source_image.size)
-        ]
+        vision_words = google_vision_word_blocks(image_path, source_image.size)
+        if not vision_words:
+            raise RuntimeError("V5 polygon localize requires Google Cloud Vision boundingPoly OCR, but no words were returned.")
+        ocr_layout_blocks, protected_ocr_lines, v5_meta = group_v5_polygon_words(vision_words, source_image)
         for language in languages:
-            ocr_layout_blocks = deterministic_v212_ocr_blocks(ocr_lines, source_image)
             payload = analyze_localize_v212_ocr_translations(ocr_layout_blocks, language)
             blocks = [block for block in apply_v212_translations(ocr_layout_blocks, payload) if block.translate]
             translations_summary[language] = [block.translated_text or block.text for block in blocks]
@@ -13904,7 +14797,9 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 json.dumps(
                     {
                         **payload,
-                        "pipeline": "v2.1.2-deterministic-ocr-layout",
+                        "pipeline": "v5-polygon-vision-layout",
+                        "pipeline_version": "v5-absolute-polygon-nm-style",
+                        "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
                     ensure_ascii=False,
@@ -13925,11 +14820,13 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 translated_text="\n\n".join(block.translated_text or "" for block in blocks if block.translated_text),
                 extracted_blocks=blocks,
                 debug={
-                    "pipeline": "v2.1.2",
+                    "pipeline": "v5",
+                    "pipeline_version": "v5-absolute-polygon-nm-style",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v2.1.2-deterministic-ocr-contour-mask-pillow-fit",
+                    "layoutEngine": "v5-google-vision-polygon-pillow-cursor-typesetting",
+                    "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
                         "mask": f"/api/download/{job_dir.name}/{mask_filename}",
@@ -13942,7 +14839,8 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 {
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
-                    "pipeline": "v2.1.2-deterministic-ocr-layout",
+                    "pipeline": "v5-polygon-vision-layout",
+                    "pipeline_version": "v5-absolute-polygon-nm-style",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
