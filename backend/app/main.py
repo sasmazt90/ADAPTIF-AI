@@ -273,6 +273,27 @@ LOCALIZE_V2_RICH_TEXT_SCHEMA = {
 }
 
 
+LOCALIZE_V212_TRANSLATION_SCHEMA = {
+    "blocks": [
+        {
+            "id": "ocr-block-id from input",
+            "translate": True,
+            "translated_text": "plain fallback localized copy, equal to concatenated segment text",
+            "segments": [
+                {
+                    "text": "translated word or phrase",
+                    "is_bold": True,
+                    "color": "#052b52",
+                    "is_uppercase": False,
+                    "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
+                    "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
+                }
+            ],
+        }
+    ]
+}
+
+
 class OutputAsset(BaseModel):
     placement_id: str | None = None
     filename: str
@@ -12178,6 +12199,169 @@ def normalized_localize_v2_blocks(payload: dict[str, Any], image: Image.Image) -
     return sorted(blocks, key=lambda block: (block.bbox[1], block.bbox[0]))
 
 
+def is_decorative_or_numeric_only(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(cleaned) and bool(re.fullmatch(r"[\d\s.,:/#%+-]+", cleaned))
+
+
+def should_translate_ocr_overlay_block(block: TextBlock, image_size: tuple[int, int]) -> bool:
+    text = block.text.strip()
+    if not text or is_decorative_or_numeric_only(text):
+        return False
+    normalized = text.lower()
+    box_width = max(1, block.bbox[2] - block.bbox[0])
+    box_height = max(1, block.bbox[3] - block.bbox[1])
+    image_width, image_height = image_size
+    area_ratio = (box_width * box_height) / max(1, image_width * image_height)
+    if has_packaging_cues(text):
+        return False
+    if any(token in normalized for token in ("www.", ".com", ".de", "http", "qr", "ask.naos")):
+        return False
+    if box_height <= max(10, image_height * 0.018) and len(text) >= 22:
+        return False
+    if area_ratio <= 0.00018 and len(text) >= 16:
+        return False
+    return True
+
+
+def deterministic_v212_ocr_blocks(ocr_lines: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+    blocks: list[TextBlock] = []
+    seen: set[tuple[str, tuple[int, int, int, int]]] = set()
+    for index, source in enumerate(sorted(ocr_lines, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
+        text = repair_mojibake(source.text.strip())
+        if not text:
+            continue
+        bbox = tuple(source.bbox)
+        key = (normalize_match_text(text), bbox)
+        if key in seen:
+            continue
+        seen.add(key)
+        translate = should_translate_ocr_overlay_block(source, image_size)
+        blocks.append(
+            source.model_copy(
+                update={
+                    "id": f"ocr-v212-{index}",
+                    "text": text,
+                    "translated_text": text,
+                    "translate": translate,
+                    "surface": "overlay" if translate else source.surface,
+                    "line_boxes": [bbox] if translate else [],
+                    "line_texts": [text] if translate else [],
+                    "clean_box": compute_clean_box(bbox, image_size, large_block=False) if translate else None,
+                    "font_size_estimate": estimate_font_size_from_bbox(bbox),
+                    "line_height_estimate": estimate_line_height_from_bbox(bbox),
+                    "align": infer_alignment(bbox, image_size[0]),
+                }
+            )
+        )
+    return blocks
+
+
+def normalize_v212_translation_items(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return {}
+    mapped: dict[str, dict[str, Any]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        block_id = str(item.get("id") or "").strip()
+        if not block_id:
+            continue
+        mapped[block_id] = item
+    return mapped
+
+
+def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_language: str) -> dict[str, Any]:
+    candidates = [block for block in blocks if block.translate]
+    prompt = {
+        "task": "Translate deterministic OCR overlay text lines for paid-media localization and return rich-text segments. Do not infer or modify coordinates.",
+        "targetLanguage": LANGUAGE_NAMES.get(target_language.upper(), target_language),
+        "schema": LOCALIZE_V212_TRANSLATION_SCHEMA,
+        "input_blocks": [
+            {
+                "id": block.id,
+                "source_text": block.text,
+                "style_hint": {
+                    "color": block.color,
+                    "is_bold": block.font_weight >= 700,
+                    "is_uppercase": block.text.isupper(),
+                    "semantic_role": classify_semantic_role(block.text),
+                },
+            }
+            for block in candidates
+        ],
+        "rules": [
+            "Return compact JSON only.",
+            "Use exactly the ids from input_blocks; do not create new ids.",
+            "Set translate=false only if the input is not marketing/instructional overlay copy.",
+            "Never return x, y, w, h, bbox, or any coordinate.",
+            "Translate each input block independently; keep decorative numbers out because they are not in input_blocks.",
+            *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
+        ],
+    }
+    if not candidates:
+        return {"analysis_provider": "deterministic-ocr", "blocks": []}
+    try:
+        if vertex_available():
+            parsed = generate_vertex_gemini_json(prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
+            if isinstance(parsed.get("blocks"), list):
+                parsed["analysis_provider"] = "vertex-gemini-ocr-layout"
+                return parsed
+    except Exception as exc:
+        print(f"[localize-v2.1.2] Vertex Gemini OCR translation failed: {exc}", flush=True)
+    try:
+        if os.getenv("OPENAI_API_KEY"):
+            client = OpenAI()
+            response = client.chat.completions.create(
+                model=os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o"),
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": "You localize OCR text lines and return compact JSON only. Never output coordinates."},
+                    {"role": "user", "content": json.dumps(prompt, ensure_ascii=False)},
+                ],
+                response_format={"type": "json_object"},
+            )
+            parsed = extract_json_object(response.choices[0].message.content or "{}")
+            if isinstance(parsed.get("blocks"), list):
+                parsed["analysis_provider"] = "openai-text-ocr-layout"
+                return parsed
+    except Exception as exc:
+        print(f"[localize-v2.1.2] OpenAI OCR translation failed: {exc}", flush=True)
+    return {"analysis_provider": "deterministic-ocr-fallback", "blocks": []}
+
+
+def apply_v212_translations(blocks: list[TextBlock], payload: dict[str, Any]) -> list[TextBlock]:
+    translations = normalize_v212_translation_items(payload)
+    updated: list[TextBlock] = []
+    for block in blocks:
+        if not block.translate:
+            updated.append(block)
+            continue
+        item = translations.get(block.id or "")
+        if not item or item.get("translate") is False:
+            updated.append(block.model_copy(update={"translate": False, "line_boxes": [], "line_texts": []}))
+            continue
+        translated_text = repair_mojibake(str(item.get("translated_text") or "").strip())
+        if not translated_text:
+            translated_text = repair_mojibake(plain_text_from_segments(item.get("segments"))) or block.text
+        translated_style_spans = normalize_rich_text_segments(item.get("segments"), block=block, translated=True)
+        source_style_spans = normalize_rich_text_segments(item.get("source_style_segments"), block=block, translated=False)
+        if not translated_style_spans:
+            source_style_spans = source_style_spans or infer_source_style_spans(block.text, block)
+            translated_style_spans = infer_translated_style_spans(block.text, translated_text, source_style_spans, block)
+        updated.append(
+            block.model_copy(
+                update={
+                    "translated_text": translated_text,
+                    "source_style_spans": source_style_spans,
+                    "translated_style_spans": translated_style_spans,
+                }
+            )
+        )
+    return updated
+
+
 def strict_mask_dilation_px(image_size: tuple[int, int]) -> int:
     configured = os.getenv("ADAPTIFAI_STRICT_MASK_DILATION_PX", "").strip()
     if configured:
@@ -12211,6 +12395,8 @@ def dilate_mask(mask: Image.Image, dilation_px: int) -> Image.Image:
 
 
 def should_use_rectangular_strict_mask(block: TextBlock, image_size: tuple[int, int]) -> bool:
+    if os.getenv("ADAPTIFAI_LOCALIZE_V212_CONTOUR_MASK", "1").strip().lower() in {"1", "true", "yes", "on"}:
+        return False
     width, height = image_size
     line_boxes = block.line_boxes or [block.bbox]
     if len(line_boxes) >= 2:
@@ -12227,6 +12413,75 @@ def should_use_rectangular_strict_mask(block: TextBlock, image_size: tuple[int, 
         if (box_width * box_height) / max(1, width * height) >= 0.018:
             return True
     return False
+
+
+def parse_hex_color(value: str, fallback: tuple[int, int, int] = (17, 17, 17)) -> tuple[int, int, int]:
+    cleaned = str(value or "").strip().lstrip("#")
+    if len(cleaned) != 6:
+        return fallback
+    try:
+        return tuple(int(cleaned[index:index + 2], 16) for index in range(0, 6, 2))
+    except ValueError:
+        return fallback
+
+
+def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_px: int) -> Image.Image:
+    import cv2
+
+    full = Image.new("L", image.size, 0)
+    full_np = np.array(full)
+    image_rgb = image.convert("RGB")
+    for box in list(block.line_boxes or []) or [block.bbox]:
+        left, top, right, bottom = box
+        if right <= left or bottom <= top:
+            continue
+        crop_box = expand_bbox((left, top, right, bottom), image.size, max(1, min(3, dilation_px // 3)))
+        crop = np.array(image_rgb.crop(crop_box))
+        if crop.size == 0:
+            continue
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        blurred = cv2.GaussianBlur(gray, (0, 0), 1.2)
+        local_delta = cv2.absdiff(gray, blurred)
+        edges = cv2.Canny(gray, 35, 135)
+        median = float(np.median(gray))
+        rgb = crop.astype(np.int16)
+        text_rgb = np.array(parse_hex_color(block.color), dtype=np.int16)
+        color_dist = np.linalg.norm(rgb - text_rgb.reshape(1, 1, 3), axis=2)
+        saturation = crop.max(axis=2).astype(np.int16) - crop.min(axis=2).astype(np.int16)
+        text_brightness = float(np.mean(text_rgb))
+        if text_brightness >= 210:
+            color_candidate = (color_dist <= 72) & (gray.astype(np.float32) >= median + 10)
+        elif text_brightness <= 70:
+            color_candidate = (color_dist <= 92) & (gray.astype(np.float32) <= median - 8)
+        else:
+            color_candidate = (color_dist <= 82) & (saturation >= max(12, int(np.median(saturation) + 8)))
+        contrast_candidate = local_delta >= max(12, int(np.percentile(local_delta, 82)))
+        edge_candidate = edges > 0
+        candidate = color_candidate | (edge_candidate & contrast_candidate)
+        candidate = candidate.astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=1)
+        candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
+        filtered = np.zeros_like(candidate)
+        crop_area = max(1, candidate.shape[0] * candidate.shape[1])
+        for label in range(1, num_labels):
+            x, y, w, h, area = stats[label]
+            if area < 3:
+                continue
+            if area / crop_area > 0.42:
+                continue
+            if h > candidate.shape[0] * 0.96 and w > candidate.shape[1] * 0.55:
+                continue
+            filtered[labels == label] = 255
+        if filtered.max() == 0:
+            filtered = candidate
+        kernel_size = max(3, dilation_px * 2 + 1)
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        filtered = cv2.dilate(filtered, dilate_kernel, iterations=1)
+        x1, y1, x2, y2 = crop_box
+        full_np[y1:y2, x1:x2] = np.maximum(full_np[y1:y2, x1:x2], filtered[: y2 - y1, : x2 - x1])
+    return Image.fromarray(full_np, "L")
 
 
 def build_strict_text_removal_mask(
@@ -12247,23 +12502,7 @@ def build_strict_text_removal_mask(
                 continue
             boxes.append((left, top, right, bottom))
         if should_use_rectangular_strict_mask(block, image.size):
-            block_mask = Image.new("L", image.size, 0)
-            block_draw = ImageDraw.Draw(block_mask)
-            for box in source_boxes:
-                expanded = expand_bbox(box, image.size, dilation_px)
-                block_draw.rectangle(expanded, fill=255)
-            raw = ImageChops.lighter(raw, block_mask)
-            mask_reports.append(
-                {
-                    "block": block.id,
-                    "status": "passed",
-                    "strategy": "rectangular_bbox_with_dilation_for_large_overlay_text",
-                    "whitePixelRatio": float(np.array(block_mask).mean() / 255.0),
-                    "textCoverageEstimate": 1.0,
-                    "backgroundLeakageEstimate": 0.0,
-                }
-            )
-            continue
+            pass
         try:
             stroke = build_precise_text_stroke_mask(
                 image,
@@ -12288,14 +12527,18 @@ def build_strict_text_removal_mask(
                 continue
         except Exception as exc:
             mask_reports.append({"block": block.id, "status": "precise_mask_failed", "failure": str(exc)[:160]})
-        fallback = Image.new("L", image.size, 0)
-        fallback_draw = ImageDraw.Draw(fallback)
-        for box in source_boxes:
-            left, top, right, bottom = box
-            if right <= left or bottom <= top:
-                continue
-            fallback_draw.rectangle((left, top, right, bottom), fill=255)
-        raw = ImageChops.lighter(raw, dilate_mask(fallback, dilation_px))
+        contour = build_ocr_contour_text_mask(image, block, dilation_px)
+        raw = ImageChops.lighter(raw, contour)
+        mask_reports.append(
+            {
+                "block": block.id,
+                "status": "passed" if contour.getbbox() else "empty_contour_mask",
+                "strategy": "ocr_text_contour_with_dilation",
+                "whitePixelRatio": float(np.array(contour).mean() / 255.0),
+                "textCoverageEstimate": 0.86 if contour.getbbox() else 0.0,
+                "backgroundLeakageEstimate": 0.04 if contour.getbbox() else 0.0,
+            }
+        )
     dilated = raw.convert("L")
     protected_boxes: list[tuple[int, int, int, int]] = []
     if protected_blocks:
@@ -12701,6 +12944,40 @@ def block_has_rich_text_segments(block: TextBlock) -> bool:
     return len({color for color in colors if color}) > 1 or len(weights) > 1
 
 
+def fit_styled_spans_strict(
+    draw: ImageDraw.ImageDraw,
+    spans: list[dict[str, Any]],
+    box: tuple[int, int, int, int],
+    base_typography: dict[str, Any],
+) -> dict[str, Any]:
+    max_width = max(8, box[2] - box[0])
+    max_height = max(8, box[3] - box[1])
+    line_height_ratio = max(1.12, min(1.42, float(base_typography.get("lineHeight", 18)) / max(1.0, float(base_typography.get("fontSize", 16)))))
+    best: dict[str, Any] | None = None
+    for scale_percent in range(100, 19, -5):
+        scale_factor = scale_percent / 100.0
+        lines = build_styled_lines(draw, spans, max_width, scale_factor)
+        if not lines:
+            continue
+        widest, total_height, line_layouts = measure_styled_layout(draw, lines, scale_factor, line_height_ratio)
+        overflow = max(0, widest - max_width) + max(0, total_height - max_height)
+        candidate = {
+            "scaleFactor": scale_factor,
+            "lines": line_layouts,
+            "widest": widest,
+            "totalHeight": total_height,
+            "overflow": overflow,
+            "preferredLineCount": None,
+            "lineCountDelta": 0,
+            "score": scale_factor * 1000 - overflow * 10,
+        }
+        if overflow == 0:
+            return candidate
+        if best is None or overflow < best.get("overflow", 10**9) or candidate["score"] > best.get("score", -10**9):
+            best = candidate
+    return best or {"scaleFactor": 1.0, "lines": [], "widest": 0, "totalHeight": 0, "overflow": max_width + max_height}
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGB")
     draw = ImageDraw.Draw(canvas)
@@ -12711,14 +12988,12 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             pad_x = max(2, int((box[2] - box[0]) * 0.02))
             pad_y = max(1, int((box[3] - box[1]) * 0.02))
             render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
-            preferred_line_count = max(1, len(block.line_boxes) or len([line for line in block.text.splitlines() if line.strip()]) or 1)
             base_typography = default_typography_style(block)
-            layout = fit_styled_spans(
+            layout = fit_styled_spans_strict(
                 draw,
                 block.translated_style_spans,
                 render_box,
                 base_typography,
-                preferred_line_count=preferred_line_count,
             )
             render_styled_spans(draw, layout, render_box, alignment=block.align)
             continue
@@ -12792,9 +13067,9 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             if has_packaging_cues(block.text) or not block.translate
         ]
         for language in languages:
-            payload = analyze_localize_v2(source_image, language)
-            blocks = normalized_localize_v2_blocks(payload, source_image)
-            blocks = snap_localize_v2_blocks_to_ocr(blocks, ocr_lines, source_image.size)
+            ocr_layout_blocks = deterministic_v212_ocr_blocks(ocr_lines, source_image.size)
+            payload = analyze_localize_v212_ocr_translations(ocr_layout_blocks, language)
+            blocks = [block for block in apply_v212_translations(ocr_layout_blocks, payload) if block.translate]
             translations_summary[language] = [block.translated_text or block.text for block in blocks]
             mask, mask_meta = build_strict_text_removal_mask(source_image, blocks, protected_ocr_lines)
             cleaned, cleanup_meta = inpaint_localize_v2_base(source_image, mask, blocks) if blocks else (source_image.copy(), {"provider": "none"})
@@ -12808,7 +13083,18 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             analysis_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-v2-analysis.json"
             mask.save(job_dir / mask_filename, "PNG")
             cleaned.save(job_dir / clean_filename, "PNG")
-            (job_dir / analysis_filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            (job_dir / analysis_filename).write_text(
+                json.dumps(
+                    {
+                        **payload,
+                        "pipeline": "v2.1.2-deterministic-ocr-layout",
+                        "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
 
             asset = OutputAsset(
                 filename=filename,
@@ -12822,10 +13108,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 translated_text="\n\n".join(block.translated_text or "" for block in blocks if block.translated_text),
                 extracted_blocks=blocks,
                 debug={
-                    "pipeline": "v2",
+                    "pipeline": "v2.1.2",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
+                    "layoutEngine": "v2.1.2-deterministic-ocr-contour-mask-pillow-fit",
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
                         "mask": f"/api/download/{job_dir.name}/{mask_filename}",
@@ -12838,7 +13125,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 {
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
-                    "pipeline": "v2",
+                    "pipeline": "v2.1.2-deterministic-ocr-layout",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
