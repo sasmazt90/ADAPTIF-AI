@@ -8558,64 +8558,67 @@ def render_styled_spans(
     *,
     alignment: str,
     style: dict[str, Any] | None = None,
+    precise_inline: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     total_height = int(layout.get("totalHeight", 0))
     if layout.get("verticalOverflowAllowed"):
         y = box[1]
     else:
         y = box[1] + max(0, (box[3] - box[1] - total_height) // 2)
+
     rendered_spans: list[dict[str, Any]] = []
     span_render_boxes: list[dict[str, Any]] = []
     shadow = style.get("shadow") if style else None
+
     for line_index, line in enumerate(layout.get("lines", [])):
         line_width = int(line.get("lineWidth", 0))
+
+        # KESİN MATEMATİK: Sola hizalamada padding'i çöpe at, tam 'box[0]' kullan
         if alignment == "left":
             x = box[0]
         elif layout.get("blockCenterX") is not None:
             x = int(round(float(layout["blockCenterX"]) - (line_width / 2)))
         else:
             x = box[0] + max(0, (box[2] - box[0] - line_width) // 2)
-        precise_inline = layout.get("typesetting") == "v6.3-precise-inline-render"
-        line_top = int(line.get("lineTop", 0))
+
         baseline = y + int(line.get("maxAscent", 0))
+        line_font_size = line.get("lineFontSize", 16)
+
         for token_index, token in enumerate(line.get("tokens", [])):
-            token_text = token["text"] if precise_inline else (token["text"] if token_index == 0 else f" {token['text']}")
+            token_text = token["text"]
             font = token["font"]
             token_style = token.get("style", {})
             fill = token_style.get("color", "#111111")
+
             stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
             stroke_fill = token_style.get("strokeFill") or fill
+
             if token_style.get("fillTransparent"):
                 fill = (0, 0, 0, 0)
-            if precise_inline:
-                text_y = y - line_top
-            else:
-                text_y = baseline - token["ascent"]
+
             left, top, right, bottom = draw.textbbox(
-                (x, text_y),
+                (x, baseline - token["ascent"]),
                 token_text,
                 font=font,
                 stroke_width=stroke_width,
             )
+
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
-                draw.text((x + shadow_offset, text_y + shadow_offset), token_text, fill=shadow_fill, font=font)
+                draw.text((x + shadow_offset, baseline - token["ascent"] + shadow_offset), token_text, fill=shadow_fill, font=font)
+
+            text_y = baseline - token["ascent"]
             if token_style.get("fillTransparent") and stroke_width > 0:
                 for distance in range(1, stroke_width + 1):
                     for dx, dy in (
-                        (-distance, 0),
-                        (distance, 0),
-                        (0, -distance),
-                        (0, distance),
-                        (-distance, -distance),
-                        (-distance, distance),
-                        (distance, -distance),
-                        (distance, distance),
+                        (-distance, 0), (distance, 0), (0, -distance), (0, distance),
+                        (-distance, -distance), (-distance, distance), (distance, -distance), (distance, distance),
                     ):
                         draw.text((x + dx, text_y + dy), token_text, fill=stroke_fill, font=font)
             else:
                 draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+
             rendered_spans.append(
                 {
                     "lineIndex": line_index,
@@ -8631,11 +8634,17 @@ def render_styled_spans(
                     "bbox": [left, top, right, bottom],
                 }
             )
-            if precise_inline:
-                x += float(token.get("xAdvance") or draw.textlength(f"{token_text} ", font=font))
+
+            # V6.4 Kuralı: X-Advance için Explicit Space ekle
+            # KESİN MATEMATİK: `v62_measure_tokens_with_line_font` üzerinden gelen doğru xAdvance değerini kullan
+            if precise_inline or "xAdvance" in token:
+                x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
             else:
                 x += text_width(draw, token_text, font)
-        y += int(line.get("lineHeight", 0))
+
+        # KESİN MATEMATİK: Satır arası ezilmeyi engellemek için tipografik nefes payı (%25)
+        y += int(line.get("lineHeight", 0)) + int(line_font_size * 0.25)
+
     return rendered_spans, span_render_boxes
 
 
@@ -14293,106 +14302,83 @@ def fit_styled_spans_strict(
     return best or {"scaleFactor": 1.0, "lines": [], "widest": 0, "totalHeight": 0, "overflow": max_width + max_height}
 
 
-def v63_source_line_heights(block: TextBlock) -> list[int]:
-    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
-    source_line_boxes = [tuple(int(value) for value in box) for box in (block.line_boxes or []) if len(box) == 4]
-    if not source_words:
-        return [max(1, int(block.font_size_estimate or 16))]
-    if not source_line_boxes:
-        heights = []
-        for word in source_words:
-            box = word.get("bbox") or word.get("estimatedBbox") or []
-            if isinstance(box, list) and len(box) == 4:
-                heights.append(max(1, int(box[3]) - int(box[1])))
-        return [max(heights)] if heights else [max(1, int(block.font_size_estimate or 16))]
-
-    line_heights: list[int] = []
-    for line_box in source_line_boxes:
-        heights: list[int] = []
-        for word in source_words:
-            box = word.get("bbox") or word.get("estimatedBbox") or []
-            if not (isinstance(box, list) and len(box) == 4):
-                continue
-            cy = (int(box[1]) + int(box[3])) / 2
-            if int(line_box[1]) <= cy <= int(line_box[3]):
-                heights.append(max(1, int(box[3]) - int(box[1])))
-        if heights:
-            line_heights.append(max(heights))
-    if line_heights:
-        return line_heights
-    all_heights = [
-        max(1, int(word["bbox"][3]) - int(word["bbox"][1]))
-        for word in source_words
-        if isinstance(word.get("bbox"), list) and len(word.get("bbox")) == 4
-    ]
-    return [max(all_heights)] if all_heights else [max(1, int(block.font_size_estimate or 16))]
-
-
-def v63_source_word_heights(block: TextBlock) -> dict[str, int]:
+def v62_source_word_height_map(block: TextBlock) -> dict[str, int]:
     heights: dict[str, int] = {}
     for word in block.source_word_styles or []:
         if not isinstance(word, dict):
             continue
         source_id = str(word.get("id") or "").strip()
+        if not source_id:
+            continue
         box = word.get("bbox") or word.get("estimatedBbox") or []
-        if source_id and isinstance(box, list) and len(box) == 4:
-            heights[source_id] = max(1, int(box[3]) - int(box[1]))
+        if isinstance(box, list) and len(box) == 4:
+            height = max(1, int(box[3]) - int(box[1]))
+        else:
+            height = max(1, int(word.get("fontSize") or block.font_size_estimate or 16))
+        heights[source_id] = height
     return heights
 
 
-def v63_line_font_size(tokens: list[dict[str, Any]], source_word_heights: dict[str, int], source_line_height: int) -> int:
-    referenced_heights: list[int] = []
-    for token in tokens:
-        for source_id in token.get("sourceWordIds") or []:
-            if source_id in source_word_heights:
-                referenced_heights.append(source_word_heights[source_id])
-    if referenced_heights:
-        return max(referenced_heights)
-    return max(1, int(source_line_height))
+def v62_token_source_height(token: dict[str, Any], source_heights: dict[str, int], fallback_size: int) -> int:
+    ids = token.get("sourceWordIds") or []
+    matched = [source_heights[source_id] for source_id in ids if source_id in source_heights]
+    if matched:
+        return max(matched)
+    return max(1, int(fallback_size))
 
 
 def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[dict[str, Any]], line_font_size: int) -> tuple[int, list[dict[str, Any]], int, int]:
-    line_advance = 0.0
-    trailing_space = 0.0
+    line_width = 0.0
     metrics: list[dict[str, Any]] = []
     max_ascent = 0
     max_descent = 0
-    line_top: int | None = None
-    line_bottom: int | None = None
-    for token in tokens:
+
+    for index, token in enumerate(tokens):
         style = dict(token.get("style", {}))
         style["fontSize"] = max(1, int(line_font_size))
-        font = get_font_for_style(style, max(1, int(line_font_size)))
+
+        font_weight = int(style.get("fontWeight") or 700)
+        font = get_font(
+            size=int(line_font_size),
+            bold=font_weight >= 700,
+            category=str(style.get("fontCategory") or "sans-serif")
+        )
+
         try:
             ascent, descent = font.getmetrics()
         except Exception:
             ascent, descent = max(1, int(line_font_size)), max(1, int(line_font_size) // 4)
+
         token_text = token["text"]
-        stroke_width = max(0, min(14, int(round(float(style.get("strokeWidth") or 0)))))
-        token_bbox = draw.textbbox((0, 0), token_text, font=font, stroke_width=stroke_width)
-        word_advance = float(draw.textlength(f"{token_text} ", font=font))
-        space_advance = float(draw.textlength(" ", font=font))
-        line_advance += word_advance
-        trailing_space = space_advance
+
+        # KESİN MATEMATİK: Kelime ve boşluk genişliğini ayrı ayrı topla
+        try:
+            width = draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)
+        except AttributeError:
+            width = text_width(draw, token_text, font) + text_width(draw, " ", font)
+
+        line_width += width
         max_ascent = max(max_ascent, ascent)
         max_descent = max(max_descent, descent)
-        line_top = token_bbox[1] if line_top is None else min(line_top, token_bbox[1])
-        line_bottom = token_bbox[3] if line_bottom is None else max(line_bottom, token_bbox[3])
-        metrics.append(
-            {
-                "font": font,
-                "size": max(1, int(line_font_size)),
-                "ascent": ascent,
-                "descent": descent,
-                "textTop": token_bbox[1],
-                "textBottom": token_bbox[3],
-                "xAdvance": word_advance,
-                "style": style,
-                "role": token["role"],
-                "text": token["text"],
-            }
-        )
-    line_width = max(0.0, line_advance - trailing_space) if metrics else 0.0
+
+        metrics.append({
+            "font": font,
+            "size": int(line_font_size),
+            "ascent": ascent,
+            "descent": descent,
+            "style": style,
+            "role": token.get("role", "benefit"),
+            "text": token["text"],
+            "xAdvance": width,  # İlerleme ölçüsünü açıkça render döngüsüne aktar
+        })
+
+    if metrics:
+        try:
+            last_space = draw.textlength(" ", font=metrics[-1]["font"])
+        except AttributeError:
+            last_space = text_width(draw, " ", metrics[-1]["font"])
+        line_width = max(0.0, line_width - last_space)
+
     return int(round(line_width)), metrics, max_ascent, max_descent
 
 
@@ -14403,19 +14389,19 @@ def fit_v62_geometric_typesetting(
     box: tuple[int, int, int, int],
 ) -> dict[str, Any]:
     max_width = max(1, box[2] - box[0])
+    source_heights = v62_source_word_height_map(block)
     fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
-    source_line_heights = v63_source_line_heights(block)
-    source_word_heights = v63_source_word_heights(block)
+
     tokens: list[dict[str, Any]] = []
     for span in spans:
         tokens.extend(tokenize_style_span(span))
+
     lines: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
+
     for token in tokens:
         candidate = current + [token]
-        source_line_index = min(len(lines), len(source_line_heights) - 1)
-        source_line_height = max(1, int(source_line_heights[source_line_index] if source_line_heights else fallback_size))
-        candidate_font_size = v63_line_font_size(candidate, source_word_heights, source_line_height)
+        candidate_font_size = max(v62_token_source_height(item, source_heights, fallback_size) for item in candidate)
         candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
         if current and candidate_width > max_width:
             lines.append(current)
@@ -14425,20 +14411,22 @@ def fit_v62_geometric_typesetting(
         if token.get("forceBreakAfter") and current:
             lines.append(current)
             current = []
+
     if current:
         lines.append(current)
 
     line_layouts: list[dict[str, Any]] = []
     widest = 0
     total_height = 0
-    for line_index, line in enumerate(lines):
-        source_line_index = min(line_index, len(source_line_heights) - 1)
-        source_line_height = max(1, int(source_line_heights[source_line_index] if source_line_heights else fallback_size))
-        line_font_size = v63_line_font_size(line, source_word_heights, source_line_height)
+
+    for line in lines:
+        line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
         line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
-        line_top = min((int(token.get("textTop", 0)) for token in metrics), default=0)
-        line_bottom = max((int(token.get("textBottom", 0)) for token in metrics), default=max_ascent + max_descent)
-        line_height = max(1, line_bottom - line_top)
+
+        # V6.4 Kuralı: Satır Arası Ezilmeyi Çöz (Typographic Leading/Line-Height)
+        line_height_measured = max_ascent + max_descent
+        line_height = int(round(line_height_measured + (line_font_size * 0.25)))
+
         widest = max(widest, line_width)
         total_height += line_height
         line_layouts.append(
@@ -14446,8 +14434,6 @@ def fit_v62_geometric_typesetting(
                 "tokens": metrics,
                 "lineWidth": line_width,
                 "lineHeight": line_height,
-                "lineTop": line_top,
-                "lineBottom": line_bottom,
                 "maxAscent": max_ascent,
                 "maxDescent": max_descent,
                 "lineFontSize": line_font_size,
@@ -14462,7 +14448,7 @@ def fit_v62_geometric_typesetting(
         "overflow": max(0, widest - max_width),
         "verticalOverflowAllowed": True,
         "blockCenterX": block_center_x,
-        "typesetting": "v6.3-precise-inline-render",
+        "typesetting": "v6.4-absolute-geometric",
         "score": 1000 - max(0, widest - max_width) * 10,
     }
 
@@ -14525,44 +14511,40 @@ def draw_v5_numeric_bypass(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
-    last_v5_text_bottom = 0
+
+    last_y_end = 0  # <--- V6.4: Bloklar arası çarpışmayı önleyen Y sayacı
+
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
             draw_v5_numeric_bypass(draw, block)
             continue
+
         text = block.translated_text or block.text
         if block_has_rich_text_segments(block):
-            render_spans = block.translated_style_spans or [
-                {
-                    "translatedText": text,
-                    "matchedSourceRole": block.role or "benefit",
-                    "style": default_typography_style(block),
-                    "sourceWordIds": [],
-                    "forceBreakAfter": False,
-                }
-            ]
             box = v5_strict_render_box(block, canvas.size) if is_v5_block(block) else block.bbox
+
+            # V6.4 Kuralı: Yeni anlamsal blok, önceki bloğun içine giremez.
+            start_y = max(box[1], last_y_end)
+
             pad_x = 0 if is_v5_block(block) else max(2, int((box[2] - box[0]) * 0.02))
             pad_y = 0 if is_v5_block(block) else max(1, int((box[3] - box[1]) * 0.02))
-            render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
-            if is_v5_block(block):
-                render_box = (render_box[0], max(render_box[1], last_v5_text_bottom), render_box[2], render_box[3])
+
+            render_box = (box[0] + pad_x, start_y + pad_y, box[2] - pad_x, max(box[3], start_y + 10) - pad_y)
+
             base_typography = default_typography_style(block)
             if is_v5_block(block):
-                layout = fit_v62_geometric_typesetting(draw, block, render_spans, render_box)
+                layout = fit_v62_geometric_typesetting(draw, block, block.translated_style_spans, render_box)
             else:
                 layout = fit_styled_spans_strict(
-                    draw,
-                    render_spans,
-                    render_box,
-                    base_typography,
-                    honor_force_breaks=True,
-                    allow_vertical_overflow=False,
+                    draw, block.translated_style_spans, render_box, base_typography, honor_force_breaks=True, allow_vertical_overflow=False,
                 )
+
             _, span_render_boxes = render_styled_spans(draw, layout, render_box, alignment=block.align)
-            if is_v5_block(block) and span_render_boxes:
-                last_v5_text_bottom = max(last_v5_text_bottom, max(int(item["bbox"][3]) for item in span_render_boxes))
+
+            if span_render_boxes:
+                last_y_end = max(b["bbox"][3] for b in span_render_boxes)
             continue
+
         translated_lines = [line.strip() for line in text.splitlines() if line.strip()]
         source_line_boxes = list(block.line_boxes or [])
         if source_line_boxes and translated_lines and len(translated_lines) <= len(source_line_boxes):
@@ -14591,32 +14573,34 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                     x = render_box[0] if block.align == "left" else render_box[0] + max(0, (render_box[2] - render_box[0] - text_width_px) // 2)
                     draw.text((x, y), fitted_line, fill=block.color or "#111111", font=font)
                     y += line_height
-            continue
-        box = block.bbox
-        pad_x = max(2, int((box[2] - box[0]) * 0.02))
-        pad_y = max(1, int((box[3] - box[1]) * 0.02))
-        if block.align == "left" and box[0] > canvas.width * 0.52:
-            pad_x = max(pad_x, int((box[2] - box[0]) * 0.12))
-        render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
-        preferred_lines = max(1, len([line for line in block.text.splitlines() if line.strip()]))
-        preferred_size = max(8, min(96, int((box[3] - box[1]) / max(1, preferred_lines) * 0.72)))
-        if len((block.translated_text or block.text).split()) >= 5:
-            preferred_size = min(preferred_size, max(10, int(canvas.height * 0.034)))
-        text_lines, size, line_height = fit_plain_text_for_box(
-            draw,
-            text,
-            render_box,
-            bold=block.font_weight >= 700,
-            preferred_size=preferred_size,
-        )
-        y = render_box[1] + max(0, (render_box[3] - render_box[1] - len(text_lines) * line_height) // 2)
-        for line_text in text_lines:
-            font = get_font(size, bold=block.font_weight >= 700)
-            bbox = draw.textbbox((0, 0), line_text, font=font)
-            text_width_px = bbox[2] - bbox[0]
-            x = render_box[0] if block.align == "left" else render_box[0] + max(0, (render_box[2] - render_box[0] - text_width_px) // 2)
-            draw.text((x, y), line_text, fill=block.color or "#111111", font=font)
-            y += line_height
+        else:
+            box = block.bbox
+            pad_x = max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = max(1, int((box[3] - box[1]) * 0.02))
+            if block.align == "left" and box[0] > canvas.width * 0.52:
+                pad_x = max(pad_x, int((box[2] - box[0]) * 0.12))
+
+            start_y = max(box[1], last_y_end)
+            render_box = (box[0] + pad_x, start_y + pad_y, box[2] - pad_x, max(box[3], start_y + 10) - pad_y)
+
+            preferred_lines = max(1, len([line for line in block.text.splitlines() if line.strip()]))
+            preferred_size = max(8, min(96, int((box[3] - box[1]) / max(1, preferred_lines) * 0.72)))
+            if len((block.translated_text or block.text).split()) >= 5:
+                preferred_size = min(preferred_size, max(10, int(canvas.height * 0.034)))
+            text_lines, size, line_height = fit_plain_text_for_box(
+                draw, text, render_box, bold=block.font_weight >= 700, preferred_size=preferred_size,
+            )
+            y = render_box[1] + max(0, (render_box[3] - render_box[1] - len(text_lines) * line_height) // 2)
+            for line_text in text_lines:
+                font = get_font(size, bold=block.font_weight >= 700)
+                bbox = draw.textbbox((0, 0), line_text, font=font)
+                text_width_px = bbox[2] - bbox[0]
+                x = render_box[0] if block.align == "left" else render_box[0] + max(0, (render_box[2] - render_box[0] - text_width_px) // 2)
+                draw.text((x, y), line_text, fill=block.color or "#111111", font=font)
+                y += line_height
+
+            last_y_end = max(last_y_end, y)
+
     return canvas.convert("RGB")
 
 
