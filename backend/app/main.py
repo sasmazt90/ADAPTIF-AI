@@ -14536,11 +14536,12 @@ def polish_masked_cleanup_with_opencv(cleaned: Image.Image, mask: Image.Image) -
 
 
 def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list[TextBlock] | None = None) -> tuple[Image.Image, dict[str, Any]]:
+    is_v5_polygon_pipeline = any(str(block.id or "").startswith("v5-block-") for block in (blocks or []))
     # Flat graphic/text panels are safer with deterministic fill: generative
     # providers can hallucinate residual letters even when instructed not to.
-    if env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "1"):
+    if not is_v5_polygon_pipeline and env_flag("ADAPTIFAI_LOCALIZE_V2_LOCAL_FILL_FIRST", "1"):
         return strict_local_fill_cleanup(image, mask, blocks or [])
-    split_small_overlay = not env_flag("ADAPTIFAI_LOCALIZE_V212_PROVIDER_CLEANUP", "1")
+    split_small_overlay = (not is_v5_polygon_pipeline) and not env_flag("ADAPTIFAI_LOCALIZE_V212_PROVIDER_CLEANUP", "1")
     if blocks and split_small_overlay:
         large_blocks = [block for block in blocks if should_use_rectangular_strict_mask(block, image.size)]
         small_blocks = [block for block in blocks if block not in large_blocks]
@@ -14565,6 +14566,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         cleaned = composite_provider_cleanup_over_source(image, replicate_result, mask)
         scrubbed = scrub_provider_residuals_inside_mask(cleaned, image, mask)
         return polish_masked_cleanup_with_opencv(scrubbed, mask), {**meta, "maskedPolish": "opencv-telea", "residualScrub": "inside-character-mask"}
+    if is_v5_polygon_pipeline:
+        raise RuntimeError(f"V5 polygon localize requires Replicate LaMa cleanup; replicate failed: {LAST_REPLICATE_LAMA_ERROR or 'unknown'}")
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
         "Do not add text. Preserve products, packaging, logos, arrows, labels, colors, gradients, and unmasked areas."
