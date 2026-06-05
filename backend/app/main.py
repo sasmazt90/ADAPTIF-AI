@@ -499,12 +499,16 @@ def pick_google_font_family(requested_family: str | None, bold: bool, category: 
     return None
 
 
-def pick_google_font_variant(item: dict[str, Any], bold: bool) -> tuple[str, str] | None:
+def pick_google_font_variant(item: dict[str, Any], bold: bool, weight: int | None = None) -> tuple[str, str] | None:
     files = item.get("files", {})
     if not isinstance(files, dict) or not files:
         return None
     variants = [str(variant) for variant in item.get("variants", [])]
-    preferred = ["700", "800", "600", "regular"] if bold else ["regular", "400", "500", "300"]
+    requested_weight = int(weight or (700 if bold else 400))
+    if requested_weight >= 700:
+        preferred = [str(requested_weight), "700", "800", "600", "regular"]
+    else:
+        preferred = [str(requested_weight), "regular", "400", "500", "300"]
     for variant in preferred + variants:
         url = files.get(variant)
         if isinstance(url, str) and url:
@@ -513,13 +517,14 @@ def pick_google_font_variant(item: dict[str, Any], bold: bool) -> tuple[str, str
     return str(first_variant), str(first_url).replace("http://", "https://")
 
 
-def get_google_font_file(requested_family: str | None, bold: bool, category: str | None = None) -> Path | None:
+def get_google_font_file(requested_family: str | None, bold: bool, category: str | None = None, weight: int | None = None) -> Path | None:
     if not google_fonts_enabled():
         return None
     family = pick_google_font_family(requested_family, bold, category)
     if not family:
         return None
-    cache_key = (family.lower(), "bold" if bold else "regular")
+    requested_weight = int(weight or (700 if bold else 400))
+    cache_key = (family.lower(), str(requested_weight), "bold" if bold else "regular")
     if cache_key in GOOGLE_FONT_FILE_CACHE:
         return GOOGLE_FONT_FILE_CACHE[cache_key]
 
@@ -527,7 +532,7 @@ def get_google_font_file(requested_family: str | None, bold: bool, category: str
     if not item:
         GOOGLE_FONT_FILE_CACHE[cache_key] = None
         return None
-    selected = pick_google_font_variant(item, bold)
+    selected = pick_google_font_variant(item, bold, requested_weight)
     if not selected:
         GOOGLE_FONT_FILE_CACHE[cache_key] = None
         return None
@@ -8100,15 +8105,16 @@ def parse_bold_markup(text: str) -> list[tuple[str, bool]]:
     return [(segment, bold) for segment, bold in segments if segment]
 
 
-def get_font(size: int, bold: bool = False, family: str | None = None, category: str | None = None):
-    google_font = get_google_font_file(family, bold, category)
+def get_font(size: int, bold: bool = False, family: str | None = None, category: str | None = None, weight: int | None = None):
+    requested_weight = int(weight or (700 if bold else 400))
+    google_font = get_google_font_file(family, bold, category, requested_weight)
     if google_font is not None:
         try:
             return ImageFont.truetype(str(google_font), size)
         except OSError as exc:
             print(f"[fonts] Google font load failed for {google_font}: {exc}", flush=True)
 
-    local_cache_key = (f"{family or ''}:{normalize_font_category(category)}:{size}", bold)
+    local_cache_key = (f"{family or ''}:{normalize_font_category(category)}:{size}:{requested_weight}", bold)
     if local_cache_key in LOCAL_FONT_FILE_CACHE:
         return LOCAL_FONT_FILE_CACHE[local_cache_key]
 
@@ -8212,11 +8218,28 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
         return []
     role = str(span.get("matchedSourceRole") or span.get("semanticRole") or "benefit")
     style = dict(span.get("style", {}))
+    source_word_id = str(span.get("sourceWordId") or span.get("source_word_id") or "").strip()
+    raw_source_word_ids = span.get("sourceWordIds") or span.get("source_word_ids") or []
+    source_word_ids = [str(value).strip() for value in raw_source_word_ids if str(value).strip()] if isinstance(raw_source_word_ids, list) else []
+    if source_word_id and source_word_id not in source_word_ids:
+        source_word_ids.insert(0, source_word_id)
     force_break_after = bool(span.get("forceBreakAfter", False))
     keep_whole = role in {"percentage", "numeric_claim", "condition_or_topic", "brand/product_name"}
+    if "[BOLD]" in text or "[/BOLD]" in text:
+        bold_tokens: list[dict[str, Any]] = []
+        for segment_text, segment_bold in parse_bold_markup(text):
+            segment_style = dict(style)
+            if segment_bold:
+                segment_style["fontWeight"] = max(700, int(segment_style.get("fontWeight") or 700))
+            for token in segment_text.split():
+                if token:
+                    bold_tokens.append({"text": token, "style": segment_style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": False})
+        if bold_tokens:
+            bold_tokens[-1]["forceBreakAfter"] = force_break_after
+        return bold_tokens
     if keep_whole:
-        return [{"text": text, "style": style, "role": role, "forceBreakAfter": force_break_after}]
-    tokens = [{"text": token, "style": style, "role": role, "forceBreakAfter": False} for token in text.split() if token]
+        return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after}]
+    tokens = [{"text": token, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": False} for token in text.split() if token]
     if tokens:
         tokens[-1]["forceBreakAfter"] = force_break_after
     return tokens
@@ -8226,7 +8249,7 @@ def get_font_for_style(style: dict[str, Any], size: int):
     weight = int(style.get("fontWeight", 700))
     family = str(style.get("fontFamily") or "").strip() or None
     category = str(style.get("fontCategory") or "sans-serif").strip() or "sans-serif"
-    return get_font(size, bold=weight >= 700, family=family, category=category)
+    return get_font(size, bold=weight >= 700, family=family, category=category, weight=weight)
 
 
 def span_token_width(draw: ImageDraw.ImageDraw, token: dict[str, Any], *, first_in_line: bool, scale_factor: float) -> float:
@@ -8546,10 +8569,17 @@ def render_styled_spans(
     shadow = style.get("shadow") if style else None
     for line_index, line in enumerate(layout.get("lines", [])):
         line_width = int(line.get("lineWidth", 0))
-        x = box[0] if alignment == "left" else box[0] + max(0, (box[2] - box[0] - line_width) // 2)
+        if alignment == "left":
+            x = box[0]
+        elif layout.get("blockCenterX") is not None:
+            x = int(round(float(layout["blockCenterX"]) - (line_width / 2)))
+        else:
+            x = box[0] + max(0, (box[2] - box[0] - line_width) // 2)
+        precise_inline = layout.get("typesetting") == "v6.3-precise-inline-render"
+        line_top = int(line.get("lineTop", 0))
         baseline = y + int(line.get("maxAscent", 0))
         for token_index, token in enumerate(line.get("tokens", [])):
-            token_text = token["text"] if token_index == 0 else f" {token['text']}"
+            token_text = token["text"] if precise_inline else (token["text"] if token_index == 0 else f" {token['text']}")
             font = token["font"]
             token_style = token.get("style", {})
             fill = token_style.get("color", "#111111")
@@ -8557,8 +8587,12 @@ def render_styled_spans(
             stroke_fill = token_style.get("strokeFill") or fill
             if token_style.get("fillTransparent"):
                 fill = (0, 0, 0, 0)
+            if precise_inline:
+                text_y = y - line_top
+            else:
+                text_y = baseline - token["ascent"]
             left, top, right, bottom = draw.textbbox(
-                (x, baseline - token["ascent"]),
+                (x, text_y),
                 token_text,
                 font=font,
                 stroke_width=stroke_width,
@@ -8566,8 +8600,7 @@ def render_styled_spans(
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
-                draw.text((x + shadow_offset, baseline - token["ascent"] + shadow_offset), token_text, fill=shadow_fill, font=font)
-            text_y = baseline - token["ascent"]
+                draw.text((x + shadow_offset, text_y + shadow_offset), token_text, fill=shadow_fill, font=font)
             if token_style.get("fillTransparent") and stroke_width > 0:
                 for distance in range(1, stroke_width + 1):
                     for dx, dy in (
@@ -8598,7 +8631,10 @@ def render_styled_spans(
                     "bbox": [left, top, right, bottom],
                 }
             )
-            x += text_width(draw, token_text, font)
+            if precise_inline:
+                x += float(token.get("xAdvance") or draw.textlength(f"{token_text} ", font=font))
+            else:
+                x += text_width(draw, token_text, font)
         y += int(line.get("lineHeight", 0))
     return rendered_spans, span_render_boxes
 
@@ -8610,12 +8646,16 @@ def serialize_styled_layout(layout: dict[str, Any]) -> dict[str, Any]:
             {
                 "lineWidth": line.get("lineWidth", 0),
                 "lineHeight": line.get("lineHeight", 0),
+                "lineFontSize": line.get("lineFontSize", 0),
+                "lineTop": line.get("lineTop", 0),
+                "lineBottom": line.get("lineBottom", 0),
                 "maxAscent": line.get("maxAscent", 0),
                 "maxDescent": line.get("maxDescent", 0),
                 "tokens": [
                     {
                         "text": token.get("text", ""),
                         "size": token.get("size", 0),
+                        "xAdvance": token.get("xAdvance", 0),
                         "role": token.get("role", ""),
                         "style": token.get("style", {}),
                     }
@@ -8628,6 +8668,8 @@ def serialize_styled_layout(layout: dict[str, Any]) -> dict[str, Any]:
         "widest": layout.get("widest", 0),
         "totalHeight": layout.get("totalHeight", 0),
         "overflow": layout.get("overflow", 0),
+        "typesetting": layout.get("typesetting"),
+        "blockCenterX": layout.get("blockCenterX"),
         "lines": serialized_lines,
     }
 
@@ -10133,22 +10175,6 @@ def is_v5_numeric_bypass_text(text: str) -> bool:
     return bool(re.fullmatch(r"[\d]+(?:[.)])?", cleaned))
 
 
-def infer_polygon_text_alignment(line_boxes: list[tuple[int, int, int, int]], fallback: str = "left") -> str:
-    boxes = [box for box in line_boxes if box[2] > box[0] and box[3] > box[1]]
-    if len(boxes) < 2:
-        return fallback if fallback in {"left", "center"} else "left"
-    union = union_bbox(boxes)
-    if union is None:
-        return fallback if fallback in {"left", "center"} else "left"
-    block_width = max(1, union[2] - union[0])
-    centers = [((box[0] + box[2]) / 2.0) for box in boxes]
-    center_spread = max(centers) - min(centers)
-    center_tolerance = max(6.0, block_width * 0.10)
-    if center_spread <= center_tolerance:
-        return "center"
-    return "left"
-
-
 def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[list[TextBlock], list[TextBlock], dict[str, Any]]:
     if not words:
         return [], [], {"provider": "google-cloud-vision", "wordCount": 0, "mode": "polygon"}
@@ -10286,7 +10312,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         line_boxes = [union_bbox([item.bbox for item in line]) or line[0].bbox for line in line_groups]
         bbox = union_bbox([item.bbox for item in group]) or group[0].bbox
         text = "\n".join(line_texts)
-        block_align = infer_polygon_text_alignment(line_boxes, infer_alignment(bbox, image.width))
+        block_align = infer_alignment(bbox, image.width)
         block = TextBlock(
             id=f"v5-block-{index}",
             text=text,
@@ -14205,6 +14231,8 @@ def fit_plain_text_for_box(
 
 def block_has_rich_text_segments(block: TextBlock) -> bool:
     spans = block.translated_style_spans or []
+    if "[BOLD]" in (block.translated_text or "") or "[/BOLD]" in (block.translated_text or ""):
+        return True
     if not spans:
         return False
     if any(span.get("styleTransferMode") == "model_word_level_semantic_mapping" for span in spans):
@@ -14265,6 +14293,180 @@ def fit_styled_spans_strict(
     return best or {"scaleFactor": 1.0, "lines": [], "widest": 0, "totalHeight": 0, "overflow": max_width + max_height}
 
 
+def v63_source_line_heights(block: TextBlock) -> list[int]:
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
+    source_line_boxes = [tuple(int(value) for value in box) for box in (block.line_boxes or []) if len(box) == 4]
+    if not source_words:
+        return [max(1, int(block.font_size_estimate or 16))]
+    if not source_line_boxes:
+        heights = []
+        for word in source_words:
+            box = word.get("bbox") or word.get("estimatedBbox") or []
+            if isinstance(box, list) and len(box) == 4:
+                heights.append(max(1, int(box[3]) - int(box[1])))
+        return [max(heights)] if heights else [max(1, int(block.font_size_estimate or 16))]
+
+    line_heights: list[int] = []
+    for line_box in source_line_boxes:
+        heights: list[int] = []
+        for word in source_words:
+            box = word.get("bbox") or word.get("estimatedBbox") or []
+            if not (isinstance(box, list) and len(box) == 4):
+                continue
+            cy = (int(box[1]) + int(box[3])) / 2
+            if int(line_box[1]) <= cy <= int(line_box[3]):
+                heights.append(max(1, int(box[3]) - int(box[1])))
+        if heights:
+            line_heights.append(max(heights))
+    if line_heights:
+        return line_heights
+    all_heights = [
+        max(1, int(word["bbox"][3]) - int(word["bbox"][1]))
+        for word in source_words
+        if isinstance(word.get("bbox"), list) and len(word.get("bbox")) == 4
+    ]
+    return [max(all_heights)] if all_heights else [max(1, int(block.font_size_estimate or 16))]
+
+
+def v63_source_word_heights(block: TextBlock) -> dict[str, int]:
+    heights: dict[str, int] = {}
+    for word in block.source_word_styles or []:
+        if not isinstance(word, dict):
+            continue
+        source_id = str(word.get("id") or "").strip()
+        box = word.get("bbox") or word.get("estimatedBbox") or []
+        if source_id and isinstance(box, list) and len(box) == 4:
+            heights[source_id] = max(1, int(box[3]) - int(box[1]))
+    return heights
+
+
+def v63_line_font_size(tokens: list[dict[str, Any]], source_word_heights: dict[str, int], source_line_height: int) -> int:
+    referenced_heights: list[int] = []
+    for token in tokens:
+        for source_id in token.get("sourceWordIds") or []:
+            if source_id in source_word_heights:
+                referenced_heights.append(source_word_heights[source_id])
+    if referenced_heights:
+        return max(referenced_heights)
+    return max(1, int(source_line_height))
+
+
+def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[dict[str, Any]], line_font_size: int) -> tuple[int, list[dict[str, Any]], int, int]:
+    line_advance = 0.0
+    trailing_space = 0.0
+    metrics: list[dict[str, Any]] = []
+    max_ascent = 0
+    max_descent = 0
+    line_top: int | None = None
+    line_bottom: int | None = None
+    for token in tokens:
+        style = dict(token.get("style", {}))
+        style["fontSize"] = max(1, int(line_font_size))
+        font = get_font_for_style(style, max(1, int(line_font_size)))
+        try:
+            ascent, descent = font.getmetrics()
+        except Exception:
+            ascent, descent = max(1, int(line_font_size)), max(1, int(line_font_size) // 4)
+        token_text = token["text"]
+        stroke_width = max(0, min(14, int(round(float(style.get("strokeWidth") or 0)))))
+        token_bbox = draw.textbbox((0, 0), token_text, font=font, stroke_width=stroke_width)
+        word_advance = float(draw.textlength(f"{token_text} ", font=font))
+        space_advance = float(draw.textlength(" ", font=font))
+        line_advance += word_advance
+        trailing_space = space_advance
+        max_ascent = max(max_ascent, ascent)
+        max_descent = max(max_descent, descent)
+        line_top = token_bbox[1] if line_top is None else min(line_top, token_bbox[1])
+        line_bottom = token_bbox[3] if line_bottom is None else max(line_bottom, token_bbox[3])
+        metrics.append(
+            {
+                "font": font,
+                "size": max(1, int(line_font_size)),
+                "ascent": ascent,
+                "descent": descent,
+                "textTop": token_bbox[1],
+                "textBottom": token_bbox[3],
+                "xAdvance": word_advance,
+                "style": style,
+                "role": token["role"],
+                "text": token["text"],
+            }
+        )
+    line_width = max(0.0, line_advance - trailing_space) if metrics else 0.0
+    return int(round(line_width)), metrics, max_ascent, max_descent
+
+
+def fit_v62_geometric_typesetting(
+    draw: ImageDraw.ImageDraw,
+    block: TextBlock,
+    spans: list[dict[str, Any]],
+    box: tuple[int, int, int, int],
+) -> dict[str, Any]:
+    max_width = max(1, box[2] - box[0])
+    fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
+    source_line_heights = v63_source_line_heights(block)
+    source_word_heights = v63_source_word_heights(block)
+    tokens: list[dict[str, Any]] = []
+    for span in spans:
+        tokens.extend(tokenize_style_span(span))
+    lines: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for token in tokens:
+        candidate = current + [token]
+        source_line_index = min(len(lines), len(source_line_heights) - 1)
+        source_line_height = max(1, int(source_line_heights[source_line_index] if source_line_heights else fallback_size))
+        candidate_font_size = v63_line_font_size(candidate, source_word_heights, source_line_height)
+        candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
+        if current and candidate_width > max_width:
+            lines.append(current)
+            current = [token]
+        else:
+            current = candidate
+        if token.get("forceBreakAfter") and current:
+            lines.append(current)
+            current = []
+    if current:
+        lines.append(current)
+
+    line_layouts: list[dict[str, Any]] = []
+    widest = 0
+    total_height = 0
+    for line_index, line in enumerate(lines):
+        source_line_index = min(line_index, len(source_line_heights) - 1)
+        source_line_height = max(1, int(source_line_heights[source_line_index] if source_line_heights else fallback_size))
+        line_font_size = v63_line_font_size(line, source_word_heights, source_line_height)
+        line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
+        line_top = min((int(token.get("textTop", 0)) for token in metrics), default=0)
+        line_bottom = max((int(token.get("textBottom", 0)) for token in metrics), default=max_ascent + max_descent)
+        line_height = max(1, line_bottom - line_top)
+        widest = max(widest, line_width)
+        total_height += line_height
+        line_layouts.append(
+            {
+                "tokens": metrics,
+                "lineWidth": line_width,
+                "lineHeight": line_height,
+                "lineTop": line_top,
+                "lineBottom": line_bottom,
+                "maxAscent": max_ascent,
+                "maxDescent": max_descent,
+                "lineFontSize": line_font_size,
+            }
+        )
+    block_center_x = (box[0] + box[2]) / 2.0
+    return {
+        "scaleFactor": 1.0,
+        "lines": line_layouts,
+        "widest": widest,
+        "totalHeight": total_height,
+        "overflow": max(0, widest - max_width),
+        "verticalOverflowAllowed": True,
+        "blockCenterX": block_center_x,
+        "typesetting": "v6.3-precise-inline-render",
+        "score": 1000 - max(0, widest - max_width) * 10,
+    }
+
+
 def is_v5_block(block: TextBlock) -> bool:
     return bool(block.id and str(block.id).startswith("v5-"))
 
@@ -14298,13 +14500,11 @@ def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tupl
     top = min(box[1] for box in boxes)
     right = max(box[2] for box in boxes)
     bottom = max(box[3] for box in boxes)
-    pad_x = 1
-    pad_y = 1
     return (
-        max(0, left + pad_x),
-        max(0, top + pad_y),
-        min(width, right - pad_x),
-        min(height, bottom - pad_y),
+        max(0, left),
+        max(0, top),
+        min(width, right),
+        min(height, bottom),
     )
 
 
@@ -14325,26 +14525,43 @@ def draw_v5_numeric_bypass(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
+    last_v5_text_bottom = 0
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
             draw_v5_numeric_bypass(draw, block)
             continue
         text = block.translated_text or block.text
         if block_has_rich_text_segments(block):
+            render_spans = block.translated_style_spans or [
+                {
+                    "translatedText": text,
+                    "matchedSourceRole": block.role or "benefit",
+                    "style": default_typography_style(block),
+                    "sourceWordIds": [],
+                    "forceBreakAfter": False,
+                }
+            ]
             box = v5_strict_render_box(block, canvas.size) if is_v5_block(block) else block.bbox
-            pad_x = 1 if is_v5_block(block) else max(2, int((box[2] - box[0]) * 0.02))
-            pad_y = 1 if is_v5_block(block) else max(1, int((box[3] - box[1]) * 0.02))
+            pad_x = 0 if is_v5_block(block) else max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = 0 if is_v5_block(block) else max(1, int((box[3] - box[1]) * 0.02))
             render_box = (box[0] + pad_x, box[1] + pad_y, box[2] - pad_x, box[3] - pad_y)
+            if is_v5_block(block):
+                render_box = (render_box[0], max(render_box[1], last_v5_text_bottom), render_box[2], render_box[3])
             base_typography = default_typography_style(block)
-            layout = fit_styled_spans_strict(
-                draw,
-                block.translated_style_spans,
-                render_box,
-                base_typography,
-                honor_force_breaks=not is_v5_block(block),
-                allow_vertical_overflow=is_v5_block(block),
-            )
-            render_styled_spans(draw, layout, render_box, alignment=block.align)
+            if is_v5_block(block):
+                layout = fit_v62_geometric_typesetting(draw, block, render_spans, render_box)
+            else:
+                layout = fit_styled_spans_strict(
+                    draw,
+                    render_spans,
+                    render_box,
+                    base_typography,
+                    honor_force_breaks=True,
+                    allow_vertical_overflow=False,
+                )
+            _, span_render_boxes = render_styled_spans(draw, layout, render_box, alignment=block.align)
+            if is_v5_block(block) and span_render_boxes:
+                last_v5_text_bottom = max(last_v5_text_bottom, max(int(item["bbox"][3]) for item in span_render_boxes))
             continue
         translated_lines = [line.strip() for line in text.splitlines() if line.strip()]
         source_line_boxes = list(block.line_boxes or [])
@@ -14438,7 +14655,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     {
                         **payload,
                         "pipeline": "v6-polygon-vision-layout",
-                        "pipeline_version": "v6.1-dynamic-vertical-flow",
+                        "pipeline_version": "v6.3-precise-inline-render",
                         "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
@@ -14461,11 +14678,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 extracted_blocks=blocks,
                 debug={
                     "pipeline": "v5",
-                    "pipeline_version": "v6.1-dynamic-vertical-flow",
+                    "pipeline_version": "v6.3-precise-inline-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v6.1-polygon-inline-flow-x-fence-y-free-align",
+                    "layoutEngine": "v6.3-precise-inline-render",
                     "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
@@ -14480,7 +14697,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
                     "pipeline": "v6-polygon-vision-layout",
-                    "pipeline_version": "v6.1-dynamic-vertical-flow",
+                    "pipeline_version": "v6.3-precise-inline-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
