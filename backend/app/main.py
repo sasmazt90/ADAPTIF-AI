@@ -8537,7 +8537,10 @@ def render_styled_spans(
     style: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     total_height = int(layout.get("totalHeight", 0))
-    y = box[1] + max(0, (box[3] - box[1] - total_height) // 2)
+    if layout.get("verticalOverflowAllowed"):
+        y = box[1]
+    else:
+        y = box[1] + max(0, (box[3] - box[1] - total_height) // 2)
     rendered_spans: list[dict[str, Any]] = []
     span_render_boxes: list[dict[str, Any]] = []
     shadow = style.get("shadow") if style else None
@@ -10130,6 +10133,22 @@ def is_v5_numeric_bypass_text(text: str) -> bool:
     return bool(re.fullmatch(r"[\d]+(?:[.)])?", cleaned))
 
 
+def infer_polygon_text_alignment(line_boxes: list[tuple[int, int, int, int]], fallback: str = "left") -> str:
+    boxes = [box for box in line_boxes if box[2] > box[0] and box[3] > box[1]]
+    if len(boxes) < 2:
+        return fallback if fallback in {"left", "center"} else "left"
+    union = union_bbox(boxes)
+    if union is None:
+        return fallback if fallback in {"left", "center"} else "left"
+    block_width = max(1, union[2] - union[0])
+    centers = [((box[0] + box[2]) / 2.0) for box in boxes]
+    center_spread = max(centers) - min(centers)
+    center_tolerance = max(6.0, block_width * 0.10)
+    if center_spread <= center_tolerance:
+        return "center"
+    return "left"
+
+
 def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[list[TextBlock], list[TextBlock], dict[str, Any]]:
     if not words:
         return [], [], {"provider": "google-cloud-vision", "wordCount": 0, "mode": "polygon"}
@@ -10267,6 +10286,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         line_boxes = [union_bbox([item.bbox for item in line]) or line[0].bbox for line in line_groups]
         bbox = union_bbox([item.bbox for item in group]) or group[0].bbox
         text = "\n".join(line_texts)
+        block_align = infer_polygon_text_alignment(line_boxes, infer_alignment(bbox, image.width))
         block = TextBlock(
             id=f"v5-block-{index}",
             text=text,
@@ -10282,7 +10302,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
             font_weight=max((item.font_weight for item in group), default=700),
             font_size_estimate=estimate_font_size_from_bbox(bbox),
             line_height_estimate=estimate_line_height_from_bbox(bbox),
-            align=infer_alignment(bbox, image.width),
+            align=block_align,
             surface="overlay",
         )
         source_word_styles = build_v5_polygon_source_word_styles(group, block, image)
@@ -14201,10 +14221,25 @@ def fit_styled_spans_strict(
     base_typography: dict[str, Any],
     *,
     honor_force_breaks: bool = True,
+    allow_vertical_overflow: bool = False,
 ) -> dict[str, Any]:
     max_width = max(8, box[2] - box[0])
     max_height = max(8, box[3] - box[1])
     line_height_ratio = max(1.12, min(1.42, float(base_typography.get("lineHeight", 18)) / max(1.0, float(base_typography.get("fontSize", 16)))))
+    if allow_vertical_overflow:
+        lines = build_styled_lines(draw, spans, max_width, 1.0, honor_force_breaks=honor_force_breaks)
+        widest, total_height, line_layouts = measure_styled_layout(draw, lines, 1.0, line_height_ratio)
+        return {
+            "scaleFactor": 1.0,
+            "lines": line_layouts,
+            "widest": widest,
+            "totalHeight": total_height,
+            "overflow": max(0, widest - max_width),
+            "verticalOverflowAllowed": True,
+            "preferredLineCount": None,
+            "lineCountDelta": 0,
+            "score": 1000 - max(0, widest - max_width) * 10,
+        }
     best: dict[str, Any] | None = None
     for scale_percent in range(100, 19, -5):
         scale_factor = scale_percent / 100.0
@@ -14307,6 +14342,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                 render_box,
                 base_typography,
                 honor_force_breaks=not is_v5_block(block),
+                allow_vertical_overflow=is_v5_block(block),
             )
             render_styled_spans(draw, layout, render_box, alignment=block.align)
             continue
@@ -14402,7 +14438,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     {
                         **payload,
                         "pipeline": "v6-polygon-vision-layout",
-                        "pipeline_version": "v6-pure-math-rendering",
+                        "pipeline_version": "v6.1-dynamic-vertical-flow",
                         "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
@@ -14425,11 +14461,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 extracted_blocks=blocks,
                 debug={
                     "pipeline": "v5",
-                    "pipeline_version": "v6-pure-math-rendering",
+                    "pipeline_version": "v6.1-dynamic-vertical-flow",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v6-google-vision-polygon-inline-flow-math-fence",
+                    "layoutEngine": "v6.1-polygon-inline-flow-x-fence-y-free-align",
                     "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
@@ -14444,7 +14480,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
                     "pipeline": "v6-polygon-vision-layout",
-                    "pipeline_version": "v6-pure-math-rendering",
+                    "pipeline_version": "v6.1-dynamic-vertical-flow",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
