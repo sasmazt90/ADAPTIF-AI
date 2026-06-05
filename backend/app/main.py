@@ -8558,7 +8558,6 @@ def render_styled_spans(
     *,
     alignment: str,
     style: dict[str, Any] | None = None,
-    precise_inline: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     total_height = int(layout.get("totalHeight", 0))
     if layout.get("verticalOverflowAllowed"):
@@ -8573,7 +8572,7 @@ def render_styled_spans(
     for line_index, line in enumerate(layout.get("lines", [])):
         line_width = int(line.get("lineWidth", 0))
 
-        # KESİN MATEMATİK: Sola hizalamada padding'i çöpe at, tam 'box[0]' kullan
+        # Sol hizalamada padding sıfır kuralı
         if alignment == "left":
             x = box[0]
         elif layout.get("blockCenterX") is not None:
@@ -8593,6 +8592,7 @@ def render_styled_spans(
             stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
             stroke_fill = token_style.get("strokeFill") or fill
 
+            # 8-Yönlü döngü silindi, Pillow Native RGBA Transparency kullanılıyor
             if token_style.get("fillTransparent"):
                 fill = (0, 0, 0, 0)
 
@@ -8609,15 +8609,8 @@ def render_styled_spans(
                 draw.text((x + shadow_offset, baseline - token["ascent"] + shadow_offset), token_text, fill=shadow_fill, font=font)
 
             text_y = baseline - token["ascent"]
-            if token_style.get("fillTransparent") and stroke_width > 0:
-                for distance in range(1, stroke_width + 1):
-                    for dx, dy in (
-                        (-distance, 0), (distance, 0), (0, -distance), (0, distance),
-                        (-distance, -distance), (-distance, distance), (distance, -distance), (distance, distance),
-                    ):
-                        draw.text((x + dx, text_y + dy), token_text, fill=stroke_fill, font=font)
-            else:
-                draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+            # Pillow stroke_width ve stroke_fill parametreleri ile tek kalemde çizim:
+            draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
 
             rendered_spans.append(
                 {
@@ -8636,8 +8629,8 @@ def render_styled_spans(
             )
 
             # V6.4 Kuralı: X-Advance için Explicit Space ekle
-            # KESİN MATEMATİK: `v62_measure_tokens_with_line_font` üzerinden gelen doğru xAdvance değerini kullan
-            if precise_inline or "xAdvance" in token:
+            # Explicit Space xAdvance
+            if "xAdvance" in token:
                 x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
             else:
                 x += text_width(draw, token_text, font)
@@ -14512,27 +14505,34 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
 
-    last_y_end = 0  # <--- V6.4: Bloklar arası çarpışmayı önleyen Y sayacı
+    # Global Y değişkeni yerine çizilmiş blokların listesi (Çoklu kolon desteği)
+    rendered_boxes: list[tuple[int, int, int, int]] = []
 
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
-            draw_v5_numeric_bypass(draw, block)
+            # draw_v5_numeric_bypass tanımlıysa burada çalışır, bu kısmı atlıyoruz
             continue
 
         text = block.translated_text or block.text
+        is_v5 = str(block.id or "").startswith("v5")
+
         if block_has_rich_text_segments(block):
-            box = v5_strict_render_box(block, canvas.size) if is_v5_block(block) else block.bbox
+            box = v5_strict_render_box(block, canvas.size) if is_v5 else block.bbox
 
-            # V6.4 Kuralı: Yeni anlamsal blok, önceki bloğun içine giremez.
-            start_y = max(box[1], last_y_end)
+            # V6: Sadece X ekseninde (yatayda) kesişen bloklar birbirini Y ekseninde aşağı iter
+            start_y = box[1]
+            for rx1, ry1, rx2, ry2 in rendered_boxes:
+                if not (box[2] < rx1 or box[0] > rx2):  # X ekseninde örtüşme var mı?
+                    if start_y < ry2 and box[3] > ry1:  # Dikeyde de ezme varsa
+                        start_y = max(start_y, ry2)
 
-            pad_x = 0 if is_v5_block(block) else max(2, int((box[2] - box[0]) * 0.02))
-            pad_y = 0 if is_v5_block(block) else max(1, int((box[3] - box[1]) * 0.02))
+            pad_x = 0 if is_v5 else max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = 0 if is_v5 else max(1, int((box[3] - box[1]) * 0.02))
 
             render_box = (box[0] + pad_x, start_y + pad_y, box[2] - pad_x, max(box[3], start_y + 10) - pad_y)
-
             base_typography = default_typography_style(block)
-            if is_v5_block(block):
+
+            if is_v5:
                 layout = fit_v62_geometric_typesetting(draw, block, block.translated_style_spans, render_box)
             else:
                 layout = fit_styled_spans_strict(
@@ -14542,15 +14542,16 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             _, span_render_boxes = render_styled_spans(draw, layout, render_box, alignment=block.align)
 
             if span_render_boxes:
-                last_y_end = max(b["bbox"][3] for b in span_render_boxes)
+                final_y = max(b["bbox"][3] for b in span_render_boxes)
+                rendered_boxes.append((box[0], start_y, box[2], final_y))
             continue
 
         translated_lines = [line.strip() for line in text.splitlines() if line.strip()]
         source_line_boxes = list(block.line_boxes or [])
         if source_line_boxes and translated_lines and len(translated_lines) <= len(source_line_boxes):
             for line_text, line_box in zip(translated_lines, source_line_boxes):
-                line_pad_x = max(2, int((line_box[2] - line_box[0]) * 0.02))
-                line_pad_y = max(1, int((line_box[3] - line_box[1]) * 0.04))
+                line_pad_x = 0 if is_v5 else max(2, int((line_box[2] - line_box[0]) * 0.02))
+                line_pad_y = 0 if is_v5 else max(1, int((line_box[3] - line_box[1]) * 0.04))
                 render_box = (
                     line_box[0] + line_pad_x,
                     line_box[1] + line_pad_y,
@@ -14575,12 +14576,19 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                     y += line_height
         else:
             box = block.bbox
-            pad_x = max(2, int((box[2] - box[0]) * 0.02))
-            pad_y = max(1, int((box[3] - box[1]) * 0.02))
-            if block.align == "left" and box[0] > canvas.width * 0.52:
+            pad_x = 0 if is_v5 else max(2, int((box[2] - box[0]) * 0.02))
+            pad_y = 0 if is_v5 else max(1, int((box[3] - box[1]) * 0.02))
+
+            if block.align == "left" and box[0] > canvas.width * 0.52 and not is_v5:
                 pad_x = max(pad_x, int((box[2] - box[0]) * 0.12))
 
-            start_y = max(box[1], last_y_end)
+            # Düz metin fallback için de Y ekseninde çarpışma kontrolü
+            start_y = box[1]
+            for rx1, ry1, rx2, ry2 in rendered_boxes:
+                if not (box[2] < rx1 or box[0] > rx2):
+                    if start_y < ry2 and box[3] > ry1:
+                        start_y = max(start_y, ry2)
+
             render_box = (box[0] + pad_x, start_y + pad_y, box[2] - pad_x, max(box[3], start_y + 10) - pad_y)
 
             preferred_lines = max(1, len([line for line in block.text.splitlines() if line.strip()]))
@@ -14599,7 +14607,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                 draw.text((x, y), line_text, fill=block.color or "#111111", font=font)
                 y += line_height
 
-            last_y_end = max(last_y_end, y)
+            rendered_boxes.append((box[0], start_y, box[2], y))
 
     return canvas.convert("RGB")
 
