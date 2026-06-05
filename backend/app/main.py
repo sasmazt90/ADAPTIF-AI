@@ -1751,9 +1751,49 @@ def choose_foreground_text_mask(crop_rgb: np.ndarray) -> np.ndarray:
             best_score = score
             best_mask = mask
     if best_mask.any():
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-        best_mask = cv2.morphologyEx(best_mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, kernel, iterations=1) > 0
+        best_mask = filter_character_like_contours(best_mask)
     return best_mask
+
+
+def filter_character_like_contours(mask: np.ndarray) -> np.ndarray:
+    import cv2
+
+    if mask.size == 0:
+        return mask.astype(bool)
+    binary = (mask.astype(np.uint8) > 0).astype(np.uint8) * 255
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    filtered = np.zeros_like(binary)
+    crop_h, crop_w = binary.shape[:2]
+    crop_area = max(1, crop_h * crop_w)
+    for contour in contours:
+        area = float(cv2.contourArea(contour))
+        if area < 1.0:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        if w <= 0 or h <= 0:
+            continue
+        rect_area = max(1, w * h)
+        aspect = w / max(1, h)
+        fill_ratio = area / rect_area
+        extent_ratio = rect_area / crop_area
+        hull = cv2.convexHull(contour)
+        hull_area = max(1.0, float(cv2.contourArea(hull)))
+        solidity = area / hull_area
+
+        long_thin_horizontal = aspect >= 5.5 and h <= max(3, crop_h * 0.22)
+        long_thin_vertical = aspect <= 0.16 and w <= max(3, crop_w * 0.08) and h >= crop_h * 0.55
+        large_frame_or_bar = extent_ratio >= 0.32 and (aspect >= 4.0 or aspect <= 0.22)
+        solid_geometric_bar = fill_ratio >= 0.72 and solidity >= 0.82 and (aspect >= 4.0 or aspect <= 0.25)
+        spans_most_width = w >= crop_w * 0.78 and h <= crop_h * 0.34
+
+        if long_thin_horizontal or long_thin_vertical or large_frame_or_bar or solid_geometric_bar or spans_most_width:
+            continue
+        if area / crop_area > 0.46:
+            continue
+        cv2.drawContours(filtered, [contour], -1, 255, thickness=-1)
+    return filtered > 0
 
 
 def sample_word_foreground_style(
@@ -1781,7 +1821,20 @@ def sample_word_foreground_style(
         if start is not None:
             clusters.append((start, len(row_has_ink)))
         if len(clusters) > 1:
-            best_start, best_end = max(clusters, key=lambda item: int(mask[item[0] : item[1], :].sum()))
+            fallback_rgb = np.array(parse_hex_color(fallback_color), dtype=np.float32)
+
+            def cluster_score(item: tuple[int, int]) -> float:
+                cluster_mask = mask[item[0] : item[1], :]
+                pixels = crop_rgb[item[0] : item[1], :, :][cluster_mask]
+                if len(pixels) == 0:
+                    return -9999.0
+                median_rgb = np.median(pixels.astype(np.float32), axis=0)
+                color_distance = float(np.linalg.norm(median_rgb - fallback_rgb))
+                area_score = min(240.0, float(cluster_mask.sum()))
+                upper_bias = max(0.0, 40.0 * (1.0 - item[0] / max(1, mask.shape[0])))
+                return area_score + upper_bias - color_distance * 1.6
+
+            best_start, best_end = max(clusters, key=cluster_score)
             clustered = np.zeros_like(mask, dtype=bool)
             clustered[best_start:best_end, :] = mask[best_start:best_end, :]
             mask = clustered
@@ -12961,10 +13014,10 @@ def strict_mask_dilation_px(image_size: tuple[int, int]) -> int:
     configured = os.getenv("ADAPTIFAI_STRICT_MASK_DILATION_PX", "").strip()
     if configured:
         try:
-            return max(0, min(2, int(configured)))
+            return max(0, min(3, int(configured)))
         except ValueError:
             pass
-    return 2
+    return 3
 
 
 def strict_mask_feather_px(image_size: tuple[int, int]) -> float:
@@ -13067,6 +13120,8 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
         word_confinement = np.array(confinement_mask_for_boxes(image.size, [word_box], pad_px=2).crop(crop_box).convert("L"))
         foreground = cv2.bitwise_and(foreground, word_confinement)
         full_np[y1:y2, x1:x2] = np.maximum(full_np[y1:y2, x1:x2], foreground[: y2 - y1, : x2 - x1])
+    if word_styles and full_np.max() > 0:
+        return Image.fromarray(full_np, "L")
     for box in list(block.line_boxes or []) or [block.bbox]:
         left, top, right, bottom = box
         if right <= left or bottom <= top:
@@ -13099,6 +13154,7 @@ def build_ocr_contour_text_mask(image: Image.Image, block: TextBlock, dilation_p
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         candidate = cv2.morphologyEx(candidate, cv2.MORPH_CLOSE, kernel, iterations=1)
         candidate = cv2.morphologyEx(candidate, cv2.MORPH_OPEN, kernel, iterations=1)
+        candidate = filter_character_like_contours(candidate).astype(np.uint8) * 255
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, connectivity=8)
         filtered = np.zeros_like(candidate)
         crop_area = max(1, candidate.shape[0] * candidate.shape[1])
@@ -13426,11 +13482,12 @@ def run_openai_localize_v2_cleanup(image: Image.Image, mask: Image.Image) -> Ima
 def composite_provider_cleanup_over_source(source: Image.Image, provider_image: Image.Image, mask: Image.Image) -> Image.Image:
     provider_resized = provider_image.convert("RGB").resize(source.size, Image.Resampling.LANCZOS)
     hard_mask = mask.convert("L").resize(source.size)
+    feather_px = strict_mask_feather_px(source.size)
+    soft_edge = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
+    alpha = ImageChops.lighter(hard_mask, soft_edge)
     if env_flag("ADAPTIFAI_LOCALIZE_V213_SEAMLESS_PROVIDER_BLEND", "1"):
         blended = seamless_clone_local_patch(source.convert("RGB"), provider_resized, hard_mask)
-        return Image.composite(blended.convert("RGB"), source.convert("RGB"), hard_mask.filter(ImageFilter.GaussianBlur(radius=strict_mask_feather_px(source.size))))
-    feather_px = strict_mask_feather_px(source.size)
-    alpha = hard_mask.filter(ImageFilter.GaussianBlur(radius=feather_px))
+        return Image.composite(blended.convert("RGB"), source.convert("RGB"), alpha)
     return Image.composite(provider_resized, source.convert("RGB"), alpha)
 
 
@@ -13506,6 +13563,12 @@ def fill_remaining_mask_components(result: Image.Image, source: Image.Image, mas
         patch_mask = mask.crop(sample_box).convert("L")
         output.paste(patch, sample_box[:2], patch_mask)
     return output
+
+
+def scrub_provider_residuals_inside_mask(result: Image.Image, source: Image.Image, mask: Image.Image) -> Image.Image:
+    if not env_flag("ADAPTIFAI_LOCALIZE_V2_PROVIDER_RESIDUAL_SCRUB", "1"):
+        return result.convert("RGB")
+    return fill_remaining_mask_components(result, source, mask.convert("L"))
 
 
 def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: list[TextBlock]) -> tuple[Image.Image, dict[str, Any]]:
@@ -13600,7 +13663,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         if blocks:
             meta["splitCleanup"] = {"provider": "replicate", "maskMode": "contour" if not split_small_overlay else "split"}
         cleaned = composite_provider_cleanup_over_source(image, replicate_result, mask)
-        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
+        scrubbed = scrub_provider_residuals_inside_mask(cleaned, image, mask)
+        return polish_masked_cleanup_with_opencv(scrubbed, mask), {**meta, "maskedPolish": "opencv-telea", "residualScrub": "inside-character-mask"}
     vertex_prompt = (
         "Remove only masked marketing text and reconstruct the original background faithfully. "
         "Do not add text. Preserve products, packaging, logos, arrows, labels, colors, gradients, and unmasked areas."
@@ -13616,7 +13680,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         if blocks:
             meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "vertex"}
         cleaned = composite_provider_cleanup_over_source(image, vertex_result["image"], mask)
-        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
+        scrubbed = scrub_provider_residuals_inside_mask(cleaned, image, mask)
+        return polish_masked_cleanup_with_opencv(scrubbed, mask), {**meta, "maskedPolish": "opencv-telea", "residualScrub": "inside-character-mask"}
     openai_result = run_openai_localize_v2_cleanup(image, mask)
     if openai_result is not None:
         meta = {"provider": "openai", "model": os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2")}
@@ -13625,7 +13690,8 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         if blocks:
             meta["splitCleanup"] = {"smallOverlayProvider": "local-fill", "largeOverlayProvider": "openai"}
         cleaned = composite_provider_cleanup_over_source(image, openai_result, mask)
-        return polish_masked_cleanup_with_opencv(cleaned, mask), {**meta, "maskedPolish": "opencv-telea"}
+        scrubbed = scrub_provider_residuals_inside_mask(cleaned, image, mask)
+        return polish_masked_cleanup_with_opencv(scrubbed, mask), {**meta, "maskedPolish": "opencv-telea", "residualScrub": "inside-character-mask"}
     import cv2
 
     source = cv2.cvtColor(np.array(image.convert("RGB")), cv2.COLOR_RGB2BGR)
