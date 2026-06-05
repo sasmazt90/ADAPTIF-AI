@@ -8558,6 +8558,7 @@ def render_styled_spans(
     *,
     alignment: str,
     style: dict[str, Any] | None = None,
+    precise_inline: bool = False,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     total_height = int(layout.get("totalHeight", 0))
     if layout.get("verticalOverflowAllowed"):
@@ -8630,7 +8631,7 @@ def render_styled_spans(
 
             # V6.4 Kuralı: X-Advance için Explicit Space ekle
             # Explicit Space xAdvance
-            if "xAdvance" in token:
+            if precise_inline or "xAdvance" in token:
                 x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
             else:
                 x += text_width(draw, token_text, font)
@@ -14510,7 +14511,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
 
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
-            # draw_v5_numeric_bypass tanımlıysa burada çalışır, bu kısmı atlıyoruz
+            draw_v5_numeric_bypass(draw, block)
             continue
 
         text = block.translated_text or block.text
