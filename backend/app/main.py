@@ -2024,7 +2024,11 @@ def sample_polygon_foreground_style(
     density = float(foreground.sum()) / max(1, int(polygon_region.sum()))
     core_density = float(core.sum()) / max(1, int(polygon_region.sum()))
     height = max(1, bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])
-    outline_like = density < 0.38 and core_density < max(0.09, density * 0.38) and height >= 18
+    outline_like = (
+        height >= 28
+        and density <= 0.18
+        and core_density <= max(0.025, density * 0.18)
+    )
     stroke_width = max(2, min(9, int(round(height * 0.09)))) if outline_like else 0
     is_bold = fallback_weight >= 700 or density >= 0.24 or outline_like
     return {
