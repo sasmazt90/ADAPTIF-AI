@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import base64
 import hashlib
@@ -154,7 +154,7 @@ SHARED_PREVIEW_TEMPLATE_PATH = REPO_ROOT / "src" / "shared" / "preview-templates
 
 
 def load_shared_preview_template_schema() -> dict[str, Any]:
-    # In Docker: __file__ = /app/app/main.py → parents[2] = / (wrong)
+    # In Docker: __file__ = /app/app/main.py â†’ parents[2] = / (wrong)
     # Fall back to parents[1] = /app which matches WORKDIR
     candidates = [
         SHARED_PREVIEW_TEMPLATE_PATH,
@@ -781,7 +781,7 @@ PACKAGING_CUE_TERMS = (
     "sensibio",
     "atoderm",
     "sebium",
-    "sébium",
+    "sÃ©bium",
     "serum",
     "bioder",
     "boder",
@@ -2065,8 +2065,11 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
 
 def source_word_style_lookup(block: TextBlock) -> dict[str, dict[str, Any]]:
     lookup: dict[str, dict[str, Any]] = {}
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
     for word in block.source_word_styles or []:
         if not isinstance(word, dict):
+            continue
+        if is_v5_isolated_step_marker_word(word, source_words):
             continue
         word_id = str(word.get("id") or "").strip()
         if word_id:
@@ -2172,6 +2175,48 @@ def source_styles_for_segment(raw: dict[str, Any], lookup: dict[str, dict[str, A
             if style:
                 source_styles.append(style)
     return source_styles
+
+
+def source_style_line_index(style: dict[str, Any]) -> int:
+    try:
+        return int(style.get("lineIndex") or 0)
+    except Exception:
+        return 0
+
+
+def is_visual_heading_brand_block(block: TextBlock) -> bool:
+    source_lines = [line.strip() for line in (block.line_texts or []) if str(line).strip()]
+    if len(source_lines) < 2:
+        return False
+    first_line = source_lines[0]
+    first_has_letters = any(char.isalpha() for char in first_line)
+    first_is_heading = first_has_letters and first_line.upper() == first_line
+    later_text = " ".join(source_lines[1:])
+    return first_is_heading and has_packaging_cues(later_text)
+
+
+def infer_v5_polygon_alignment(line_boxes: list[tuple[int, int, int, int]], bbox: tuple[int, int, int, int], image_width: int) -> str:
+    valid_boxes = [box for box in line_boxes if len(box) == 4 and box[2] > box[0] and box[3] > box[1]]
+    if len(valid_boxes) >= 2:
+        lefts = [box[0] for box in valid_boxes]
+        if max(lefts) - min(lefts) <= max(8, int(image_width * 0.015)):
+            return "left"
+    return infer_alignment(bbox, image_width)
+
+
+def preserve_visual_heading_span_order(block: TextBlock, spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not is_visual_heading_brand_block(block) or len(spans) < 2:
+        return spans
+
+    def span_line_index(span: dict[str, Any]) -> int:
+        styles = [style for style in (span.get("sourceWordStyles") or []) if isinstance(style, dict)]
+        if not styles:
+            return 0
+        return min(source_style_line_index(style) for style in styles)
+
+    ordered = sorted(enumerate(spans), key=lambda item: (span_line_index(item[1]), item[0]))
+    result = [{**span, "forceBreakAfter": index < len(ordered) - 1} for index, (_original_index, span) in enumerate(ordered)]
+    return result
 
 
 def style_from_source_word_style(source_style: dict[str, Any], base_style: dict[str, Any]) -> dict[str, Any]:
@@ -2758,20 +2803,7 @@ def detect_source_language(blocks: list[TextBlock]) -> str:
         return "EN"
 
 def repair_mojibake(text: str) -> str:
-    if not any(marker in text for marker in ("Ã", "Ä", "Å", "Â")):
-        return text
-    try:
-        repaired = text.encode("latin1").decode("utf-8")
-    except (UnicodeEncodeError, UnicodeDecodeError):
-        try:
-            repaired = text.encode("cp1252").decode("utf-8")
-        except (UnicodeEncodeError, UnicodeDecodeError):
-            return text
-    return repaired if repaired else text
-
-
-def repair_mojibake(text: str) -> str:
-    if not any(marker in text for marker in ("Ã", "Ä", "Å", "Â", "â€", "â€“", "â€™")):
+    if not any(marker in text for marker in ("Ãƒ", "Ã„", "Ã…", "Ã‚", "Ã¢â‚¬", "Ã¢â‚¬â€œ", "Ã¢â‚¬â„¢")):
         return text
     candidates = [text]
     for encoding in ("latin1", "cp1252"):
@@ -2781,8 +2813,8 @@ def repair_mojibake(text: str) -> str:
             pass
 
     def score(candidate: str) -> int:
-        penalty = sum(candidate.count(marker) for marker in ("Ã", "Ä", "Å", "Â", "�")) * 8
-        reward = sum(candidate.count(char) for char in "çğıöşüÇĞİÖŞÜ") * 2
+        penalty = sum(candidate.count(marker) for marker in ("Ãƒ", "Ã„", "Ã…", "Ã‚", "ï¿½")) * 8
+        reward = sum(candidate.count(char) for char in "Ã§ÄŸÄ±Ã¶ÅŸÃ¼Ã‡ÄžÄ°Ã–ÅžÃœ") * 2
         return reward - penalty
 
     return max(candidates, key=score)
@@ -3034,12 +3066,12 @@ LANGUAGE_NAMES = {
 }
 
 SHORT_LABEL_TRANSLATIONS: dict[str, dict[str, str]] = {
-    "alt": {"TR": "ESKİ", "FR": "ANCIEN", "DE": "ALT", "ES": "ANTERIOR", "IT": "PRIMA", "PT": "ANTIGO"},
-    "old": {"TR": "ESKİ", "FR": "ANCIEN", "DE": "ALT", "ES": "ANTERIOR", "IT": "PRIMA", "PT": "ANTIGO"},
-    "neu": {"TR": "YENİ", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
-    "new": {"TR": "YENİ", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
+    "alt": {"TR": "ESKÄ°", "FR": "ANCIEN", "DE": "ALT", "ES": "ANTERIOR", "IT": "PRIMA", "PT": "ANTIGO"},
+    "old": {"TR": "ESKÄ°", "FR": "ANCIEN", "DE": "ALT", "ES": "ANTERIOR", "IT": "PRIMA", "PT": "ANTIGO"},
+    "neu": {"TR": "YENÄ°", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
+    "new": {"TR": "YENÄ°", "FR": "NOUVEAU", "DE": "NEU", "ES": "NUEVO", "IT": "NUOVO", "PT": "NOVO"},
     "shop now": {"TR": "HEMEN AL", "FR": "ACHETER MAINTENANT", "DE": "JETZT KAUFEN", "ES": "COMPRA AHORA", "IT": "ACQUISTA ORA", "PT": "COMPRE AGORA"},
-    "defensive": {"TR": "SAVUNMA\nTEKNOLOJİSİ", "EN": "DEFENSIVE\nTECHNOLOGY", "DE": "SCHUTZ-\nTECHNOLOGIE", "FR": "TECHNOLOGIE\nDÉFENSIVE", "ES": "TECNOLOGÍA\nDEFENSIVA", "IT": "TECNOLOGIA\nDIFENSIVA", "PT": "TECNOLOGIA\nDEFENSIVA"},
+    "defensive": {"TR": "SAVUNMA\nTEKNOLOJÄ°SÄ°", "EN": "DEFENSIVE\nTECHNOLOGY", "DE": "SCHUTZ-\nTECHNOLOGIE", "FR": "TECHNOLOGIE\nDÃ‰FENSIVE", "ES": "TECNOLOGÃA\nDEFENSIVA", "IT": "TECNOLOGIA\nDIFENSIVA", "PT": "TECNOLOGIA\nDEFENSIVA"},
 }
 
 
@@ -3363,8 +3395,8 @@ def infer_translated_style_spans(source_text: str, translated_text: str, source_
 
 
 LANGUAGE_FILLER_WORDS: dict[str, set[str]] = {
-    "TR": {"ile", "ve", "bir", "için", "olarak", "daha", "çok", "olan", "oranında"},
-    "DE": {"und", "mit", "für", "die", "der", "das"},
+    "TR": {"ile", "ve", "bir", "iÃ§in", "olarak", "daha", "Ã§ok", "olan", "oranÄ±nda"},
+    "DE": {"und", "mit", "fÃ¼r", "die", "der", "das"},
     "FR": {"et", "avec", "pour", "les", "des", "une", "un"},
     "ES": {"y", "con", "para", "los", "las", "una", "un"},
     "IT": {"e", "con", "per", "gli", "le", "una", "un"},
@@ -3390,7 +3422,7 @@ def shorten_marketing_copy(text: str, target_language: str, role: str, aggressiv
             normalized = normalize_ocr_text(word)
             if aggressiveness >= 1 and normalized in filler and 0 < index < len(words) - 1:
                 continue
-            if aggressiveness >= 2 and role == "headline" and len(words) > 4 and normalized in {"çok", "daha", "çoklu", "long", "lang", "mit", "ile"}:
+            if aggressiveness >= 2 and role == "headline" and len(words) > 4 and normalized in {"Ã§ok", "daha", "Ã§oklu", "long", "lang", "mit", "ile"}:
                 continue
             kept.append(word)
         candidate = " ".join(kept).strip()
@@ -3403,7 +3435,7 @@ def shorten_marketing_copy(text: str, target_language: str, role: str, aggressiv
 
 def rebalance_copy_lines(text: str, target_language: str) -> str:
     connector_words = {
-        "TR": {"VE", "İLE", "DA", "DE"},
+        "TR": {"VE", "Ä°LE", "DA", "DE"},
         "DE": {"UND", "MIT"},
         "FR": {"ET", "AVEC"},
         "ES": {"Y", "CON"},
@@ -4487,7 +4519,7 @@ def extract_source_word_targets(block: TextBlock) -> list[dict[str, str]]:
     source_text = " ".join(block.line_texts or [block.text])
     candidates: list[dict[str, str]] = []
     seen: set[str] = set()
-    for token in re.findall(r"[A-Za-zÀ-ÿ0-9%]+", source_text):
+    for token in re.findall(r"[A-Za-zÃ€-Ã¿0-9%]+", source_text):
         normalized = normalize_match_text(token)
         if not normalized or normalized.isdigit() or len(normalized) < 4:
             continue
@@ -4644,7 +4676,7 @@ def build_residual_word_focus_boxes(
         normalized_line = normalize_match_text(line_text)
         if not normalized_line:
             continue
-        words = [match for match in re.finditer(r"[A-Za-zÀ-ÿ0-9%]+", line_text)]
+        words = [match for match in re.finditer(r"[A-Za-zÃ€-Ã¿0-9%]+", line_text)]
         if not words:
             continue
         line_left, line_top, line_right, line_bottom = line_box
@@ -5034,7 +5066,7 @@ def resolve_cleanup_provider(block: TextBlock, image_size: tuple[int, int]) -> s
     area_ratio = (block_width * block_height) / max(1, image_size[0] * image_size[1])
 
     if is_large_marketing_headline_block(block, image_size):
-        # HIGH risk — prefer mask-capable specialist or SDXL
+        # HIGH risk â€” prefer mask-capable specialist or SDXL
         routes = route_cleanup_providers(RiskLevel.HIGH, block, image_size)
         for route in routes:
             if route.provider == "huggingface" and get_huggingface_cleanup_token():
@@ -5053,7 +5085,7 @@ def resolve_cleanup_provider(block: TextBlock, image_size: tuple[int, int]) -> s
                 return "openai"
         return "openai"
 
-    # LOW risk — OpenAI primary, HF fallback
+    # LOW risk â€” OpenAI primary, HF fallback
     if os.getenv("OPENAI_API_KEY"):
         return "openai"
     return "huggingface"
@@ -6073,7 +6105,7 @@ def _sanitize_inpaint_result(
     1. Color divergence: inpainted mean color vs surrounding border median.
     2. Edge-density ratio: if the inpainted region has significantly more
        edges/structure than the surrounding source area, the model hallucinated
-       new imagery (icons, objects, text) — suppressed even when colours match.
+       new imagery (icons, objects, text) â€” suppressed even when colours match.
 
     When either signal triggers, the inpainted region is blended back toward
     the local median background color.
@@ -6103,7 +6135,7 @@ def _sanitize_inpaint_result(
         inpainted_mean = np.mean(inpainted_colors, axis=0)
         color_divergence = float(np.linalg.norm(inpainted_mean - border_median))
 
-        # ── Edge-density hallucination detection ─────────────────────────────
+        # â”€â”€ Edge-density hallucination detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Compute per-channel gradient magnitude (Sobel-like) for both the
         # composited inpainted region and the source border ring.
         def _edge_density(arr_f32: np.ndarray, region_bool: np.ndarray) -> float:
@@ -6116,8 +6148,8 @@ def _sanitize_inpaint_result(
 
         inpaint_edge = _edge_density(comp_arr, mask_bool)
         border_edge = _edge_density(src_arr, border_only)
-        # Ratio > 2.5 means the inpainted area has 2.5× more structure than
-        # the surrounding area — a strong hallucination signal.
+        # Ratio > 2.5 means the inpainted area has 2.5Ã— more structure than
+        # the surrounding area â€” a strong hallucination signal.
         edge_ratio = inpaint_edge / max(border_edge, 1.0)
         structural_hallucination = edge_ratio > 2.5 and inpaint_edge > 8.0
 
@@ -7324,7 +7356,7 @@ def attempt_block_level_generative_cleanup(
 
     prompt = (
         "Remove only the visible text inside the transparent mask area. "
-        "Fill it with the exact same background colour and texture that borders the mask — do NOT generate new images, products, labels, or patterns. "
+        "Fill it with the exact same background colour and texture that borders the mask â€” do NOT generate new images, products, labels, or patterns. "
         "Preserve everything outside the mask exactly as-is. "
         "Do not add text. Do not blur. Return only the clean continuation of the existing background."
     )
@@ -7504,7 +7536,7 @@ def apply_large_block_primary_cleanup(
         "Do NOT generate new imagery, products, labels, patterns, or objects. "
         "Do NOT change anything outside the masked area. "
         "Do not blur, smear, or leave ghosting. "
-        "The result must look like the text was never there — only the background visible."
+        "The result must look like the text was never there â€” only the background visible."
     )
     dilation_attempts = sorted({max(8, base_dilation_px - 3), base_dilation_px, min(24, base_dilation_px + 3)})
     attempt_summaries: list[dict[str, Any]] = []
@@ -9222,7 +9254,7 @@ def decide_block_render_strategy(
     panel_color = sample_panel_color(image, block.bbox)
     safe_areas = find_safe_area_candidates(image, block, foreground_bbox)
 
-    # Always use clean_replace — overlay/panel fallbacks produce visible boxes
+    # Always use clean_replace â€” overlay/panel fallbacks produce visible boxes
     # that look wrong to the user. Render the translated text directly at the
     # original position regardless of cleanup confidence.
     strategy = "clean_replace"
@@ -10386,7 +10418,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         line_boxes = [union_bbox([item.bbox for item in line]) or line[0].bbox for line in line_groups]
         bbox = union_bbox([item.bbox for item in group]) or group[0].bbox
         text = "\n".join(line_texts)
-        block_align = infer_alignment(bbox, image.width)
+        block_align = infer_v5_polygon_alignment(line_boxes, bbox, image.width)
         block = TextBlock(
             id=f"v5-block-{index}",
             text=text,
@@ -10862,7 +10894,7 @@ def _suppress_cta_button(
     return result
 
 
-# Meta and TikTok placement prefixes — these platforms render their own CTA buttons
+# Meta and TikTok placement prefixes â€” these platforms render their own CTA buttons
 _NATIVE_CTA_PLATFORMS = {"meta_", "facebook_", "instagram_", "tiktok_"}
 
 
@@ -10894,7 +10926,7 @@ def smart_resize_image(
         src_w, src_h = source.width, source.height
         tgt_w, tgt_h = width, height
 
-        # ── Step 1: OCR ───────────────────────────────────────────────────
+        # â”€â”€ Step 1: OCR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Use raw EasyOCR (not the full build_localize_blocks pipeline) to get
         # lightweight text-region bboxes for inpainting.  The full pipeline
         # can fail silently or be slow; raw OCR is fast and reliable on CPU.
@@ -10939,7 +10971,7 @@ def smart_resize_image(
 
         has_translatable = any(b.translate for b in text_blocks)
 
-        # ── Step 2: CTA suppression for native-CTA platforms ─────────────
+        # â”€â”€ Step 2: CTA suppression for native-CTA platforms â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         working_source = source
         if _placement_has_native_cta(placement_id) and text_blocks:
             cta_bbox = _detect_cta_button_bbox(source, text_blocks)
@@ -10949,11 +10981,11 @@ def smart_resize_image(
                 text_blocks = [b for b in text_blocks if b.role != "cta" and classify_text_role(b.text) != "cta"]
                 has_translatable = any(b.translate for b in text_blocks)
 
-        # ── Step 3: Detect foreground / subject region ───────────────────
+        # â”€â”€ Step 3: Detect foreground / subject region â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Use the visual-subject-only bbox (colour distance from border).
         # build_resize_focus_bbox includes the union of text + subject, which
         # causes the entire image to be treated as "foreground" in landscape ads
-        # with text on the right — and that text ends up visible in the result.
+        # with text on the right â€” and that text ends up visible in the result.
         subject_bbox = detect_foreground_bbox(working_source)
         if subject_bbox is None:
             subject_bbox = (0, 0, working_source.width, working_source.height)
@@ -10973,7 +11005,7 @@ def smart_resize_image(
         fg_w = fx1 - fx0
         fg_h = fy1 - fy0
 
-        # ── Step 4: Build clean background (text removed) ────────────────
+        # â”€â”€ Step 4: Build clean background (text removed) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if has_translatable:
             try:
                 cleaned, cleanup_debug = build_clean_background(working_source, text_blocks, cleanup_strength=100, return_debug=True)  # type: ignore[misc]
@@ -10984,7 +11016,7 @@ def smart_resize_image(
         else:
             bg_base = working_source
 
-        # ── Step 4a: Fast OpenCV inpaint — remove text from background ───────
+        # â”€â”€ Step 4a: Fast OpenCV inpaint â€” remove text from background â”€â”€â”€â”€â”€â”€â”€
         # Run regardless of whether the full cleanup pipeline succeeded, using
         # whichever text source is available (full blocks or raw bboxes).
         # This ensures background text is gone before the cover-scale step.
@@ -11009,7 +11041,7 @@ def smart_resize_image(
             except Exception as _e:
                 print(f"[smart_resize_image] inpaint step failed: {_e}", flush=True)
 
-        # ── Step 4b: Scale background to COVER the target canvas ─────────
+        # â”€â”€ Step 4b: Scale background to COVER the target canvas â”€â”€â”€â”€â”€â”€â”€â”€â”€
         bg_color = _sample_edge_color(bg_base)
         canvas = Image.new("RGB", (tgt_w, tgt_h), bg_color)
 
@@ -11027,13 +11059,13 @@ def smart_resize_image(
         bg_crop_y = max(0, min(bg_resized_h - tgt_h, bg_cy - tgt_h // 2))
         canvas.paste(bg_resized.crop((bg_crop_x, bg_crop_y, bg_crop_x + tgt_w, bg_crop_y + tgt_h)), (0, 0))
 
-        # ── Step 5: Scale and reposition foreground subject ───────────────
+        # â”€â”€ Step 5: Scale and reposition foreground subject â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         #
         # Goal: the foreground keeps roughly the same visual size proportion
         # relative to the new canvas, and its relative anchor (left/center/right,
         # top/center/bottom) is preserved.
         #
-        # For extreme ratio changes (e.g. 4:1 → 9:16) the foreground is
+        # For extreme ratio changes (e.g. 4:1 â†’ 9:16) the foreground is
         # allowed to grow significantly to fill the taller canvas naturally.
         #
         tgt_fg_max_w = int(tgt_w * 0.88)
@@ -11045,7 +11077,7 @@ def smart_resize_image(
         cover_scale = max(tgt_w / src_w, tgt_h / src_h)
         # Use whichever is larger so the subject fills the canvas better
         fg_scale = max(fg_scale_fit, cover_scale * 0.9)
-        # Hard cap: don't upscale beyond 2.2× (avoids extreme pixellation)
+        # Hard cap: don't upscale beyond 2.2Ã— (avoids extreme pixellation)
         fg_scale = min(fg_scale, 2.2)
 
         # Crop from bg_base (text removed) rather than working_source so that
@@ -11061,7 +11093,7 @@ def smart_resize_image(
         target_cx = int(rel_cx * tgt_w)
         target_cy = int(rel_cy * tgt_h)
 
-        # For wide→tall: bias subject slightly downward so it feels grounded
+        # For wideâ†’tall: bias subject slightly downward so it feels grounded
         src_ratio = src_w / max(1, src_h)
         tgt_ratio = tgt_w / max(1, tgt_h)
         if src_ratio > tgt_ratio * 1.4:
@@ -11071,7 +11103,7 @@ def smart_resize_image(
         paste_y = max(0, min(tgt_h - new_fg_h, target_cy - new_fg_h // 2))
         canvas.paste(fg_resized, (paste_x, paste_y))
 
-        # ── Step 6: Re-render text at proportionally scaled positions ─────
+        # â”€â”€ Step 6: Re-render text at proportionally scaled positions â”€â”€â”€â”€â”€
         if has_translatable and text_blocks:
             try:
                 x_scale = tgt_w / src_w
@@ -12588,7 +12620,7 @@ def placement_preview_metadata(placement_id: str, source_name: str, translated_t
         "description": description,
         "ctaText": cta_map.get(placement_id, "Learn More"),
         "caption": description,
-        "price": "€39.90",
+        "price": "â‚¬39.90",
         "creativeMode": creative_mode,
         "carouselActivationSource": "user_selected" if creative_mode == "carousel" else "forced_single",
         "unusedAssets": [],
@@ -12713,8 +12745,8 @@ def render_native_placement_preview(
                 right_center = (box[2] - arrow_radius - 12, box[1] + target_h // 2)
                 draw.ellipse((left_center[0] - arrow_radius, left_center[1] - arrow_radius, left_center[0] + arrow_radius, left_center[1] + arrow_radius), fill="#10111499")
                 draw.ellipse((right_center[0] - arrow_radius, right_center[1] - arrow_radius, right_center[0] + arrow_radius, right_center[1] + arrow_radius), fill="#10111499")
-                draw.text((left_center[0], left_center[1] - 2), "‹", fill="white", font=get_font(max(16, arrow_radius), bold=True), anchor="mm")
-                draw.text((right_center[0], right_center[1] - 2), "›", fill="white", font=get_font(max(16, arrow_radius), bold=True), anchor="mm")
+                draw.text((left_center[0], left_center[1] - 2), "â€¹", fill="white", font=get_font(max(16, arrow_radius), bold=True), anchor="mm")
+                draw.text((right_center[0], right_center[1] - 2), "â€º", fill="white", font=get_font(max(16, arrow_radius), bold=True), anchor="mm")
                 ui_elements_rendered.extend(["carousel_arrows", "carousel_peek"])
             draw_carousel_indicators(box, len(resolved_carousel_assets), carousel_active_index)
         else:
@@ -13225,7 +13257,7 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "styleTransferMode": "deterministic_nm_source_word_foreground_style_cross_line",
             }
         )
-    return normalized
+    return preserve_visual_heading_span_order(block, normalized)
 
 
 def is_decorative_or_numeric_only(text: str) -> bool:
@@ -13406,8 +13438,6 @@ def missing_expressive_punctuation(payload: dict[str, Any], candidates: list[Tex
 
 
 def natural_language_violations(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> list[dict[str, Any]]:
-    if target_language.upper() != "TR":
-        return []
     items = payload.get("blocks", [])
     if not isinstance(items, list):
         return []
@@ -13418,12 +13448,11 @@ def natural_language_violations(payload: dict[str, Any], candidates: list[TextBl
     }
     violations: list[dict[str, Any]] = []
     for block in candidates:
-        source = f" {normalize_ocr_text(block.text)} "
-        if not re.search(r"\ba\b", source):
-            continue
         item = mapped.get(block.id or "")
         translated = plain_text_from_translation_item(item or {}) if item else ""
-        if re.search(r"\b[Bb]ir\s+\S+", translated):
+        translated_norm = normalize_ocr_text(translated)
+        source = f" {normalize_ocr_text(block.text)} "
+        if target_language.upper() == "TR" and re.search(r"\ba\b", source) and re.search(r"\b[Bb]ir\s+\S+", translated):
             violations.append(
                 {
                     "id": block.id,
@@ -13432,6 +13461,23 @@ def natural_language_violations(payload: dict[str, Any], candidates: list[TextBl
                     "reason": "literal_turkish_indefinite_article",
                 }
             )
+        for word in block.source_word_styles or []:
+            if not isinstance(word, dict):
+                continue
+            source_token = str(word.get("text") or "").strip()
+            source_norm = normalize_ocr_text(source_token)
+            if not source_norm or not has_packaging_cues(source_token):
+                continue
+            if source_norm not in translated_norm:
+                violations.append(
+                    {
+                        "id": block.id,
+                        "sourceText": block.text,
+                        "translatedText": translated,
+                        "missingToken": source_token,
+                        "reason": "missing_brand_or_product_token",
+                    }
+                )
     return violations
 
 
@@ -13508,13 +13554,13 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "Set translate=false only if the input is not marketing/instructional overlay copy.",
             "Never return x, y, w, h, bbox, or any coordinate.",
             "HARD RULE: Translate each input block as one semantic unit, never as independent source lines or word-by-word fragments.",
-            "HARD RULE: First decide how the marketing or instruction message is naturally said in the target language. Do not literal-translate source-language articles, filler words, or word order when the target language would omit or move them. Example for Turkish: 'Soak a cotton pad with Sébium H2O' must become 'Pamuk pedi Sébium H2O ile ıslatın', not 'Bir pamuk pedi Sébium H2O ile ıslatın'.",
-            "HARD RULE: Brand/product tokens such as Sébium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
+            "HARD RULE: First decide how the marketing or instruction message is naturally said in the target language. Do not literal-translate source-language articles, filler words, or word order when the target language would omit or move them. Example for Turkish: 'Soak a cotton pad with SÃ©bium H2O' must become 'Pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n', not 'Bir pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n'.",
+            "HARD RULE: Brand/product tokens such as SÃ©bium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
             "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
             "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
-            "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with Sébium H2O', Turkish target 'Pamuk pedi' inherits the grey/black source words 'a cotton pad', target 'Sébium H2O ile' inherits the product/with source words, and target 'ıslatın' inherits only 'Soak'.",
+            "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with SÃ©bium H2O', Turkish target 'Pamuk pedi' inherits the grey/black source words 'a cotton pad', target 'SÃ©bium H2O ile' inherits the product/with source words, and target 'Ä±slatÄ±n' inherits only 'Soak'.",
             "HARD RULE: For 1-to-N mapping, repeat the same source word id across all target segments that inherit that source word style.",
             "HARD RULE: For N-to-1 mapping, put all contributing source word ids in source_word_ids; the backend will apply dominant style.",
             "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_ids.",
@@ -14501,7 +14547,7 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
 
         token_text = token["text"]
 
-        # KESİN MATEMATİK: Kelime ve boşluk genişliğini ayrı ayrı topla
+        # KESÄ°N MATEMATÄ°K: Kelime ve boÅŸluk geniÅŸliÄŸini ayrÄ± ayrÄ± topla
         try:
             width = draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)
         except AttributeError:
@@ -14519,7 +14565,7 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
             "style": style,
             "role": token.get("role", "benefit"),
             "text": token["text"],
-            "xAdvance": width,  # İlerleme ölçüsünü açıkça render döngüsüne aktar
+            "xAdvance": width,  # Ä°lerleme Ã¶lÃ§Ã¼sÃ¼nÃ¼ aÃ§Ä±kÃ§a render dÃ¶ngÃ¼sÃ¼ne aktar
         })
 
     if metrics:
@@ -14597,7 +14643,7 @@ def fit_v62_geometric_typesetting(
             line_font_size = max(1, int(line_font_size * (max_width / max(1, line_width))))
             line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
 
-        # V6.4 Kuralı: Satır Arası Ezilmeyi Çöz (Typographic Leading/Line-Height)
+        # V6.4 KuralÄ±: SatÄ±r ArasÄ± Ezilmeyi Ã‡Ã¶z (Typographic Leading/Line-Height)
         line_height_measured = max_ascent + max_descent
         line_height = int(round(line_height_measured + (line_font_size * 0.25)))
 
@@ -14694,20 +14740,6 @@ def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tupl
         min(width, right),
         min(height, bottom),
     )
-
-
-def draw_v5_numeric_bypass(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
-    style = (block.source_word_styles or [{}])[0] if block.source_word_styles else {}
-    box = tuple(int(value) for value in (style.get("bbox") or block.bbox))
-    color = str(style.get("color") or block.color or "#111111")
-    font_size = max(8, int(style.get("fontSize") or block.font_size_estimate or max(8, box[3] - box[1])))
-    font_weight = int(style.get("fontWeight") or block.font_weight or 700)
-    font = get_font(font_size, bold=font_weight >= 700, category=str(style.get("fontCategory") or "sans-serif"))
-    text = block.text.strip()
-    text_box = draw.textbbox((0, 0), text, font=font)
-    x = box[0] - text_box[0]
-    y = box[1] - text_box[1]
-    draw.text((x, y), text, fill=color, font=font)
 
 
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
@@ -14856,7 +14888,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     {
                         **payload,
                         "pipeline": "v6-polygon-vision-layout",
-                        "pipeline_version": "v6.3-precise-inline-render",
+                        "pipeline_version": "v6.4-code-audit-render",
                         "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
@@ -14879,11 +14911,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 extracted_blocks=blocks,
                 debug={
                     "pipeline": "v5",
-                    "pipeline_version": "v6.3-precise-inline-render",
+                    "pipeline_version": "v6.4-code-audit-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v6.3-precise-inline-render",
+                    "layoutEngine": "v6.4-code-audit-render",
                     "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
@@ -14898,7 +14930,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
                     "pipeline": "v6-polygon-vision-layout",
-                    "pipeline_version": "v6.3-precise-inline-render",
+                    "pipeline_version": "v6.4-code-audit-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
@@ -15043,7 +15075,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                         }
                     )
 
-            # ─── Localization Protocol V2.2 ───
+            # â”€â”€â”€ Localization Protocol V2.2 â”€â”€â”€
             if _PROTOCOL_AVAILABLE:
                 try:
                     protocol_foreground_bbox = detect_foreground_bbox(source_image)
@@ -15099,7 +15131,7 @@ def build_localize_assets(paths: list[Path], languages: list[str], output_format
                                 pass
                 except Exception:
                     pass
-            # ─── End Protocol V2.2 ───
+            # â”€â”€â”€ End Protocol V2.2 â”€â”€â”€
 
             render_plan_entries = [
                 decide_block_render_strategy(source_image, block, cleanup_debug, foreground_bbox)
@@ -15760,7 +15792,7 @@ def _apply_style_overrides(blocks: list[TextBlock], edit: EditRequest) -> list[T
             overridden.append(block)
             continue
         updates: dict[str, Any] = {}
-        # Color override — only apply when a non-default colour was chosen
+        # Color override â€” only apply when a non-default colour was chosen
         if edit.text_color and edit.text_color != "#111111":
             updates["color"] = edit.text_color
         # Font size scale (100 = no change)
@@ -15813,9 +15845,9 @@ def _apply_italic_shear(
 ) -> Image.Image:
     """
     Simulate italic by applying a forward-lean affine shear to each translate block region.
-    Shear ~14° (tan ≈ 0.25): top of each block region leans to the right.
+    Shear ~14Â° (tan â‰ˆ 0.25): top of each block region leans to the right.
     PIL AFFINE coefficients (a,b,c,d,e,f): src_x = a*dst_x + b*dst_y + c
-    For forward-lean: src_x = dst_x + shear*dst_y  →  (a=1, b=shear, c=0, d=0, e=1, f=0)
+    For forward-lean: src_x = dst_x + shear*dst_y  â†’  (a=1, b=shear, c=0, d=0, e=1, f=0)
     """
     shear = 0.25
     result = image.copy()
