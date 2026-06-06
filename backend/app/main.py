@@ -8298,6 +8298,51 @@ def text_width(draw: ImageDraw.ImageDraw, text: str, font) -> float:
     return right - left
 
 
+V62_CALIBRATED_POINT_SIZE_CACHE: dict[tuple[str, int, bool, str, int], int] = {}
+
+
+def v62_line_sample_text(tokens: list[dict[str, Any]]) -> str:
+    sample = " ".join(str(token.get("text") or "").strip() for token in tokens if str(token.get("text") or "").strip())
+    return sample or "Hg0123456789"
+
+
+def v62_calibrated_point_size(
+    draw: ImageDraw.ImageDraw,
+    tokens: list[dict[str, Any]],
+    target_pixel_height: int,
+    *,
+    font_weight: int,
+    font_category: str,
+    bold: bool,
+) -> int:
+    target = max(1, int(target_pixel_height))
+    sample = v62_line_sample_text(tokens)
+    cache_key = (sample[:80], target, bool(bold), normalize_font_category(font_category), int(font_weight))
+    if cache_key in V62_CALIBRATED_POINT_SIZE_CACHE:
+        return V62_CALIBRATED_POINT_SIZE_CACHE[cache_key]
+
+    best_size = target
+    best_delta = 10**9
+    upper = max(12, min(240, int(target * 3.0) + 12))
+    for size in range(1, upper + 1):
+        font = get_font(size=size, bold=bold, category=font_category, weight=font_weight)
+        try:
+            left, top, right, bottom = draw.textbbox((0, 0), sample, font=font)
+            pixel_height = max(1, int(bottom - top))
+        except Exception:
+            pixel_height = size
+        delta = abs(pixel_height - target)
+        if delta < best_delta or (delta == best_delta and pixel_height >= target and size < best_size):
+            best_delta = delta
+            best_size = size
+        if pixel_height >= target and delta <= 1:
+            best_size = size
+            break
+
+    V62_CALIBRATED_POINT_SIZE_CACHE[cache_key] = max(1, int(best_size))
+    return max(1, int(best_size))
+
+
 def build_wrapped_lines(
     draw: ImageDraw.ImageDraw,
     text: str,
@@ -13621,6 +13666,19 @@ def natural_language_violations(payload: dict[str, Any], candidates: list[TextBl
                     "reason": "literal_turkish_indefinite_article",
                 }
             )
+        if (
+            target_language.upper() == "TR"
+            and "skin" in source
+            and re.search(r"\b(ciltleri|cildi|cilti)\b", translated, flags=re.IGNORECASE)
+        ):
+            violations.append(
+                {
+                    "id": block.id,
+                    "sourceText": block.text,
+                    "translatedText": translated,
+                    "reason": "literal_turkish_skin_possessive_label",
+                }
+            )
         for word in block.source_word_styles or []:
             if not isinstance(word, dict):
                 continue
@@ -13639,6 +13697,94 @@ def natural_language_violations(payload: dict[str, Any], candidates: list[TextBl
                     }
                 )
     return violations
+
+
+def repair_turkish_skin_label_text(text: str, source_text: str) -> str:
+    if "skin" not in normalize_ocr_text(source_text):
+        return text
+
+    def keep_case(match: re.Match[str], replacement_upper: str, replacement_title: str, replacement_lower: str) -> str:
+        value = match.group(0)
+        if value.upper() == value:
+            return replacement_upper
+        if value[:1].upper() == value[:1]:
+            return replacement_title
+        return replacement_lower
+
+    repaired = re.sub(
+        r"\b(ciltleri|ciltileri)\b",
+        lambda match: keep_case(match, "CİLTLER", "Ciltler", "ciltler"),
+        text,
+        flags=re.IGNORECASE,
+    )
+    repaired = re.sub(
+        r"\b(cildi|cilti)\b",
+        lambda match: keep_case(match, "CİLT", "Cilt", "cilt"),
+        repaired,
+        flags=re.IGNORECASE,
+    )
+    return repaired
+
+
+def repair_target_language_morphology(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> dict[str, Any]:
+    if target_language.upper() != "TR":
+        return payload
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return payload
+    by_id = {str(block.id or ""): block for block in candidates}
+    repaired_any = False
+    repaired_items: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            repaired_items.append(item)
+            continue
+        block = by_id.get(str(item.get("id") or ""))
+        if not block:
+            repaired_items.append(item)
+            continue
+        updated = dict(item)
+        original_text = str(updated.get("translated_text") or plain_text_from_translation_item(updated) or "")
+        repaired_text = repair_turkish_skin_label_text(original_text, block.text)
+        if repaired_text != original_text:
+            updated["translated_text"] = repaired_text
+            repaired_any = True
+        lines = updated.get("lines")
+        if isinstance(lines, list):
+            repaired_lines: list[Any] = []
+            for line in lines:
+                if not isinstance(line, dict):
+                    repaired_lines.append(line)
+                    continue
+                line_copy = dict(line)
+                segments = line_copy.get("segments")
+                if isinstance(segments, list):
+                    repaired_segments: list[Any] = []
+                    for segment in segments:
+                        if not isinstance(segment, dict):
+                            repaired_segments.append(segment)
+                            continue
+                        segment_copy = dict(segment)
+                        for key in ("text", "translatedText"):
+                            if key in segment_copy:
+                                segment_original = str(segment_copy.get(key) or "")
+                                segment_repaired = repair_turkish_skin_label_text(segment_original, block.text)
+                                if segment_repaired != segment_original:
+                                    segment_copy[key] = segment_repaired
+                                    repaired_any = True
+                        repaired_segments.append(segment_copy)
+                    line_copy["segments"] = repaired_segments
+                repaired_lines.append(line_copy)
+            updated["lines"] = repaired_lines
+        repaired_items.append(updated)
+    if not repaired_any:
+        return payload
+    return {**payload, "blocks": repaired_items, "morphologyRepairApplied": True}
+
+
+def finalize_v212_translation_payload(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> dict[str, Any]:
+    punctuated = repair_missing_expressive_punctuation(payload, candidates)
+    return repair_target_language_morphology(punctuated, candidates, target_language)
 
 
 def repair_missing_expressive_punctuation(payload: dict[str, Any], candidates: list[TextBlock]) -> dict[str, Any]:
@@ -13715,6 +13861,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "Never return x, y, w, h, bbox, or any coordinate.",
             "HARD RULE: Translate each input block as one semantic unit, never as independent source lines or word-by-word fragments.",
             "HARD RULE: First decide how the marketing or instruction message is naturally said in the target language. Do not literal-translate source-language articles, filler words, or word order when the target language would omit or move them. Example for Turkish: 'Soak a cotton pad with SÃ©bium H2O' must become 'Pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n', not 'Bir pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n'.",
+            "HARD RULE: For Turkish skincare condition labels, do not create possessive forms such as 'ciltleri' or 'cildi' unless the source explicitly means 'their skin'. Translate standalone 'acne-prone adult skin' style labels as natural label copy such as 'akneye eÄŸilimli yetiÅŸkin ciltler/cilt'.",
             "HARD RULE: Brand/product tokens such as SÃ©bium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
             "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
@@ -13752,7 +13899,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                     if isinstance(retry.get("blocks"), list):
                         retry["analysis_provider"] = "vertex-gemini-v5-polygon-nm-style-retry-natural-language"
                         parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
-                return repair_missing_expressive_punctuation(parsed, candidates)
+                return finalize_v212_translation_payload(parsed, candidates, target_language)
     except Exception as exc:
         print(f"[localize-v2.1.2] Vertex Gemini OCR translation failed: {exc}", flush=True)
     try:
@@ -13809,12 +13956,13 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                     if isinstance(retry.get("blocks"), list):
                         retry["analysis_provider"] = "openai-text-ocr-layout-retry-natural-language"
                         parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
-                return repair_missing_expressive_punctuation(parsed, candidates)
+                return finalize_v212_translation_payload(parsed, candidates, target_language)
     except Exception as exc:
         print(f"[localize-v2.1.2] OpenAI OCR translation failed: {exc}", flush=True)
-    return repair_missing_expressive_punctuation(
+    return finalize_v212_translation_payload(
         ensure_v212_translation_coverage({"analysis_provider": "deterministic-ocr-fallback", "blocks": []}, candidates, target_language),
         candidates,
+        target_language,
     )
 
 
@@ -14597,7 +14745,17 @@ def block_has_rich_text_segments(block: TextBlock) -> bool:
         return True
     if not spans:
         return False
+    if is_v5_block(block):
+        return True
     if any(span.get("styleTransferMode") == "model_word_level_semantic_mapping" for span in spans):
+        return True
+    if any(
+        (span.get("style") or {}).get("hasTextBackground")
+        or (span.get("style") or {}).get("backgroundColor")
+        or (span.get("style") or {}).get("strokeWidth")
+        or (span.get("style") or {}).get("fillTransparent")
+        for span in spans
+    ):
         return True
     colors = {str((span.get("style") or {}).get("color") or span.get("color") or "").lower() for span in spans}
     weights = {int((span.get("style") or {}).get("fontWeight") or span.get("fontWeight") or block.font_weight) for span in spans}
@@ -14688,14 +14846,25 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
     metrics: list[dict[str, Any]] = []
     max_ascent = 0
     max_descent = 0
+    first_style = dict((tokens[0].get("style") if tokens else {}) or {})
+    first_weight = int(first_style.get("fontWeight") or 700)
+    line_point_size = v62_calibrated_point_size(
+        draw,
+        tokens,
+        max(1, int(line_font_size)),
+        font_weight=first_weight,
+        font_category=str(first_style.get("fontCategory") or "sans-serif"),
+        bold=first_weight >= 700,
+    )
 
     for index, token in enumerate(tokens):
         style = dict(token.get("style", {}))
-        style["fontSize"] = max(1, int(line_font_size))
+        style["fontSize"] = max(1, int(line_point_size))
+        style["sourcePixelHeight"] = max(1, int(line_font_size))
 
         font_weight = int(style.get("fontWeight") or 700)
         font = get_font(
-            size=int(line_font_size),
+            size=int(line_point_size),
             bold=font_weight >= 700,
             category=str(style.get("fontCategory") or "sans-serif"),
             weight=font_weight,
@@ -14704,7 +14873,7 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
         try:
             ascent, descent = font.getmetrics()
         except Exception:
-            ascent, descent = max(1, int(line_font_size)), max(1, int(line_font_size) // 4)
+            ascent, descent = max(1, int(line_point_size)), max(1, int(line_point_size) // 4)
 
         token_text = token["text"]
 
@@ -14720,7 +14889,8 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
 
         metrics.append({
             "font": font,
-            "size": int(line_font_size),
+            "size": int(line_point_size),
+            "sourcePixelHeight": int(line_font_size),
             "ascent": ascent,
             "descent": descent,
             "style": style,
@@ -14763,7 +14933,7 @@ def fit_v62_geometric_typesetting(
             "overflow": 0,
             "verticalOverflowAllowed": True,
             "blockCenterX": block_center_x,
-            "typesetting": "v6.4-absolute-geometric",
+            "typesetting": "v6.5-calibrated-rich-v5",
             "score": 1000,
         }
 
@@ -14797,9 +14967,6 @@ def fit_v62_geometric_typesetting(
     for line in lines:
         line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
         line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
-        if line_width > max_width and line_width <= max_width * 1.15:
-            line_font_size = max(1, int(line_font_size * (max_width / max(1, line_width))))
-            line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
 
         # V6.4 KuralÄ±: SatÄ±r ArasÄ± Ezilmeyi Ã‡Ã¶z (Typographic Leading/Line-Height)
         line_height_measured = max_ascent + max_descent
@@ -14826,7 +14993,7 @@ def fit_v62_geometric_typesetting(
         "overflow": max(0, widest - max_width),
         "verticalOverflowAllowed": True,
         "blockCenterX": block_center_x,
-        "typesetting": "v6.4-absolute-geometric",
+        "typesetting": "v6.5-calibrated-rich-v5",
         "score": 1000 - max(0, widest - max_width) * 10,
     }
 
@@ -15130,7 +15297,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     {
                         **payload,
                         "pipeline": "v6-polygon-vision-layout",
-                        "pipeline_version": "v6.4-code-audit-render",
+                        "pipeline_version": "v6.5-calibrated-rich-v5-render",
                         "v5VisionLayout": v5_meta,
                         "ocrLayoutBlocks": [block.model_dump(mode="json") for block in ocr_layout_blocks],
                     },
@@ -15153,11 +15320,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                 extracted_blocks=blocks,
                 debug={
                     "pipeline": "v5",
-                    "pipeline_version": "v6.4-code-audit-render",
+                    "pipeline_version": "v6.5-calibrated-rich-v5-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,
-                    "layoutEngine": "v6.4-code-audit-render",
+                    "layoutEngine": "v6.5-calibrated-rich-v5-render",
                     "v5VisionLayout": v5_meta,
                     "artifacts": {
                         "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
@@ -15172,7 +15339,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     **asset.model_dump(mode="json"),
                     "mode": "localize",
                     "pipeline": "v6-polygon-vision-layout",
-                    "pipeline_version": "v6.4-code-audit-render",
+                    "pipeline_version": "v6.5-calibrated-rich-v5-render",
                     "analysisProvider": payload.get("analysis_provider"),
                     "cleanupMeta": cleanup_meta,
                     "strictMasking": mask_meta,

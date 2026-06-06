@@ -34,6 +34,8 @@ services:
         value: us-central1
       - key: VERTEX_GEMINI_MODEL
         value: gemini-2.5-pro
+      - key: VERTEX_GEMINI_TIMEOUT
+        value: "120"
       - key: VERTEX_IMAGEN_EDIT_MODEL
         value: imagen-3.0-capability-001
       - key: VERTEX_IMAGEN_MODEL
