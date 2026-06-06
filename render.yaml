@@ -33,7 +33,7 @@ services:
       - key: VERTEX_AI_LOCATION
         value: us-central1
       - key: VERTEX_GEMINI_MODEL
-        value: gemini-1.5-pro
+        value: gemini-2.5-pro
       - key: VERTEX_IMAGEN_EDIT_MODEL
         value: imagen-3.0-capability-001
       - key: VERTEX_IMAGEN_MODEL

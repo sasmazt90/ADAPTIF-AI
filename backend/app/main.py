@@ -1984,24 +1984,54 @@ def sample_polygon_foreground_style(
         pixels = crop_rgb[foreground].reshape(-1, 3)
     bg_pixels = crop_rgb[polygon_region & ~foreground]
     bg_color = np.median(bg_pixels.reshape(-1, 3), axis=0) if bg_pixels.size else np.median(crop_rgb.reshape(-1, 3), axis=0)
+    bg_hex = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in bg_color))
     distances = np.linalg.norm(pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
     if len(distances) >= 8:
         pixels = pixels[distances >= np.percentile(distances, 35)]
     median = np.median(pixels, axis=0)
     color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in median))
+    region_pixels = crop_rgb[polygon_region].reshape(-1, 3)
+    region_luma = region_pixels.astype(np.float32) @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    region_chroma = region_pixels.max(axis=1).astype(np.int16) - region_pixels.min(axis=1).astype(np.int16)
+    region_dist = np.linalg.norm(region_pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
     density = float(foreground.sum()) / max(1, int(polygon_region.sum()))
     core_density = float(core.sum()) / max(1, int(polygon_region.sum()))
     height = max(1, bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])
     font_size = max(8, int(height))
+    bg_hex = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in bg_color))
+    bg_luma = color_luminance(bg_hex)
+    contrast_mask = (
+        (region_luma <= max(230.0, bg_luma - 18.0))
+        & (region_chroma >= 18)
+        & (region_dist >= 24)
+    )
+    contrast_pixels = region_pixels[contrast_mask]
+    contrast_fraction = float(len(contrast_pixels)) / max(1, len(region_pixels))
+    contrast_color = color
+    if len(contrast_pixels) >= 8:
+        contrast_median = np.median(contrast_pixels, axis=0)
+        contrast_color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in contrast_median))
     outline_like = (
-        height >= 28
-        and density <= 0.18
-        and core_density <= max(0.025, density * 0.18)
+        height >= 24
+        and bg_luma >= 235
+        and 0.02 <= contrast_fraction <= 0.42
+        and color_chroma(contrast_color) >= 18
     )
     stroke_width = max(2, min(9, int(round(height * 0.09)))) if outline_like else 0
+    if outline_like:
+        color = contrast_color
     is_bold = fallback_weight >= 700 or density >= 0.24 or outline_like
+    text_luma = color_luminance(color)
+    has_text_background = (
+        text_luma >= 205
+        and bg_luma <= 235
+        and color_chroma(bg_hex) >= 26
+        and np.linalg.norm(np.array(parse_hex_color(color), dtype=np.float32) - np.array(parse_hex_color(bg_hex), dtype=np.float32)) >= 42
+    )
     return {
         "color": color,
+        "backgroundColor": bg_hex if has_text_background else None,
+        "hasTextBackground": bool(has_text_background),
         "fontWeight": 700 if is_bold else 400,
         "fontSize": font_size,
         "lineHeight": max(font_size + 2, int(round(font_size * 1.12))),
@@ -2046,6 +2076,8 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
                 "polygon": [list(point) for point in word.polygon],
                 "symbolPolygons": [[list(point) for point in polygon] for polygon in (word.symbol_polygons or [word.polygon])],
                 "color": style["color"],
+                "backgroundColor": style.get("backgroundColor"),
+                "hasTextBackground": bool(style.get("hasTextBackground")),
                 "fontWeight": style["fontWeight"],
                 "fontSize": style.get("fontSize", max(8, word.bbox[3] - word.bbox[1])),
                 "lineHeight": style.get("lineHeight", max(10, int((word.bbox[3] - word.bbox[1]) * 1.12))),
@@ -2093,6 +2125,11 @@ def color_chroma(color: str) -> float:
     return float(np.max(rgb) - np.min(rgb))
 
 
+def color_luminance(color: str) -> float:
+    rgb = np.array(parse_hex_color(color), dtype=np.float32)
+    return float(np.dot(rgb, [0.299, 0.587, 0.114]))
+
+
 def majority_source_style(source_styles: list[dict[str, Any]], base_style: dict[str, Any]) -> dict[str, Any]:
     if not source_styles:
         return dict(base_style)
@@ -2117,6 +2154,14 @@ def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[
     if not source_styles:
         return dict(base_style)
     dominant_color_style = max(source_styles, key=lambda item: color_dominance_score(str(item.get("color") or base_style["color"])))
+    background_style = next(
+        (
+            item
+            for item in source_styles
+            if item.get("hasTextBackground") and item.get("backgroundColor")
+        ),
+        None,
+    )
     max_weight = max(int(item.get("fontWeight") or base_style["fontWeight"]) for item in source_styles)
     uppercase_votes = sum(1 for item in source_styles if item.get("isUppercase"))
     dominant = dict(base_style)
@@ -2148,6 +2193,8 @@ def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[
             ),
             "casing": "uppercase" if uppercase_votes > len(source_styles) / 2 else "mixed",
             "fontCategory": str(dominant_color_style.get("fontCategory") or base_style.get("fontCategory") or "sans-serif"),
+            "backgroundColor": background_style.get("backgroundColor") if background_style else None,
+            "hasTextBackground": bool(background_style),
             "strokeWidth": max(int(item.get("strokeWidth") or 0) for item in source_styles),
             "strokeFill": next((item.get("strokeFill") for item in source_styles if item.get("strokeFill")), None),
             "fillTransparent": any(bool(item.get("outline") or item.get("fillTransparent")) for item in source_styles),
@@ -2233,6 +2280,8 @@ def style_from_source_word_style(source_style: dict[str, Any], base_style: dict[
             "lineHeight": max(10, int(round(float(source_style.get("lineHeight") or base_style.get("lineHeight") or 18)))),
             "casing": "uppercase" if source_style.get("isUppercase") else "mixed",
             "fontCategory": normalize_font_category(source_style.get("fontCategory") or base_style.get("fontCategory")),
+            "backgroundColor": source_style.get("backgroundColor"),
+            "hasTextBackground": bool(source_style.get("hasTextBackground")),
             "strokeWidth": int(source_style.get("strokeWidth") or 0),
             "strokeFill": source_style.get("strokeFill"),
             "fillTransparent": bool(source_style.get("outline") or source_style.get("fillTransparent")),
@@ -2897,7 +2946,7 @@ def vertex_imagen_edit_model() -> str:
 
 
 def vertex_gemini_model() -> str:
-    return os.getenv("VERTEX_GEMINI_MODEL", os.getenv("ADAPTIFAI_VERTEX_GEMINI_MODEL", "gemini-1.5-pro")).strip() or "gemini-1.5-pro"
+    return os.getenv("VERTEX_GEMINI_MODEL", os.getenv("ADAPTIFAI_VERTEX_GEMINI_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
 
 
 def vertex_available() -> bool:
@@ -3084,7 +3133,7 @@ def translate_with_gemini(blocks: list[TextBlock], languages: list[str]) -> dict
     if not api_key:
         return {language: source for language in languages}
 
-    model = os.getenv("GEMINI_TRANSLATION_MODEL", os.getenv("ADAPTIFAI_GEMINI_TRANSLATION_MODEL", "gemini-1.5-pro")).strip() or "gemini-1.5-pro"
+    model = os.getenv("GEMINI_TRANSLATION_MODEL", os.getenv("ADAPTIFAI_GEMINI_TRANSLATION_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
     prompt = {
         "task": "Translate every source string into the requested target language as faithful marketing localization. Treat stacked words as one semantic copy block before translating. Preserve meaning, protected brand/product tokens, metric tokens, [BOLD] tags, style intent by semantic word/phrase meaning, and source line rhythm where natural. Return compact JSON only. Each key must be a requested language code and each value must be an array aligned to the input order.",
         "target_languages": {language: LANGUAGE_NAMES.get(language.upper(), language) for language in languages},
@@ -8702,6 +8751,25 @@ def render_styled_spans(
             # KURAL: 8-Y?nl? d?ng? silindi, Pillow Native RGBA Transparency kullan?l?yor
             if token_style.get("fillTransparent"):
                 fill = (0, 0, 0, 0)
+
+            try:
+                advance = float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
+            except AttributeError:
+                advance = float(token.get("xAdvance") or (text_width(draw, token_text, font) + text_width(draw, " ", font)))
+
+            background_color = token_style.get("backgroundColor") if token_style.get("hasTextBackground") else None
+            if isinstance(background_color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", background_color):
+                bg_top = int(round(y))
+                bg_bottom = int(round(y + max(int(line.get("lineHeight", 0)), int(line_font_size * 1.15))))
+                draw.rectangle(
+                    (
+                        int(round(x - max(1, line_font_size * 0.12))),
+                        bg_top,
+                        int(round(x + max(1.0, advance) + max(1, line_font_size * 0.12))),
+                        bg_bottom,
+                    ),
+                    fill=background_color,
+                )
             
             left, top, right, bottom = draw.textbbox(
                 (x, baseline - token["ascent"]),
@@ -8717,7 +8785,20 @@ def render_styled_spans(
             
             text_y = baseline - token["ascent"]
             # Pillow stroke_width ve stroke_fill parametreleri ile tek kalemde ?izim:
-            draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+            if token_style.get("fillTransparent") and stroke_width > 0 and hasattr(draw, "_image"):
+                overlay = Image.new("RGBA", draw._image.size, (0, 0, 0, 0))
+                overlay_draw = ImageDraw.Draw(overlay)
+                overlay_draw.text(
+                    (x, text_y),
+                    token_text,
+                    fill=(0, 0, 0, 0),
+                    font=font,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_fill,
+                )
+                draw._image.alpha_composite(overlay)
+            else:
+                draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
             
             rendered_spans.append({
                 "lineIndex": line_index,
@@ -8733,7 +8814,7 @@ def render_styled_spans(
             
             # KURAL: Explicit Space xAdvance
             if precise_inline or "xAdvance" in token:
-                x += float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
+                x += advance
             else:
                 try:
                     x += draw.textlength(token_text, font=font)
@@ -10340,6 +10421,28 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         else:
             groups.append(line)
 
+    split_groups: list[list[TextBlock]] = []
+    for group in groups:
+        ordered_group = sorted(group, key=lambda item: item.bbox[0])
+        heights = [max(1, item.bbox[3] - item.bbox[1]) for item in ordered_group]
+        median_height = sorted(heights)[len(heights) // 2] if heights else 1
+        vertical_span = max(item.bbox[3] for item in ordered_group) - min(item.bbox[1] for item in ordered_group)
+        gaps = [
+            ordered_group[index + 1].bbox[0] - ordered_group[index].bbox[2]
+            for index in range(len(ordered_group) - 1)
+        ]
+        should_split_columns = (
+            len(ordered_group) >= 2
+            and vertical_span <= median_height * 1.8
+            and bool(gaps)
+            and min(gaps) >= max(28, median_height * 2.4)
+        )
+        if should_split_columns:
+            split_groups.extend([[word] for word in ordered_group])
+        else:
+            split_groups.append(group)
+    groups = split_groups
+
     blocks: list[TextBlock] = []
     for numeric_index, word in enumerate(sorted(numeric_bypass_words, key=lambda item: (item.bbox[1], item.bbox[0])), start=1):
         block = TextBlock(
@@ -10376,6 +10479,8 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                             "style": {
                                 **default_typography_style(block),
                                 "color": source_word_styles[0]["color"],
+                                "backgroundColor": source_word_styles[0].get("backgroundColor"),
+                                "hasTextBackground": bool(source_word_styles[0].get("hasTextBackground")),
                                 "fontWeight": source_word_styles[0]["fontWeight"],
                                 "fontSize": source_word_styles[0].get("fontSize", block.font_size_estimate),
                                 "lineHeight": source_word_styles[0].get("lineHeight", block.line_height_estimate),
@@ -10446,6 +10551,8 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                 "style": {
                     **default_typography_style(block),
                     "color": word["color"],
+                    "backgroundColor": word.get("backgroundColor"),
+                    "hasTextBackground": bool(word.get("hasTextBackground")),
                     "fontWeight": word["fontWeight"],
                     "fontSize": word.get("fontSize", block.font_size_estimate),
                     "lineHeight": word.get("lineHeight", block.line_height_estimate),
@@ -11477,7 +11584,7 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
         encoded_io = io.BytesIO()
         probe.save(encoded_io, format="PNG")
         encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
-        model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-1.5-pro")).strip() or "gemini-1.5-pro"
+        model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
         prompt = (
             build_visual_analysis_prompt(target_language)
             + " Return JSON only. Return the dimensions of the original source image, not the resized analysis image. "
@@ -13232,6 +13339,8 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "fontSize": max(8, int(round(float(inherited_style.get("fontSize") or base_style.get("fontSize") or 16)))),
                 "lineHeight": max(10, int(round(float(inherited_style.get("lineHeight") or base_style.get("lineHeight") or 18)))),
                 "color": color,
+                "backgroundColor": inherited_style.get("backgroundColor"),
+                "hasTextBackground": bool(inherited_style.get("hasTextBackground")),
                 "casing": "uppercase" if is_uppercase else "mixed",
                 "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or inherited_style.get("fontCategory") or base_style.get("fontCategory")),
                 "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or inherited_style.get("strokeWidth") or 0),
@@ -14742,6 +14851,42 @@ def v5_strict_render_box(block: TextBlock, canvas_size: tuple[int, int]) -> tupl
     )
 
 
+def expand_v5_single_line_render_box(
+    draw: ImageDraw.ImageDraw,
+    block: TextBlock,
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    if len([line for line in (block.line_texts or []) if str(line).strip()]) != 1:
+        return box
+    if not block.translated_style_spans:
+        return box
+    max_width = max(1, canvas_size[0] - 12)
+    source_width = max(1, box[2] - box[0])
+    source_heights = v62_source_word_height_map(block)
+    fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
+    tokens: list[dict[str, Any]] = []
+    for span in block.translated_style_spans:
+        tokens.extend(tokenize_style_span(span))
+    if not tokens:
+        return box
+    line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in tokens)
+    line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, line_font_size)
+    needed_width = min(max_width, max(source_width, line_width))
+    if needed_width <= source_width:
+        return box
+    center_x = (box[0] + box[2]) / 2.0
+    left = int(round(center_x - needed_width / 2.0))
+    right = left + int(round(needed_width))
+    if left < 0:
+        right -= left
+        left = 0
+    if right > canvas_size[0]:
+        left -= right - canvas_size[0]
+        right = canvas_size[0]
+    return (max(0, left), box[1], min(canvas_size[0], right), box[3])
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
@@ -14759,6 +14904,8 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
         
         if block_has_rich_text_segments(block):
             box = v5_strict_render_box(block, canvas.size) if is_v5 else block.bbox
+            if is_v5:
+                box = expand_v5_single_line_render_box(draw, block, box, canvas.size)
             
             # KURAL: Sadece X ekseninde (yatayda) kesi?en bloklar birbirini Y ekseninde a?a?? iter
             start_y = box[1]
