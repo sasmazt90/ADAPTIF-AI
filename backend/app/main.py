@@ -13405,6 +13405,36 @@ def missing_expressive_punctuation(payload: dict[str, Any], candidates: list[Tex
     return missing
 
 
+def natural_language_violations(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> list[dict[str, Any]]:
+    if target_language.upper() != "TR":
+        return []
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return []
+    mapped = {
+        str(item.get("id") or "").strip(): item
+        for item in items
+        if isinstance(item, dict) and str(item.get("id") or "").strip()
+    }
+    violations: list[dict[str, Any]] = []
+    for block in candidates:
+        source = f" {normalize_ocr_text(block.text)} "
+        if not re.search(r"\ba\b", source):
+            continue
+        item = mapped.get(block.id or "")
+        translated = plain_text_from_translation_item(item or {}) if item else ""
+        if re.search(r"\b[Bb]ir\s+\S+", translated):
+            violations.append(
+                {
+                    "id": block.id,
+                    "sourceText": block.text,
+                    "translatedText": translated,
+                    "reason": "literal_turkish_indefinite_article",
+                }
+            )
+    return violations
+
+
 def repair_missing_expressive_punctuation(payload: dict[str, Any], candidates: list[TextBlock]) -> dict[str, Any]:
     items = payload.get("blocks", [])
     if not isinstance(items, list):
@@ -13506,6 +13536,16 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                     if isinstance(retry.get("blocks"), list):
                         retry["analysis_provider"] = "vertex-gemini-v5-polygon-nm-style-retry-punctuation"
                         parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
+                if natural_language_violations(parsed, candidates, target_language):
+                    retry_prompt = {
+                        **prompt,
+                        "retry_reason": "Previous response violated natural target-language wording. For Turkish, do not carry English articles such as 'a/an' into literal 'Bir ...' unless the meaning is numeric one. Rewrite as natural Turkish while preserving source_word_ids style mapping.",
+                        "previous_response": parsed,
+                    }
+                    retry = generate_vertex_gemini_json(retry_prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
+                    if isinstance(retry.get("blocks"), list):
+                        retry["analysis_provider"] = "vertex-gemini-v5-polygon-nm-style-retry-natural-language"
+                        parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
                 return repair_missing_expressive_punctuation(parsed, candidates)
     except Exception as exc:
         print(f"[localize-v2.1.2] Vertex Gemini OCR translation failed: {exc}", flush=True)
@@ -13538,6 +13578,30 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                     retry = extract_json_object(response.choices[0].message.content or "{}")
                     if isinstance(retry.get("blocks"), list):
                         retry["analysis_provider"] = "openai-text-ocr-layout-retry-punctuation"
+                        parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
+                if natural_language_violations(parsed, candidates, target_language):
+                    response = client.chat.completions.create(
+                        model=os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o"),
+                        temperature=0,
+                        messages=[
+                            {"role": "system", "content": "You localize OCR text and return compact JSON only. This is a retry: fix literal target-language wording while preserving source_word_ids style mapping."},
+                            {
+                                "role": "user",
+                                "content": json.dumps(
+                                    {
+                                        **prompt,
+                                        "retry_reason": "Previous response used literal Turkish wording such as 'Bir ...' for English 'a/an'. Rewrite as natural Turkish; omit 'Bir' unless the meaning is numeric one.",
+                                        "previous_response": parsed,
+                                    },
+                                    ensure_ascii=False,
+                                ),
+                            },
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                    retry = extract_json_object(response.choices[0].message.content or "{}")
+                    if isinstance(retry.get("blocks"), list):
+                        retry["analysis_provider"] = "openai-text-ocr-layout-retry-natural-language"
                         parsed = ensure_v212_translation_coverage(retry, candidates, target_language)
                 return repair_missing_expressive_punctuation(parsed, candidates)
     except Exception as exc:
@@ -13666,8 +13730,18 @@ def parse_hex_color(value: str, fallback: tuple[int, int, int] = (17, 17, 17)) -
 def build_v5_polygon_text_mask(image: Image.Image, block: TextBlock) -> tuple[Image.Image, dict[str, Any]]:
     masks: list[Image.Image] = []
     word_reports: list[dict[str, Any]] = []
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
     for word in block.source_word_styles or []:
         if not isinstance(word, dict):
+            continue
+        if is_v5_isolated_step_marker_word(word, source_words):
+            word_reports.append(
+                {
+                    "word": word.get("text"),
+                    "status": "preserved_step_marker",
+                    "polygonCount": 0,
+                }
+            )
             continue
         raw_polygons = word.get("symbolPolygons") or ([word.get("polygon")] if word.get("polygon") else [])
         polygons: list[list[tuple[int, int]]] = []
@@ -13821,6 +13895,9 @@ def build_strict_text_removal_mask(
     dilation_px = strict_mask_dilation_px(image.size)
     feather_px = int(round(strict_mask_feather_px(image.size)))
     for block in blocks:
+        if block.render_strategy == "v5_numeric_bypass":
+            mask_reports.append({"block": block.id, "strategy": "v5_numeric_bypass", "status": "preserved_step_marker"})
+            continue
         has_v5_polygons = any(isinstance(word, dict) and (word.get("symbolPolygons") or word.get("polygon")) for word in (block.source_word_styles or []))
         source_boxes = list(block.line_boxes or []) or [block.bbox]
         for box in source_boxes:
@@ -14642,7 +14719,6 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
     
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
-            draw_v5_numeric_bypass(draw, block)
             continue
             
         text = block.translated_text or block.text
