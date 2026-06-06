@@ -2085,6 +2085,31 @@ def color_dominance_score(color: str) -> float:
     return chroma * 2.0 + abs(brightness - 128.0) * 0.15 - neutral_penalty
 
 
+def color_chroma(color: str) -> float:
+    rgb = np.array(parse_hex_color(color), dtype=np.float32)
+    return float(np.max(rgb) - np.min(rgb))
+
+
+def majority_source_style(source_styles: list[dict[str, Any]], base_style: dict[str, Any]) -> dict[str, Any]:
+    if not source_styles:
+        return dict(base_style)
+    neutral_styles = [
+        item
+        for item in source_styles
+        if color_chroma(str(item.get("color") or base_style.get("color") or "#111111")) < 32
+    ]
+    if len(neutral_styles) > len(source_styles) / 2:
+        max_weight = max(int(item.get("fontWeight") or base_style.get("fontWeight") or 700) for item in neutral_styles)
+        neutral = min(
+            neutral_styles,
+            key=lambda item: abs(float(np.mean(parse_hex_color(str(item.get("color") or base_style.get("color") or "#111111")))) - 96.0),
+        )
+        style = style_from_source_word_style(neutral, base_style)
+        style["fontWeight"] = 700 if max_weight >= 700 else 400
+        return style
+    return dominant_source_style(source_styles, base_style)
+
+
 def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[str, Any]) -> dict[str, Any]:
     if not source_styles:
         return dict(base_style)
@@ -8254,6 +8279,8 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
             for source_style in source_word_styles:
                 if normalize_ocr_text(str(source_style.get("text") or "")) == normalized_token:
                     return style_from_source_word_style(source_style, fallback_style)
+        if len(source_word_styles) > 1:
+            return majority_source_style(source_word_styles, fallback_style)
         return dict(fallback_style)
 
     def token_source_ids_for_text(token_text: str) -> list[str]:
@@ -13456,9 +13483,11 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
             "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
+            "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with Sébium H2O', the target words meaning 'a cotton pad with' must inherit the grey/black source words 'a cotton pad with', while the target word meaning 'Soak' inherits only 'Soak'.",
             "HARD RULE: For 1-to-N mapping, repeat the same source word id across all target segments that inherit that source word style.",
             "HARD RULE: For N-to-1 mapping, put all contributing source word ids in source_word_ids; the backend will apply dominant style.",
             "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_ids.",
+            "HARD RULE: Preserve the original visible line count when the translated text can fit with the original font sizes and overall visual balance. Only change line count when target grammar or fit requires it.",
             *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
@@ -14367,6 +14396,57 @@ def v62_token_source_height(token: dict[str, Any], source_heights: dict[str, int
     return max(1, int(fallback_size))
 
 
+def v62_source_word_line_index_map(block: TextBlock) -> dict[str, int]:
+    line_indices: dict[str, int] = {}
+    for word in block.source_word_styles or []:
+        if not isinstance(word, dict):
+            continue
+        source_id = str(word.get("id") or "").strip()
+        if not source_id:
+            continue
+        try:
+            line_indices[source_id] = int(word.get("lineIndex") or 0)
+        except Exception:
+            line_indices[source_id] = 0
+    return line_indices
+
+
+def v62_token_source_line_index(token: dict[str, Any], source_line_indices: dict[str, int]) -> int:
+    ids = [source_id for source_id in (token.get("sourceWordIds") or []) if source_id in source_line_indices]
+    if not ids:
+        return 0
+    counts: dict[int, int] = {}
+    first_seen: dict[int, int] = {}
+    for order, source_id in enumerate(ids):
+        line_index = source_line_indices[source_id]
+        counts[line_index] = counts.get(line_index, 0) + 1
+        first_seen.setdefault(line_index, order)
+    return sorted(counts, key=lambda line_index: (-counts[line_index], first_seen[line_index], line_index))[0]
+
+
+def v62_regroup_lines_to_source_line_count(
+    lines: list[list[dict[str, Any]]],
+    block: TextBlock,
+    source_line_indices: dict[str, int],
+) -> list[list[dict[str, Any]]]:
+    source_line_count = max(0, len([line for line in (block.line_texts or []) if str(line).strip()]))
+    if source_line_count <= 1 or len(lines) <= source_line_count:
+        return lines
+    ordered_tokens = [token for line in lines for token in line]
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for token in ordered_tokens:
+        line_index = min(source_line_count - 1, max(0, v62_token_source_line_index(token, source_line_indices)))
+        token = {**token, "forceBreakAfter": False}
+        grouped.setdefault(line_index, []).append(token)
+    rebuilt: list[list[dict[str, Any]]] = []
+    for line_index in range(source_line_count):
+        line = grouped.get(line_index, [])
+        if line:
+            line[-1]["forceBreakAfter"] = line_index < source_line_count - 1
+            rebuilt.append(line)
+    return rebuilt or lines
+
+
 def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[dict[str, Any]], line_font_size: int) -> tuple[int, list[dict[str, Any]], int, int]:
     line_width = 0.0
     metrics: list[dict[str, Any]] = []
@@ -14430,6 +14510,7 @@ def fit_v62_geometric_typesetting(
 ) -> dict[str, Any]:
     max_width = max(1, box[2] - box[0])
     source_heights = v62_source_word_height_map(block)
+    source_line_indices = v62_source_word_line_index_map(block)
     fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
 
     tokens: list[dict[str, Any]] = []
@@ -14454,6 +14535,8 @@ def fit_v62_geometric_typesetting(
 
     if current:
         lines.append(current)
+
+    lines = v62_regroup_lines_to_source_line_count(lines, block, source_line_indices)
 
     line_layouts: list[dict[str, Any]] = []
     widest = 0
