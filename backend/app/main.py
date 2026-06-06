@@ -8366,46 +8366,85 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
         source_word_ids.insert(0, source_word_id)
     source_word_styles = [item for item in (span.get("sourceWordStyles") or []) if isinstance(item, dict)]
 
-    def token_style_for_text(token_text: str, fallback_style: dict[str, Any]) -> dict[str, Any]:
-        normalized_token = normalize_ocr_text(token_text)
-        if normalized_token:
-            for source_style in source_word_styles:
-                if normalize_ocr_text(str(source_style.get("text") or "")) == normalized_token:
-                    return style_from_source_word_style(source_style, fallback_style)
+    def source_id_for_style(source_style: dict[str, Any]) -> str:
+        return str(source_style.get("id") or "").strip()
+
+    def source_style_for_tokens(tokens: list[str]) -> list[dict[str, Any] | None]:
+        if not tokens or not source_word_styles:
+            return [None for _ in tokens]
+        assignments: list[dict[str, Any] | None] = [None for _ in tokens]
+        used_source_indexes: set[int] = set()
+        normalized_sources = [normalize_ocr_text(str(item.get("text") or "")) for item in source_word_styles]
+
+        for token_index, token_text in enumerate(tokens):
+            normalized_token = normalize_ocr_text(token_text)
+            if not normalized_token:
+                continue
+            for source_index, normalized_source in enumerate(normalized_sources):
+                if source_index in used_source_indexes:
+                    continue
+                if normalized_source and normalized_source == normalized_token:
+                    assignments[token_index] = source_word_styles[source_index]
+                    used_source_indexes.add(source_index)
+                    break
+
+        remaining_sources = [
+            source_style
+            for source_index, source_style in enumerate(source_word_styles)
+            if source_index not in used_source_indexes
+        ]
+        remaining_cursor = 0
+        for token_index, current in enumerate(assignments):
+            if current is not None:
+                continue
+            if remaining_cursor < len(remaining_sources):
+                assignments[token_index] = remaining_sources[remaining_cursor]
+                remaining_cursor += 1
+        return assignments
+
+    def token_style_from_source(source_style: dict[str, Any] | None, fallback_style: dict[str, Any]) -> dict[str, Any]:
+        if source_style:
+            return style_from_source_word_style(source_style, fallback_style)
         if len(source_word_styles) > 1:
             return majority_source_style(source_word_styles, fallback_style)
         return dict(fallback_style)
 
-    def token_source_ids_for_text(token_text: str) -> list[str]:
+    def token_source_ids_from_source(source_style: dict[str, Any] | None) -> list[str]:
+        source_id = source_id_for_style(source_style or {})
+        if source_id:
+            return [source_id]
         return source_word_ids
 
     force_break_after = bool(span.get("forceBreakAfter", False))
-    keep_whole = role in {"percentage", "numeric_claim", "condition_or_topic", "brand/product_name"}
+    keep_whole = role in {"percentage", "numeric_claim", "condition_or_topic", "brand/product_name"} and len(source_word_styles) <= 1
     if "[BOLD]" in text or "[/BOLD]" in text:
         bold_tokens: list[dict[str, Any]] = []
         for segment_text, segment_bold in parse_bold_markup(text):
             segment_style = dict(style)
             if segment_bold:
                 segment_style["fontWeight"] = max(700, int(segment_style.get("fontWeight") or 700))
-            for token in segment_text.split():
+            segment_tokens = [token for token in segment_text.split() if token]
+            assignments = source_style_for_tokens(segment_tokens)
+            for token, source_style in zip(segment_tokens, assignments, strict=False):
                 if token:
-                    token_style = token_style_for_text(token, segment_style)
-                    bold_tokens.append({"text": token, "style": token_style, "role": role, "sourceWordIds": token_source_ids_for_text(token), "forceBreakAfter": False})
+                    token_style = token_style_from_source(source_style, segment_style)
+                    bold_tokens.append({"text": token, "style": token_style, "role": role, "sourceWordIds": token_source_ids_from_source(source_style), "forceBreakAfter": False})
         if bold_tokens:
             bold_tokens[-1]["forceBreakAfter"] = force_break_after
         return bold_tokens
     if keep_whole:
         return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after}]
+    split_tokens = [token for token in text.split() if token]
+    assignments = source_style_for_tokens(split_tokens)
     tokens = [
         {
             "text": token,
-            "style": token_style_for_text(token, style),
+            "style": token_style_from_source(source_style, style),
             "role": role,
-            "sourceWordIds": token_source_ids_for_text(token),
+            "sourceWordIds": token_source_ids_from_source(source_style),
             "forceBreakAfter": False,
         }
-        for token in text.split()
-        if token
+        for token, source_style in zip(split_tokens, assignments, strict=False)
     ]
     if tokens:
         tokens[-1]["forceBreakAfter"] = force_break_after
@@ -14739,10 +14778,7 @@ def fit_v62_geometric_typesetting(
         candidate = current + [token]
         candidate_font_size = max(v62_token_source_height(item, source_heights, fallback_size) for item in candidate)
         candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
-        same_semantic_span = current and {
-            tuple(item.get("sourceWordIds") or []) for item in candidate
-        } == {tuple(current[0].get("sourceWordIds") or [])}
-        if current and candidate_width > max_width and not (same_semantic_span and candidate_width <= max_width * 1.15):
+        if current and candidate_width > max_width:
             lines.append(current)
             current = [token]
         else:
@@ -14900,6 +14936,51 @@ def expand_v5_single_line_render_box(
     return (max(0, left), box[1], min(canvas_size[0], right), box[3])
 
 
+def expand_v5_render_box_for_line_fit(
+    draw: ImageDraw.ImageDraw,
+    block: TextBlock,
+    box: tuple[int, int, int, int],
+    canvas_size: tuple[int, int],
+) -> tuple[int, int, int, int]:
+    source_heights = v62_source_word_height_map(block)
+    fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
+    lines: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for span in block.translated_style_spans or []:
+        span_tokens = tokenize_style_span(span)
+        if span_tokens:
+            current.extend(span_tokens)
+        if span.get("forceBreakAfter") and current:
+            lines.append(current)
+            current = []
+    if current:
+        lines.append(current)
+    if not lines:
+        return box
+    source_width = max(1, box[2] - box[0])
+    needed_width = source_width
+    for line in lines:
+        line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
+        line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, line, line_font_size)
+        needed_width = max(needed_width, line_width)
+    if needed_width <= source_width:
+        return box
+    left, top, right, bottom = box
+    if block.align == "left":
+        right = min(canvas_size[0], left + int(round(needed_width)))
+    else:
+        center_x = (left + right) / 2.0
+        left = int(round(center_x - needed_width / 2.0))
+        right = left + int(round(needed_width))
+        if left < 0:
+            right -= left
+            left = 0
+        if right > canvas_size[0]:
+            left -= right - canvas_size[0]
+            right = canvas_size[0]
+    return (max(0, left), top, min(canvas_size[0], right), bottom)
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
@@ -14919,6 +15000,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             box = v5_strict_render_box(block, canvas.size) if is_v5 else block.bbox
             if is_v5:
                 box = expand_v5_single_line_render_box(draw, block, box, canvas.size)
+                box = expand_v5_render_box_for_line_fit(draw, block, box, canvas.size)
             
             # KURAL: Sadece X ekseninde (yatayda) kesi?en bloklar birbirini Y ekseninde a?a?? iter
             start_y = box[1]
