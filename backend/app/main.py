@@ -14374,8 +14374,11 @@ def fit_styled_spans_strict(
 
 def v62_source_word_height_map(block: TextBlock) -> dict[str, int]:
     heights: dict[str, int] = {}
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
     for word in block.source_word_styles or []:
         if not isinstance(word, dict):
+            continue
+        if is_v5_isolated_step_marker_word(word, source_words):
             continue
         source_id = str(word.get("id") or "").strip()
         if not source_id:
@@ -14466,6 +14469,24 @@ def fit_v62_geometric_typesetting(
     for span in spans:
         tokens.extend(tokenize_style_span(span))
 
+    if not tokens:
+        block_center_x = (box[0] + box[2]) / 2.0
+        return {
+            "scaleFactor": 1.0,
+            "lines": [],
+            "widest": 0,
+            "totalHeight": 0,
+            "overflow": 0,
+            "verticalOverflowAllowed": True,
+            "blockCenterX": block_center_x,
+            "typesetting": "v6.4-absolute-geometric",
+            "score": 1000,
+        }
+
+    full_line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in tokens)
+    full_line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, full_line_font_size)
+    honor_force_breaks = full_line_width > max_width
+
     lines: list[list[dict[str, Any]]] = []
     current: list[dict[str, Any]] = []
 
@@ -14473,12 +14494,15 @@ def fit_v62_geometric_typesetting(
         candidate = current + [token]
         candidate_font_size = max(v62_token_source_height(item, source_heights, fallback_size) for item in candidate)
         candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
-        if current and candidate_width > max_width:
+        same_semantic_span = current and {
+            tuple(item.get("sourceWordIds") or []) for item in candidate
+        } == {tuple(current[0].get("sourceWordIds") or [])}
+        if current and candidate_width > max_width and not (same_semantic_span and candidate_width <= max_width * 1.15):
             lines.append(current)
             current = [token]
         else:
             current = candidate
-        if token.get("forceBreakAfter") and current:
+        if honor_force_breaks and token.get("forceBreakAfter") and current:
             lines.append(current)
             current = []
 
@@ -14492,6 +14516,9 @@ def fit_v62_geometric_typesetting(
     for line in lines:
         line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
         line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
+        if line_width > max_width and line_width <= max_width * 1.15:
+            line_font_size = max(1, int(line_font_size * (max_width / max(1, line_width))))
+            line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
 
         # V6.4 Kuralı: Satır Arası Ezilmeyi Çöz (Typographic Leading/Line-Height)
         line_height_measured = max_ascent + max_descent
