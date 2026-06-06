@@ -2065,6 +2065,14 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
             fallback_color=block.color,
             fallback_weight=word.font_weight or block.font_weight,
         )
+        if (
+            text.upper() == text
+            and any(char.isalpha() for char in text)
+            and not style.get("outline")
+            and int(style.get("fontWeight") or 700) >= 700
+            and int(style.get("fontSize") or 0) >= 18
+        ):
+            style["fontWeight"] = 800
         styles.append(
             {
                 "id": source_word_id(block.id, line_index, word_index, text),
@@ -8246,17 +8254,22 @@ def get_font(size: int, bold: bool = False, family: str | None = None, category:
     if local_cache_key in LOCAL_FONT_FILE_CACHE:
         return LOCAL_FONT_FILE_CACHE[local_cache_key]
 
-    font_names = (
-        [
+    if bold:
+        font_names = [
             family or "",
+            *(
+                ["C:/Windows/Fonts/ariblk.ttf", "C:/Windows/Fonts/bahnschrift.ttf"]
+                if requested_weight >= 800
+                else []
+            ),
             "C:/Windows/Fonts/arialbd.ttf",
             "C:/Windows/Fonts/segoeuib.ttf",
             "C:/Windows/Fonts/calibrib.ttf",
             "DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         ]
-        if bold
-        else [
+    else:
+        font_names = [
             family or "",
             "C:/Windows/Fonts/arial.ttf",
             "C:/Windows/Fonts/segoeui.ttf",
@@ -8264,7 +8277,6 @@ def get_font(size: int, bold: bool = False, family: str | None = None, category:
             "DejaVuSans.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
-    )
     for font_name in font_names:
         if not font_name:
             continue
@@ -14646,7 +14658,8 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
         font = get_font(
             size=int(line_font_size),
             bold=font_weight >= 700,
-            category=str(style.get("fontCategory") or "sans-serif")
+            category=str(style.get("fontCategory") or "sans-serif"),
+            weight=font_weight,
         )
 
         try:
@@ -14859,7 +14872,7 @@ def expand_v5_single_line_render_box(
 ) -> tuple[int, int, int, int]:
     if len([line for line in (block.line_texts or []) if str(line).strip()]) != 1:
         return box
-    if not block.translated_style_spans:
+    if len(block.translated_style_spans or []) != 1:
         return box
     max_width = max(1, canvas_size[0] - 12)
     source_width = max(1, box[2] - box[0])
