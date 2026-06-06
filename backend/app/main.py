@@ -13478,16 +13478,17 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "Set translate=false only if the input is not marketing/instructional overlay copy.",
             "Never return x, y, w, h, bbox, or any coordinate.",
             "HARD RULE: Translate each input block as one semantic unit, never as independent source lines or word-by-word fragments.",
+            "HARD RULE: First decide how the marketing or instruction message is naturally said in the target language. Do not literal-translate source-language articles, filler words, or word order when the target language would omit or move them. Example for Turkish: 'Soak a cotton pad with Sébium H2O' must become 'Pamuk pedi Sébium H2O ile ıslatın', not 'Bir pamuk pedi Sébium H2O ile ıslatın'.",
             "HARD RULE: Brand/product tokens such as Sébium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
             "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
             "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
-            "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with Sébium H2O', the target words meaning 'a cotton pad with' must inherit the grey/black source words 'a cotton pad with', while the target word meaning 'Soak' inherits only 'Soak'.",
+            "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with Sébium H2O', Turkish target 'Pamuk pedi' inherits the grey/black source words 'a cotton pad', target 'Sébium H2O ile' inherits the product/with source words, and target 'ıslatın' inherits only 'Soak'.",
             "HARD RULE: For 1-to-N mapping, repeat the same source word id across all target segments that inherit that source word style.",
             "HARD RULE: For N-to-1 mapping, put all contributing source word ids in source_word_ids; the backend will apply dominant style.",
             "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_ids.",
-            "HARD RULE: Preserve the original visible line count when the translated text can fit with the original font sizes and overall visual balance. Only change line count when target grammar or fit requires it.",
+            "HARD RULE: Preserve the original visible line count only after the natural target-language wording is decided and only if it can fit without changing word order, grammar, or meaning.",
             *LOCALIZE_V2_RICH_TEXT_PROMPT_RULES,
         ],
     }
@@ -14396,57 +14397,6 @@ def v62_token_source_height(token: dict[str, Any], source_heights: dict[str, int
     return max(1, int(fallback_size))
 
 
-def v62_source_word_line_index_map(block: TextBlock) -> dict[str, int]:
-    line_indices: dict[str, int] = {}
-    for word in block.source_word_styles or []:
-        if not isinstance(word, dict):
-            continue
-        source_id = str(word.get("id") or "").strip()
-        if not source_id:
-            continue
-        try:
-            line_indices[source_id] = int(word.get("lineIndex") or 0)
-        except Exception:
-            line_indices[source_id] = 0
-    return line_indices
-
-
-def v62_token_source_line_index(token: dict[str, Any], source_line_indices: dict[str, int]) -> int:
-    ids = [source_id for source_id in (token.get("sourceWordIds") or []) if source_id in source_line_indices]
-    if not ids:
-        return 0
-    counts: dict[int, int] = {}
-    first_seen: dict[int, int] = {}
-    for order, source_id in enumerate(ids):
-        line_index = source_line_indices[source_id]
-        counts[line_index] = counts.get(line_index, 0) + 1
-        first_seen.setdefault(line_index, order)
-    return sorted(counts, key=lambda line_index: (-counts[line_index], first_seen[line_index], line_index))[0]
-
-
-def v62_regroup_lines_to_source_line_count(
-    lines: list[list[dict[str, Any]]],
-    block: TextBlock,
-    source_line_indices: dict[str, int],
-) -> list[list[dict[str, Any]]]:
-    source_line_count = max(0, len([line for line in (block.line_texts or []) if str(line).strip()]))
-    if source_line_count <= 1 or len(lines) <= source_line_count:
-        return lines
-    ordered_tokens = [token for line in lines for token in line]
-    grouped: dict[int, list[dict[str, Any]]] = {}
-    for token in ordered_tokens:
-        line_index = min(source_line_count - 1, max(0, v62_token_source_line_index(token, source_line_indices)))
-        token = {**token, "forceBreakAfter": False}
-        grouped.setdefault(line_index, []).append(token)
-    rebuilt: list[list[dict[str, Any]]] = []
-    for line_index in range(source_line_count):
-        line = grouped.get(line_index, [])
-        if line:
-            line[-1]["forceBreakAfter"] = line_index < source_line_count - 1
-            rebuilt.append(line)
-    return rebuilt or lines
-
-
 def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[dict[str, Any]], line_font_size: int) -> tuple[int, list[dict[str, Any]], int, int]:
     line_width = 0.0
     metrics: list[dict[str, Any]] = []
@@ -14510,7 +14460,6 @@ def fit_v62_geometric_typesetting(
 ) -> dict[str, Any]:
     max_width = max(1, box[2] - box[0])
     source_heights = v62_source_word_height_map(block)
-    source_line_indices = v62_source_word_line_index_map(block)
     fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
 
     tokens: list[dict[str, Any]] = []
@@ -14535,8 +14484,6 @@ def fit_v62_geometric_typesetting(
 
     if current:
         lines.append(current)
-
-    lines = v62_regroup_lines_to_source_line_count(lines, block, source_line_indices)
 
     line_layouts: list[dict[str, Any]] = []
     widest = 0
