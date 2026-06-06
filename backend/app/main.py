@@ -2149,6 +2149,28 @@ def source_styles_for_segment(raw: dict[str, Any], lookup: dict[str, dict[str, A
     return source_styles
 
 
+def style_from_source_word_style(source_style: dict[str, Any], base_style: dict[str, Any]) -> dict[str, Any]:
+    style = dict(base_style)
+    color = str(source_style.get("color") or base_style.get("color") or "#111111")
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", color):
+        color = str(base_style.get("color") or "#111111")
+    font_weight = int(source_style.get("fontWeight") or base_style.get("fontWeight") or 700)
+    style.update(
+        {
+            "color": color,
+            "fontWeight": 700 if font_weight >= 700 else 400,
+            "fontSize": max(8, int(round(float(source_style.get("fontSize") or base_style.get("fontSize") or 16)))),
+            "lineHeight": max(10, int(round(float(source_style.get("lineHeight") or base_style.get("lineHeight") or 18)))),
+            "casing": "uppercase" if source_style.get("isUppercase") else "mixed",
+            "fontCategory": normalize_font_category(source_style.get("fontCategory") or base_style.get("fontCategory")),
+            "strokeWidth": int(source_style.get("strokeWidth") or 0),
+            "strokeFill": source_style.get("strokeFill"),
+            "fillTransparent": bool(source_style.get("outline") or source_style.get("fillTransparent")),
+        }
+    )
+    return style
+
+
 def run_trocr_ocr_on_image(image_path: Path) -> list[TextBlock]:
     detector = load_ocr_detector()
     use_trocr = os.getenv("ADAPTIFAI_OCR_ENGINE", "easyocr").lower() == "trocr"
@@ -8224,6 +8246,19 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
     source_word_ids = [str(value).strip() for value in raw_source_word_ids if str(value).strip()] if isinstance(raw_source_word_ids, list) else []
     if source_word_id and source_word_id not in source_word_ids:
         source_word_ids.insert(0, source_word_id)
+    source_word_styles = [item for item in (span.get("sourceWordStyles") or []) if isinstance(item, dict)]
+
+    def token_style_for_text(token_text: str, fallback_style: dict[str, Any]) -> dict[str, Any]:
+        normalized_token = normalize_ocr_text(token_text)
+        if normalized_token:
+            for source_style in source_word_styles:
+                if normalize_ocr_text(str(source_style.get("text") or "")) == normalized_token:
+                    return style_from_source_word_style(source_style, fallback_style)
+        return dict(fallback_style)
+
+    def token_source_ids_for_text(token_text: str) -> list[str]:
+        return source_word_ids
+
     force_break_after = bool(span.get("forceBreakAfter", False))
     keep_whole = role in {"percentage", "numeric_claim", "condition_or_topic", "brand/product_name"}
     if "[BOLD]" in text or "[/BOLD]" in text:
@@ -8234,13 +8269,24 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
                 segment_style["fontWeight"] = max(700, int(segment_style.get("fontWeight") or 700))
             for token in segment_text.split():
                 if token:
-                    bold_tokens.append({"text": token, "style": segment_style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": False})
+                    token_style = token_style_for_text(token, segment_style)
+                    bold_tokens.append({"text": token, "style": token_style, "role": role, "sourceWordIds": token_source_ids_for_text(token), "forceBreakAfter": False})
         if bold_tokens:
             bold_tokens[-1]["forceBreakAfter"] = force_break_after
         return bold_tokens
     if keep_whole:
         return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after}]
-    tokens = [{"text": token, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": False} for token in text.split() if token]
+    tokens = [
+        {
+            "text": token,
+            "style": token_style_for_text(token, style),
+            "role": role,
+            "sourceWordIds": token_source_ids_for_text(token),
+            "forceBreakAfter": False,
+        }
+        for token in text.split()
+        if token
+    ]
     if tokens:
         tokens[-1]["forceBreakAfter"] = force_break_after
     return tokens
@@ -13143,6 +13189,7 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "sourceSegmentHint": hint or " ".join(str(source.get("text") or "") for source in source_styles).strip(),
                 "sourceWordId": source_id,
                 "sourceWordIds": source_ids or ([source_id] if source_id else []),
+                "sourceWordStyles": source_styles,
                 "forceBreakAfter": force_break,
                 "color": color,
                 "fontWeight": style["fontWeight"],
