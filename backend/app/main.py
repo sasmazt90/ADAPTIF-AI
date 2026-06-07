@@ -16190,6 +16190,18 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
             continue
         has_background = any(bool(word.get("hasTextBackground") and word.get("backgroundColor")) for word in line_words)
         if has_background:
+            bg_values = [
+                parse_hex_color(str(word.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255))
+                for word in line_words
+                if word.get("hasTextBackground") and word.get("backgroundColor")
+            ]
+            bg_rgb = tuple(int(np.median([color[index] for color in bg_values])) for index in range(3)) if bg_values else (255, 255, 255)
+            left = max(0, min(min(box[0] for box in boxes), block.bbox[0]) - 2)
+            top = max(0, min(box[1] for box in boxes))
+            right = min(canvas.width, max(max(box[2] for box in boxes), block.bbox[2]) + 2)
+            bottom = min(canvas.height, max(box[3] for box in boxes))
+            if right > left and bottom > top:
+                draw.rectangle((left, top, right, bottom), fill=rgb_to_hex(bg_rgb))
             continue
         line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
         pad_x = max(4, int(round(line_height * 0.35)))
@@ -16365,7 +16377,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             translations_summary[language] = [block.translated_text or block.text for block in blocks]
             mask, mask_meta = build_strict_text_removal_mask(source_image, blocks, protected_ocr_lines)
             cleaned, cleanup_meta = inpaint_localize_v2_base(source_image, mask, blocks) if blocks else (source_image.copy(), {"provider": "none"})
-            rendered = draw_fitted_localize_v2_text(cleaned, blocks)
+            render_base = cleaned.convert("RGBA")
+            for block in blocks:
+                if str(block.id or "").startswith("v5"):
+                    clear_v5_source_background_lines(render_base, block)
+            rendered = draw_fitted_localize_v2_text(render_base.convert("RGB"), blocks)
             filename = localize_filename(image_path, language, output_format)
             output_path = job_dir / filename
             save_image_output(rendered, output_path, normalize_output_format(output_format, image_path))
@@ -16374,7 +16390,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             clean_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-v2-clean.png"
             analysis_filename = f"debug-{sanitize_stem(image_path)}-{language.lower()}-v2-analysis.json"
             mask.save(job_dir / mask_filename, "PNG")
-            cleaned.save(job_dir / clean_filename, "PNG")
+            render_base.convert("RGB").save(job_dir / clean_filename, "PNG")
             (job_dir / analysis_filename).write_text(
                 json.dumps(
                     {
