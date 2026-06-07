@@ -16072,8 +16072,10 @@ def expand_v5_single_line_render_box(
         return box
     line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in tokens)
     line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, line_font_size)
-    max_expanded_width = int(round(source_width * float(os.getenv("ADAPTIFAI_V5_RENDER_BOX_MAX_EXPAND", "1.18"))))
-    needed_width = min(max_width, max(source_width, min(line_width, max_expanded_width)))
+    # Single-line translated copy should keep the original source font height
+    # whenever there is enough horizontal room. Short source words such as
+    # "Care" must not force a longer localized phrase like "Bakim yap" to shrink.
+    needed_width = min(max_width, max(source_width, line_width))
     if needed_width <= source_width:
         return box
     center_x = (box[0] + box[2]) / 2.0
@@ -16225,6 +16227,67 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
             (left, top, right, bottom),
             fill=fill_color_around_box(canvas, (left, top, right, bottom), exclude_color=exclude_color),
         )
+
+
+def restore_source_thin_horizontal_rules(canvas: Image.Image, source: Image.Image) -> None:
+    source_rgb = source.convert("RGB")
+    if source_rgb.size != canvas.size:
+        source_rgb = source_rgb.resize(canvas.size, Image.Resampling.LANCZOS)
+    source_np = np.array(source_rgb, dtype=np.uint8)
+    if source_np.size == 0:
+        return
+
+    channel_max = source_np.max(axis=2).astype(np.int16)
+    channel_min = source_np.min(axis=2).astype(np.int16)
+    chroma = channel_max - channel_min
+    green_teal = (
+        (source_np[:, :, 1] > 110)
+        & (source_np[:, :, 0] < 120)
+        & (source_np[:, :, 1].astype(np.int16) >= source_np[:, :, 0].astype(np.int16) + 24)
+        & (chroma > 38)
+    )
+    min_run = max(80, int(source_rgb.width * 0.42))
+    candidate_rows: list[int] = []
+    row_ranges: dict[int, tuple[int, int]] = {}
+    for y in range(source_rgb.height):
+        xs = np.where(green_teal[y])[0]
+        if len(xs) < min_run:
+            continue
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        if x2 - x1 >= min_run and len(xs) >= int((x2 - x1) * 0.82):
+            candidate_rows.append(y)
+            row_ranges[y] = (x1, x2)
+
+    groups: list[list[int]] = []
+    for y in candidate_rows:
+        if not groups or y != groups[-1][-1] + 1:
+            groups.append([y])
+        else:
+            groups[-1].append(y)
+
+    for group in groups:
+        if len(group) > 4:
+            continue
+        x1 = max(0, min(row_ranges[y][0] for y in group) - 1)
+        x2 = min(source_rgb.width, max(row_ranges[y][1] for y in group) + 1)
+        y1 = max(0, min(group) - 1)
+        y2 = min(source_rgb.height, max(group) + 2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        canvas.alpha_composite(source_rgb.crop((x1, y1, x2, y2)).convert("RGBA"), (x1, y1))
+
+
+def restore_v5_numeric_bypass_from_source(canvas: Image.Image, source: Image.Image, blocks: list[TextBlock]) -> None:
+    source_rgba = source.convert("RGBA")
+    if source_rgba.size != canvas.size:
+        source_rgba = source_rgba.resize(canvas.size, Image.Resampling.LANCZOS)
+    for block in blocks:
+        if block.render_strategy != "v5_numeric_bypass":
+            continue
+        restore_box = expand_bbox(block.bbox, canvas.size, max(2, int((block.bbox[3] - block.bbox[1]) * 0.08)))
+        if restore_box[2] <= restore_box[0] or restore_box[3] <= restore_box[1]:
+            continue
+        canvas.alpha_composite(source_rgba.crop(restore_box), restore_box[:2])
 
 
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
@@ -16381,6 +16444,8 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
             for block in blocks:
                 if str(block.id or "").startswith("v5"):
                     clear_v5_source_background_lines(render_base, block)
+            restore_source_thin_horizontal_rules(render_base, source_image)
+            restore_v5_numeric_bypass_from_source(render_base, source_image, blocks)
             rendered = draw_fitted_localize_v2_text(render_base.convert("RGB"), blocks)
             filename = localize_filename(image_path, language, output_format)
             output_path = job_dir / filename
