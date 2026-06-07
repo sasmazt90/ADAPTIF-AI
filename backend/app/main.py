@@ -8605,7 +8605,14 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
     force_break_after = bool(span.get("forceBreakAfter", False))
     split_tokens_preview = [token for token in text.split() if token]
     punctuation_only = bool(re.fullmatch(r"[!?.,;:%]+", text))
+    source_line_indexes = {
+        int(source_style.get("lineIndex") or 0)
+        for source_style in source_word_styles
+        if isinstance(source_style, dict)
+    }
     keep_whole = role in {"percentage", "numeric_claim", "brand/product_name"} and len(source_word_styles) <= 1 and len(split_tokens_preview) <= 2
+    if force_break_after and len(split_tokens_preview) > 1 and not punctuation_only and (len(source_word_styles) <= 1 or len(source_line_indexes) == 1):
+        keep_whole = True
     if "[BOLD]" in text or "[/BOLD]" in text:
         bold_tokens: list[dict[str, Any]] = []
         for segment_text, segment_bold in parse_bold_markup(text):
@@ -8622,7 +8629,8 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
             bold_tokens[-1]["forceBreakAfter"] = force_break_after
         return bold_tokens
     if keep_whole:
-        return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after, "noSpaceBefore": punctuation_only}]
+        token_style = majority_source_style(source_word_styles, style) if source_word_styles else style
+        return [{"text": text, "style": token_style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after, "noSpaceBefore": punctuation_only}]
     split_tokens = split_tokens_preview
     assignments = source_style_for_tokens(split_tokens)
     tokens = [
@@ -14409,6 +14417,13 @@ def repair_turkish_skin_label_text(text: str, source_text: str) -> str:
     return repaired
 
 
+def repair_turkish_literal_article_text(text: str, source_text: str) -> str:
+    source = f" {normalize_ocr_text(source_text)} "
+    if not re.search(r"\ba\b", source):
+        return text
+    return re.sub(r"^\s*[Bb]ir\s+", "", text or "")
+
+
 def normalize_translated_punctuation_spacing(text: str) -> str:
     repaired = re.sub(r"\s+([!?.,;:%])", r"\1", text or "")
     repaired = re.sub(r"([¿¡])\s+", r"\1", repaired)
@@ -14483,7 +14498,7 @@ def repair_target_language_morphology(payload: dict[str, Any], candidates: list[
             continue
         updated = dict(item)
         original_text = str(updated.get("translated_text") or plain_text_from_translation_item(updated) or "")
-        repaired_text = repair_turkish_skin_label_text(original_text, block.text)
+        repaired_text = repair_turkish_literal_article_text(repair_turkish_skin_label_text(original_text, block.text), block.text)
         if repaired_text != original_text:
             updated["translated_text"] = repaired_text
             repaired_any = True
@@ -14506,7 +14521,7 @@ def repair_target_language_morphology(payload: dict[str, Any], candidates: list[
                         for key in ("text", "translatedText"):
                             if key in segment_copy:
                                 segment_original = str(segment_copy.get(key) or "")
-                                segment_repaired = repair_turkish_skin_label_text(segment_original, block.text)
+                                segment_repaired = repair_turkish_literal_article_text(repair_turkish_skin_label_text(segment_original, block.text), block.text)
                                 if segment_repaired != segment_original:
                                     segment_copy[key] = segment_repaired
                                     repaired_any = True
