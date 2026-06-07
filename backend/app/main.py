@@ -9017,6 +9017,41 @@ def draw_rich_text_decorations(
         draw.line((left, y, right, y), fill=color, width=line_width)
 
 
+def choose_render_fill_for_style(
+    draw: ImageDraw.ImageDraw,
+    bbox: tuple[int, int, int, int],
+    style: dict[str, Any],
+    fallback_fill: Any,
+) -> Any:
+    if not (style.get("hasTextBackground") and style.get("backgroundColor")):
+        return fallback_fill
+    if not hasattr(draw, "_image"):
+        return fallback_fill
+
+    left, top, right, bottom = bbox
+    image = draw._image.convert("RGB")
+    left = max(0, min(image.width, int(left)))
+    right = max(left + 1, min(image.width, int(right)))
+    top = max(0, min(image.height, int(top)))
+    bottom = max(top + 1, min(image.height, int(bottom)))
+    sample = np.array(image.crop((left, top, right, bottom)), dtype=np.float32)
+    if sample.size == 0:
+        return fallback_fill
+
+    observed_bg = tuple(int(value) for value in np.median(sample.reshape(-1, 3), axis=0))
+    source_bg = parse_hex_color(str(style.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255))
+    source_fg = parse_hex_color(str(style.get("color") or "#111111"), fallback=(17, 17, 17))
+    bg_distance = float(np.linalg.norm(np.array(observed_bg, dtype=np.float32) - np.array(source_bg, dtype=np.float32)))
+    source_fg_contrast = contrast_ratio(observed_bg, source_fg)
+    source_bg_as_text_contrast = contrast_ratio(observed_bg, source_bg)
+
+    if bg_distance <= 42.0 and source_fg_contrast >= 2.2:
+        return style.get("color") or fallback_fill
+    if source_bg_as_text_contrast > source_fg_contrast:
+        return style.get("backgroundColor") or fallback_fill
+    return style.get("color") or fallback_fill
+
+
 def render_styled_spans(
     draw: ImageDraw.ImageDraw,
     layout: dict[str, Any],
@@ -9049,63 +9084,6 @@ def render_styled_spans(
 
         baseline = y + int(line.get("maxAscent", 0))
         line_font_size = line.get("lineFontSize", 16)
-        if any((token.get("style") or {}).get("hasTextBackground") and (token.get("style") or {}).get("backgroundColor") for token in line.get("tokens", [])):
-            probe_x = x
-            background_runs: list[dict[str, Any]] = []
-            current_run: dict[str, Any] | None = None
-            for token in line.get("tokens", []):
-                token_text = token["text"]
-                font = token["font"]
-                token_style = token.get("style", {})
-                stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
-                try:
-                    advance = float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
-                except AttributeError:
-                    advance = float(token.get("xAdvance") or (text_width(draw, token_text, font) + text_width(draw, " ", font)))
-                token_box = draw.textbbox(
-                    (probe_x, baseline - token["ascent"]),
-                    token_text,
-                    font=font,
-                    stroke_width=stroke_width,
-                )
-                bg_color = token_style.get("backgroundColor") if token_style.get("hasTextBackground") else None
-                if bg_color:
-                    source_height = int(token_style.get("sourcePixelHeight") or token_style.get("fontSize") or max(1, token_box[3] - token_box[1]))
-                    pad_x = max(1, int(round(source_height * 0.18)))
-                    pad_y = max(1, int(round(source_height * 0.10)))
-                    padded_box = (
-                        int(token_box[0]) - pad_x,
-                        int(token_box[1]) - pad_y,
-                        int(token_box[2]) + pad_x,
-                        int(token_box[3]) + pad_y,
-                    )
-                    bg_rgb = parse_hex_color(str(bg_color), fallback=(255, 255, 255))
-                    color_close = (
-                        current_run is not None
-                        and np.linalg.norm(np.array(current_run["rgb"], dtype=np.float32) - np.array(bg_rgb, dtype=np.float32)) <= 24.0
-                    )
-                    if current_run and color_close and padded_box[0] <= current_run["box"][2] + max(3, pad_x * 2):
-                        rb = current_run["box"]
-                        current_run["box"] = (
-                            min(rb[0], padded_box[0]),
-                            min(rb[1], padded_box[1]),
-                            max(rb[2], padded_box[2]),
-                            max(rb[3], padded_box[3]),
-                        )
-                        current_run["colors"].append(bg_rgb)
-                        current_run["rgb"] = tuple(
-                            int(np.median([color[channel] for color in current_run["colors"]])) for channel in range(3)
-                        )
-                        current_run["color"] = rgb_to_hex(current_run["rgb"])
-                    else:
-                        current_run = {"color": rgb_to_hex(bg_rgb), "rgb": bg_rgb, "colors": [bg_rgb], "box": padded_box}
-                        background_runs.append(current_run)
-                else:
-                    current_run = None
-                probe_x += advance
-            for run in background_runs:
-                draw.rectangle(run["box"], fill=run["color"])
-
         for token_index, token in enumerate(line.get("tokens", [])):
             token_text = token["text"]
             font = token["font"]
@@ -9130,6 +9108,7 @@ def render_styled_spans(
                 font=font,
                 stroke_width=stroke_width,
             )
+            fill = choose_render_fill_for_style(draw, (int(left), int(top), int(right), int(bottom)), token_style, fill)
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
