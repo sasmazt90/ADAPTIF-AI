@@ -59,6 +59,7 @@ type RunProgress = {
   stages: ProgressStage[];
 };
 type PipelineOutput = {
+  job_id?: string;
   placement_id?: string | null;
   filename: string;
   download_url: string;
@@ -663,7 +664,7 @@ function CreativeModeControl({
 }
 
 function ProcessingProgress({ progress }: { progress: RunProgress }) {
-  const [now, setNow] = useState(Date.now());
+  const [now, setNow] = useState(progress.startedAt);
   useEffect(() => {
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
@@ -1483,32 +1484,68 @@ export function AdaptDashboard() {
     });
     setError(null);
     setResult(null);
-    const formData = new FormData();
-    files.forEach((file) => formData.append("files", file));
-    formData.append("user_id", currentUserEmail);
-    formData.append("mode", mode === "adapt" ? "localize" : "resize");
-    formData.append("target_languages", mode === "adapt" ? selectedLanguages.join(",") : "EN");
-    formData.append("output_format", selectedFormat);
-    formData.append("placements", mode === "adapt" ? "custom-display" : selectedPlacementIds.join(","));
-    if (mode === "resize") {
-      const creativeModes = Object.fromEntries(
-        selectedPlacementIds.map((placementId) => [
-          placementId,
-          (placements.find((item) => item.id === placementId)?.supportsCarousel
-            ? creativeModesByPlacement[placementId] ?? "single"
-            : "single"),
-        ]),
-      );
-      formData.append("creative_modes", JSON.stringify(creativeModes));
-    }
-    if (mode === "resize" && selectedPlacementIds.includes("custom-display")) {
-      formData.append("custom_width", String(customWidth));
-      formData.append("custom_height", String(customHeight));
-    }
     try {
-      const response = await fetch("/api/adapt", { method: "POST", body: formData, headers: sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Pipeline failed.");
+      const buildRequestForm = (requestFiles: File[]) => {
+        const formData = new FormData();
+        requestFiles.forEach((file) => formData.append("files", file));
+        formData.append("user_id", currentUserEmail);
+        formData.append("mode", mode === "adapt" ? "localize" : "resize");
+        formData.append("target_languages", mode === "adapt" ? selectedLanguages.join(",") : "EN");
+        formData.append("output_format", selectedFormat);
+        formData.append("placements", mode === "adapt" ? "custom-display" : selectedPlacementIds.join(","));
+        if (mode === "resize") {
+          const creativeModes = Object.fromEntries(
+            selectedPlacementIds.map((placementId) => [
+              placementId,
+              (placements.find((item) => item.id === placementId)?.supportsCarousel
+                ? creativeModesByPlacement[placementId] ?? "single"
+                : "single"),
+            ]),
+          );
+          formData.append("creative_modes", JSON.stringify(creativeModes));
+        }
+        if (mode === "resize" && selectedPlacementIds.includes("custom-display")) {
+          formData.append("custom_width", String(customWidth));
+          formData.append("custom_height", String(customHeight));
+        }
+        return formData;
+      };
+
+      const runAdaptRequest = async (requestFiles: File[]) => {
+        const response = await fetch("/api/adapt", {
+          method: "POST",
+          body: buildRequestForm(requestFiles),
+          headers: sessionToken ? { authorization: `Bearer ${sessionToken}` } : undefined,
+        });
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload.error ?? "Pipeline failed.");
+        return payload as PipelineResult;
+      };
+
+      let payload: PipelineResult;
+      if (mode === "adapt" && files.length > 1) {
+        const partials: PipelineResult[] = [];
+        for (const file of files) {
+          const partial = await runAdaptRequest([file]);
+          partials.push({
+            ...partial,
+            outputs: (partial.outputs ?? []).map((output) => ({ ...output, job_id: partial.job_id })),
+          });
+          setCredits(Number(partial.credits_remaining ?? credits));
+        }
+        payload = {
+          job_id: partials[0]?.job_id ?? "",
+          outputs: partials.flatMap((partial) => partial.outputs ?? []),
+          credits_remaining: partials.at(-1)?.credits_remaining,
+        };
+      } else {
+        const single = await runAdaptRequest(files);
+        payload = {
+          ...single,
+          outputs: (single.outputs ?? []).map((output) => ({ ...output, job_id: single.job_id })),
+        };
+      }
+
       setResult(payload);
       if (payload.outputs?.[0]?.placement_id) setActivePlacementId(payload.outputs[0].placement_id);
       if (payload.outputs?.[0]?.source_name) setActiveResizeSource(payload.outputs[0].source_name);
@@ -1532,7 +1569,7 @@ export function AdaptDashboard() {
         method: "POST",
         headers: { "content-type": "application/json", ...(sessionToken ? { authorization: `Bearer ${sessionToken}` } : {}) },
         body: JSON.stringify({
-          job_id: result?.job_id,
+          job_id: activeOutput?.job_id ?? result?.job_id,
           filename: activeOutput?.filename,
           mode,
           copy,
