@@ -9049,6 +9049,52 @@ def render_styled_spans(
 
         baseline = y + int(line.get("maxAscent", 0))
         line_font_size = line.get("lineFontSize", 16)
+        if any((token.get("style") or {}).get("hasTextBackground") and (token.get("style") or {}).get("backgroundColor") for token in line.get("tokens", [])):
+            probe_x = x
+            background_runs: list[dict[str, Any]] = []
+            current_run: dict[str, Any] | None = None
+            for token in line.get("tokens", []):
+                token_text = token["text"]
+                font = token["font"]
+                token_style = token.get("style", {})
+                stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
+                try:
+                    advance = float(token.get("xAdvance") or (draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)))
+                except AttributeError:
+                    advance = float(token.get("xAdvance") or (text_width(draw, token_text, font) + text_width(draw, " ", font)))
+                token_box = draw.textbbox(
+                    (probe_x, baseline - token["ascent"]),
+                    token_text,
+                    font=font,
+                    stroke_width=stroke_width,
+                )
+                bg_color = token_style.get("backgroundColor") if token_style.get("hasTextBackground") else None
+                if bg_color:
+                    source_height = int(token_style.get("sourcePixelHeight") or token_style.get("fontSize") or max(1, token_box[3] - token_box[1]))
+                    pad_x = max(1, int(round(source_height * 0.18)))
+                    pad_y = max(1, int(round(source_height * 0.10)))
+                    padded_box = (
+                        int(token_box[0]) - pad_x,
+                        int(token_box[1]) - pad_y,
+                        int(token_box[2]) + pad_x,
+                        int(token_box[3]) + pad_y,
+                    )
+                    if current_run and current_run["color"] == str(bg_color) and padded_box[0] <= current_run["box"][2] + max(3, pad_x * 2):
+                        rb = current_run["box"]
+                        current_run["box"] = (
+                            min(rb[0], padded_box[0]),
+                            min(rb[1], padded_box[1]),
+                            max(rb[2], padded_box[2]),
+                            max(rb[3], padded_box[3]),
+                        )
+                    else:
+                        current_run = {"color": str(bg_color), "box": padded_box}
+                        background_runs.append(current_run)
+                else:
+                    current_run = None
+                probe_x += advance
+            for run in background_runs:
+                draw.rectangle(run["box"], fill=run["color"])
 
         for token_index, token in enumerate(line.get("tokens", [])):
             token_text = token["text"]
@@ -9074,7 +9120,6 @@ def render_styled_spans(
                 font=font,
                 stroke_width=stroke_width,
             )
-            
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
@@ -11066,10 +11111,31 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
             overlap_x = max(0, min(line_box[2], prev_box[2]) - max(line_box[0], prev_box[0]))
             min_width = max(1, min(line_box[2] - line_box[0], prev_box[2] - prev_box[0]))
             same_column = overlap_x >= min_width * 0.20 or abs(line_box[0] - prev_box[0]) <= image.width * 0.075
+            normalized_pair = normalize_ocr_text(prev_text + " " + line_text)
             semantic_continuation = (
                 not prev_text.strip().isupper()
                 or not line_text.strip().isupper()
-                or any(term in normalize_ocr_text(prev_text + " " + line_text) for term in ("use", "with", "apply", "remove", "cleanse", "rinse", "benefits", "look", "tragen", "spray", "schuhe"))
+                or any(
+                    term in normalized_pair
+                    for term in (
+                        "use",
+                        "with",
+                        "apply",
+                        "remove",
+                        "cleanse",
+                        "rinse",
+                        "benefits",
+                        "look",
+                        "recommended",
+                        "acne",
+                        "prone",
+                        "adult",
+                        "skin",
+                        "tragen",
+                        "spray",
+                        "schuhe",
+                    )
+                )
             )
             if same_column and semantic_continuation and gap_y <= max(24, (line_box[3] - line_box[1]) * 1.25):
                 if best_gap is None or gap_y < best_gap:
@@ -16044,6 +16110,78 @@ def expand_v5_render_box_for_line_fit(
     return (max(0, left), top, min(canvas_size[0], right), bottom)
 
 
+def fill_color_around_box(
+    image: Image.Image,
+    box: tuple[int, int, int, int],
+    *,
+    exclude_color: tuple[int, int, int] | None = None,
+) -> tuple[int, int, int]:
+    left, top, right, bottom = box
+    width, height = image.size
+    pad = max(6, int(max(1, bottom - top) * 0.75))
+    arr = np.array(image.convert("RGB"))
+    samples: list[np.ndarray] = []
+    if top - pad >= 0:
+        samples.append(arr[max(0, top - pad):top, max(0, left):min(width, right)].reshape(-1, 3))
+    if bottom + pad <= height:
+        samples.append(arr[bottom:min(height, bottom + pad), max(0, left):min(width, right)].reshape(-1, 3))
+    if left - pad >= 0:
+        samples.append(arr[max(0, top):min(height, bottom), max(0, left - pad):left].reshape(-1, 3))
+    if right + pad <= width:
+        samples.append(arr[max(0, top):min(height, bottom), right:min(width, right + pad)].reshape(-1, 3))
+    samples = [sample for sample in samples if sample.size]
+    if not samples:
+        return (255, 255, 255)
+    merged = np.concatenate(samples, axis=0)
+    if exclude_color is not None and len(merged) > 8:
+        exclude = np.array(exclude_color, dtype=np.float32)
+        distances = np.linalg.norm(merged.astype(np.float32) - exclude, axis=1)
+        filtered = merged[distances > 32.0]
+        if len(filtered) >= max(8, int(len(merged) * 0.18)):
+            merged = filtered
+    return tuple(int(value) for value in np.median(merged, axis=0))
+
+
+def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> None:
+    words = [
+        word
+        for word in (block.source_word_styles or [])
+        if isinstance(word, dict) and word.get("hasTextBackground") and word.get("backgroundColor")
+    ]
+    if not words:
+        return
+    by_line: dict[int, list[dict[str, Any]]] = {}
+    for word in words:
+        by_line.setdefault(int(word.get("lineIndex") or 0), []).append(word)
+    draw = ImageDraw.Draw(canvas)
+    for line_words in by_line.values():
+        boxes: list[tuple[int, int, int, int]] = []
+        for word in line_words:
+            box = word.get("estimatedBbox") or word.get("bbox")
+            if isinstance(box, list) and len(box) == 4:
+                boxes.append((int(box[0]), int(box[1]), int(box[2]), int(box[3])))
+        if not boxes:
+            continue
+        line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
+        pad_x = max(4, int(round(line_height * 0.35)))
+        pad_y = max(4, int(round(line_height * 0.28)))
+        left = max(0, min(min(box[0] for box in boxes), block.bbox[0]) - pad_x)
+        top = max(0, min(box[1] for box in boxes) - pad_y)
+        right = min(canvas.width, max(max(box[2] for box in boxes), block.bbox[2]) + pad_x)
+        bottom = min(canvas.height, max(box[3] for box in boxes) + pad_y)
+        if right <= left or bottom <= top:
+            continue
+        bg_colors = [
+            parse_hex_color(str(word.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255))
+            for word in line_words
+        ]
+        exclude_color = tuple(int(np.median([color[index] for color in bg_colors])) for index in range(3)) if bg_colors else None
+        draw.rectangle(
+            (left, top, right, bottom),
+            fill=fill_color_around_box(canvas, (left, top, right, bottom), exclude_color=exclude_color),
+        )
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
@@ -16064,6 +16202,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             if is_v5:
                 box = expand_v5_single_line_render_box(draw, block, box, canvas.size)
                 box = expand_v5_render_box_for_line_fit(draw, block, box, canvas.size)
+                clear_v5_source_background_lines(canvas, block)
             
             # KURAL: Sadece X ekseninde (yatayda) kesi?en bloklar birbirini Y ekseninde a?a?? iter
             start_y = box[1]
