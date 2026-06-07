@@ -1996,10 +1996,35 @@ def sample_polygon_foreground_style(
     region_dist = np.linalg.norm(region_pixels.astype(np.float32) - bg_color.astype(np.float32), axis=1)
     density = float(foreground.sum()) / max(1, int(polygon_region.sum()))
     core_density = float(core.sum()) / max(1, int(polygon_region.sum()))
-    height = max(1, bbox_from_polygon(polygon)[3] - bbox_from_polygon(polygon)[1])
+    fg_ys, fg_xs = np.where(foreground)
+    if fg_xs.size and fg_ys.size:
+        foreground_bbox = (
+            left + int(fg_xs.min()),
+            top + int(fg_ys.min()),
+            left + int(fg_xs.max()) + 1,
+            top + int(fg_ys.max()) + 1,
+        )
+    else:
+        foreground_bbox = bbox_from_polygon(polygon)
+    height = max(1, foreground_bbox[3] - foreground_bbox[1])
     font_size = max(8, int(height))
     bg_hex = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in bg_color))
     bg_luma = color_luminance(bg_hex)
+    word_box = bbox_from_polygon(polygon)
+    ring_box = expand_bbox(word_box, image.size, max(8, int((word_box[3] - word_box[1]) * 0.75)))
+    ring_crop = np.array(image.crop(ring_box).convert("RGB"), dtype=np.uint8)
+    ring_local_box = (
+        max(0, word_box[0] - ring_box[0]),
+        max(0, word_box[1] - ring_box[1]),
+        min(ring_crop.shape[1], word_box[2] - ring_box[0]),
+        min(ring_crop.shape[0], word_box[3] - ring_box[1]),
+    )
+    ring_mask = np.ones(ring_crop.shape[:2], dtype=bool)
+    if ring_local_box[2] > ring_local_box[0] and ring_local_box[3] > ring_local_box[1]:
+        ring_mask[ring_local_box[1]:ring_local_box[3], ring_local_box[0]:ring_local_box[2]] = False
+    ring_pixels = ring_crop[ring_mask]
+    ring_color = np.median(ring_pixels.reshape(-1, 3), axis=0) if ring_pixels.size else np.median(ring_crop.reshape(-1, 3), axis=0)
+    background_contrast = float(np.linalg.norm(bg_color.astype(np.float32) - ring_color.astype(np.float32)))
     contrast_mask = (
         (region_luma <= max(230.0, bg_luma - 18.0))
         & (region_chroma >= 18)
@@ -2011,11 +2036,16 @@ def sample_polygon_foreground_style(
     if len(contrast_pixels) >= 8:
         contrast_median = np.median(contrast_pixels, axis=0)
         contrast_color = "#{:02x}{:02x}{:02x}".format(*(int(max(0, min(255, round(channel)))) for channel in contrast_median))
+    contrast_rgb = parse_hex_color(contrast_color)
+    green_dominant_solid = contrast_rgb[1] >= max(contrast_rgb[0], contrast_rgb[2]) and (
+        contrast_rgb[1] - contrast_rgb[0] >= 18 or contrast_rgb[1] - contrast_rgb[2] >= 18
+    )
     outline_like = (
         height >= 24
         and bg_luma >= 235
         and 0.02 <= contrast_fraction <= 0.42
         and color_chroma(contrast_color) >= 18
+        and not green_dominant_solid
     )
     stroke_width = max(2, min(9, int(round(height * 0.09)))) if outline_like else 0
     if outline_like:
@@ -2026,12 +2056,36 @@ def sample_polygon_foreground_style(
         text_luma >= 205
         and bg_luma <= 235
         and color_chroma(bg_hex) >= 26
+        and background_contrast >= 32.0
         and np.linalg.norm(np.array(parse_hex_color(color), dtype=np.float32) - np.array(parse_hex_color(bg_hex), dtype=np.float32)) >= 42
     )
+    if has_text_background:
+        crop_f = crop_rgb.astype(np.float32)
+        bg_rgb = np.array(parse_hex_color(bg_hex), dtype=np.float32)
+        text_rgb = np.array(parse_hex_color(color), dtype=np.float32)
+        local_luma = crop_f[:, :, 0] * 0.299 + crop_f[:, :, 1] * 0.587 + crop_f[:, :, 2] * 0.114
+        local_bg_distance = np.linalg.norm(crop_f - bg_rgb, axis=2)
+        if text_luma >= 205:
+            refined_foreground = (local_luma >= text_luma - 52.0) & (local_bg_distance >= 20.0) & polygon_region
+        elif text_luma <= 80:
+            refined_foreground = (local_luma <= text_luma + 52.0) & (local_bg_distance >= 20.0) & polygon_region
+        else:
+            refined_foreground = (np.linalg.norm(crop_f - text_rgb, axis=2) <= 72.0) & (local_bg_distance >= 20.0) & polygon_region
+        refined_ys, refined_xs = np.where(refined_foreground)
+        if refined_xs.size and refined_ys.size and int(refined_foreground.sum()) >= 3:
+            foreground_bbox = (
+                left + int(refined_xs.min()),
+                top + int(refined_ys.min()),
+                left + int(refined_xs.max()) + 1,
+                top + int(refined_ys.max()) + 1,
+            )
+            height = max(1, foreground_bbox[3] - foreground_bbox[1])
+            font_size = max(8, int(height))
     return {
         "color": color,
         "backgroundColor": bg_hex if has_text_background else None,
         "hasTextBackground": bool(has_text_background),
+        "backgroundContrast": round(background_contrast, 3),
         "fontWeight": 700 if is_bold else 400,
         "fontSize": font_size,
         "lineHeight": max(font_size + 2, int(round(font_size * 1.12))),
@@ -2039,7 +2093,7 @@ def sample_polygon_foreground_style(
         "fontCategory": "sans-serif",
         "foregroundDensity": round(density, 4),
         "coreForegroundDensity": round(core_density, 4),
-        "foregroundBbox": bbox_from_polygon(polygon),
+        "foregroundBbox": foreground_bbox,
         "outline": bool(outline_like),
         "strokeWidth": stroke_width,
         "strokeFill": color if outline_like else None,
@@ -2086,6 +2140,7 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
                 "color": style["color"],
                 "backgroundColor": style.get("backgroundColor"),
                 "hasTextBackground": bool(style.get("hasTextBackground")),
+                "backgroundContrast": style.get("backgroundContrast", 0.0),
                 "fontWeight": style["fontWeight"],
                 "fontSize": style.get("fontSize", max(8, word.bbox[3] - word.bbox[1])),
                 "lineHeight": style.get("lineHeight", max(10, int((word.bbox[3] - word.bbox[1]) * 1.12))),
@@ -2203,6 +2258,7 @@ def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[
             "fontCategory": str(dominant_color_style.get("fontCategory") or base_style.get("fontCategory") or "sans-serif"),
             "backgroundColor": background_style.get("backgroundColor") if background_style else None,
             "hasTextBackground": bool(background_style),
+            "backgroundContrast": max(float(item.get("backgroundContrast") or 0.0) for item in source_styles),
             "strokeWidth": max(int(item.get("strokeWidth") or 0) for item in source_styles),
             "strokeFill": next((item.get("strokeFill") for item in source_styles if item.get("strokeFill")), None),
             "fillTransparent": any(bool(item.get("outline") or item.get("fillTransparent")) for item in source_styles),
@@ -2290,6 +2346,7 @@ def style_from_source_word_style(source_style: dict[str, Any], base_style: dict[
             "fontCategory": normalize_font_category(source_style.get("fontCategory") or base_style.get("fontCategory")),
             "backgroundColor": source_style.get("backgroundColor"),
             "hasTextBackground": bool(source_style.get("hasTextBackground")),
+            "backgroundContrast": float(source_style.get("backgroundContrast") or 0.0),
             "strokeWidth": int(source_style.get("strokeWidth") or 0),
             "strokeFill": source_style.get("strokeFill"),
             "fillTransparent": bool(source_style.get("outline") or source_style.get("fillTransparent")),
@@ -8853,20 +8910,6 @@ def render_styled_spans(
             except AttributeError:
                 advance = float(token.get("xAdvance") or (text_width(draw, token_text, font) + text_width(draw, " ", font)))
 
-            background_color = token_style.get("backgroundColor") if token_style.get("hasTextBackground") else None
-            if isinstance(background_color, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", background_color):
-                bg_top = int(round(y))
-                bg_bottom = int(round(y + max(int(line.get("lineHeight", 0)), int(line_font_size * 1.15))))
-                draw.rectangle(
-                    (
-                        int(round(x - max(1, line_font_size * 0.12))),
-                        bg_top,
-                        int(round(x + max(1.0, advance) + max(1, line_font_size * 0.12))),
-                        bg_bottom,
-                    ),
-                    fill=background_color,
-                )
-            
             left, top, right, bottom = draw.textbbox(
                 (x, baseline - token["ascent"]),
                 token_text,
@@ -10451,11 +10494,320 @@ def google_vision_word_blocks(image_path: Path, image_size: tuple[int, int]) -> 
     return words
 
 
+def bbox_area(box: tuple[int, int, int, int]) -> int:
+    return max(0, int(box[2]) - int(box[0])) * max(0, int(box[3]) - int(box[1]))
+
+
+def split_ocr_line_to_word_boxes(text: str, bbox: tuple[int, int, int, int]) -> list[tuple[str, tuple[int, int, int, int]]]:
+    words = [part for part in re.split(r"\s+", str(text or "").strip()) if part]
+    if not words:
+        return []
+    left, top, right, bottom = bbox
+    width = max(1, right - left)
+    weights = [max(1, len(normalize_ocr_text(word)) or len(word)) for word in words]
+    total_weight = max(1, sum(weights))
+    cursor = float(left)
+    results: list[tuple[str, tuple[int, int, int, int]]] = []
+    for index, (word, weight) in enumerate(zip(words, weights, strict=False)):
+        if index == len(words) - 1:
+            word_right = right
+        else:
+            word_right = int(round(cursor + width * (weight / total_weight)))
+        word_left = int(round(cursor))
+        if word_right <= word_left:
+            word_right = min(right, word_left + 1)
+        results.append((word, (max(left, word_left), top, min(right, word_right), bottom)))
+        cursor = float(word_right)
+    return results
+
+
+def easyocr_supplemental_v5_word_blocks(
+    image_path: Path,
+    image_size: tuple[int, int],
+    existing_words: list[TextBlock],
+) -> list[TextBlock]:
+    try:
+        detector = load_ocr_detector()
+        image = Image.open(image_path).convert("RGB")
+        ocr_image, scale = fit_for_ocr(image)
+        detections = detector.readtext(
+            np.array(ocr_image),
+            detail=1,
+            paragraph=False,
+            batch_size=int(os.getenv("ADAPTIFAI_OCR_BATCH_SIZE", "1")),
+            width_ths=float(os.getenv("ADAPTIFAI_OCR_WIDTH_THS", "0.7")),
+            decoder=os.getenv("ADAPTIFAI_EASYOCR_DECODER", "greedy"),
+        )
+    except Exception as exc:
+        print(f"[vision] EasyOCR supplemental pass unavailable: {exc}", flush=True)
+        return []
+
+    existing_boxes = [word.bbox for word in existing_words if word.bbox]
+    supplemental: list[TextBlock] = []
+    min_confidence = float(os.getenv("ADAPTIFAI_V5_SUPPLEMENTAL_OCR_MIN_CONFIDENCE", "0.18"))
+    word_index = 0
+    for points, detected_text, confidence in detections:
+        text = repair_mojibake(str(detected_text or "").strip())
+        if not text or float(confidence or 0.0) < min_confidence:
+            continue
+        xs = [int(point[0] / scale) for point in points]
+        ys = [int(point[1] / scale) for point in points]
+        line_box = (
+            max(0, min(xs)),
+            max(0, min(ys)),
+            min(image_size[0], max(xs)),
+            min(image_size[1], max(ys)),
+        )
+        if line_box[2] <= line_box[0] or line_box[3] <= line_box[1]:
+            continue
+        duplicates_existing = any(
+            overlap_fraction(line_box, existing_box) >= 0.45 or overlap_fraction(existing_box, line_box) >= 0.55
+            for existing_box in existing_boxes
+        )
+        if duplicates_existing:
+            if "%" in text and not any("%" in str(word.text or "") and overlap_fraction(line_box, word.bbox) >= 0.12 for word in existing_words):
+                symbol_width = max(4, int((line_box[2] - line_box[0]) * 0.18))
+                symbol_box = (max(line_box[0], line_box[2] - symbol_width), line_box[1], line_box[2], line_box[3])
+                polygon = [
+                    (symbol_box[0], symbol_box[1]),
+                    (symbol_box[2], symbol_box[1]),
+                    (symbol_box[2], symbol_box[3]),
+                    (symbol_box[0], symbol_box[3]),
+                ]
+                word_index += 1
+                supplemental.append(
+                    TextBlock(
+                        id=f"v5-easyocr-word-{word_index}",
+                        text="%",
+                        role="numeric_claim",
+                        translate=True,
+                        bbox=symbol_box,
+                        clean_box=symbol_box,
+                        polygon=polygon,
+                        line_polygons=[polygon],
+                        symbol_polygons=[polygon],
+                        line_boxes=[symbol_box],
+                        line_texts=["%"],
+                        color="#111111",
+                        font_weight=800,
+                        font_size_estimate=estimate_font_size_from_bbox(symbol_box),
+                        line_height_estimate=estimate_line_height_from_bbox(symbol_box),
+                        align=infer_alignment(symbol_box, image_size[0]),
+                        surface="overlay",
+                    )
+                )
+            continue
+        for word_text, word_box in split_ocr_line_to_word_boxes(text, line_box):
+            if is_decorative_or_numeric_only(word_text) and len(normalize_ocr_text(word_text)) <= 1:
+                continue
+            polygon = [(word_box[0], word_box[1]), (word_box[2], word_box[1]), (word_box[2], word_box[3]), (word_box[0], word_box[3])]
+            word_index += 1
+            supplemental.append(
+                TextBlock(
+                    id=f"v5-easyocr-word-{word_index}",
+                    text=word_text,
+                    role=classify_text_role(word_text),
+                    translate=True,
+                    bbox=word_box,
+                    clean_box=word_box,
+                    polygon=polygon,
+                    line_polygons=[polygon],
+                    symbol_polygons=[polygon],
+                    line_boxes=[word_box],
+                    line_texts=[word_text],
+                    color="#111111",
+                    font_weight=800 if word_text.isupper() else 700,
+                    font_size_estimate=estimate_font_size_from_bbox(word_box),
+                    line_height_estimate=estimate_line_height_from_bbox(word_box),
+                    align=infer_alignment(word_box, image_size[0]),
+                    surface="overlay",
+                )
+            )
+    return supplemental
+
+
+def supplement_v5_ocr_words(image_path: Path, image_size: tuple[int, int], words: list[TextBlock]) -> tuple[list[TextBlock], dict[str, Any]]:
+    if os.getenv("ADAPTIFAI_DISABLE_SUPPLEMENTAL_OCR", "0") == "1":
+        return words, {"supplementalProvider": "disabled", "supplementalWordCount": 0}
+    image_area = max(1, image_size[0] * image_size[1])
+    detected_area = sum(bbox_area(word.bbox) for word in words)
+    area_ratio = detected_area / image_area
+    should_run = area_ratio < float(os.getenv("ADAPTIFAI_V5_SUPPLEMENTAL_OCR_AREA_RATIO", "0.16")) or len(words) < int(os.getenv("ADAPTIFAI_V5_SUPPLEMENTAL_OCR_MIN_WORDS", "8"))
+    if not should_run:
+        return words, {"supplementalProvider": "skipped", "supplementalWordCount": 0, "visionAreaRatio": area_ratio}
+    supplemental = easyocr_supplemental_v5_word_blocks(image_path, image_size, words)
+    if not supplemental:
+        return words, {"supplementalProvider": "easyocr", "supplementalWordCount": 0, "visionAreaRatio": area_ratio}
+    merged = list(words)
+    existing_boxes = [word.bbox for word in merged]
+    added = 0
+    for candidate in supplemental:
+        duplicate = any(
+            overlap_fraction(candidate.bbox, existing_box) >= 0.45 or overlap_fraction(existing_box, candidate.bbox) >= 0.55
+            for existing_box in existing_boxes
+        )
+        if duplicate:
+            continue
+        merged.append(candidate)
+        existing_boxes.append(candidate.bbox)
+        added += 1
+    return merged, {
+        "supplementalProvider": "easyocr",
+        "supplementalWordCount": added,
+        "visionAreaRatio": area_ratio,
+    }
+
+
 def is_v5_numeric_bypass_text(text: str) -> bool:
     cleaned = str(text or "").strip()
     if not cleaned:
         return False
     return bool(re.fullmatch(r"[\d]+(?:[.)])?", cleaned))
+
+
+def is_v5_step_marker_word(word: TextBlock, words: list[TextBlock], image_size: tuple[int, int]) -> bool:
+    if not is_v5_numeric_bypass_text(word.text):
+        return False
+    box = word.bbox
+    height = max(1, box[3] - box[1])
+    width = max(1, box[2] - box[0])
+    if height < max(26, int(image_size[1] * 0.045)):
+        return False
+    if width > height * 1.15:
+        return False
+    cy = (box[1] + box[3]) / 2.0
+    right_context: list[TextBlock] = []
+    for other in words:
+        if other is word or is_v5_numeric_bypass_text(other.text):
+            continue
+        other_box = other.bbox
+        other_height = max(1, other_box[3] - other_box[1])
+        other_cy = (other_box[1] + other_box[3]) / 2.0
+        same_band = abs(other_cy - cy) <= max(height, other_height) * 1.35
+        starts_to_right = other_box[0] >= box[2] + max(14, int(height * 0.8))
+        if same_band and starts_to_right:
+            right_context.append(other)
+    if not right_context:
+        return False
+    nearest_context_left = min(item.bbox[0] for item in right_context)
+    return box[0] <= image_size[0] * 0.32 and nearest_context_left > box[2]
+
+
+def detect_v5_step_marker_words(words: list[TextBlock], image_size: tuple[int, int]) -> list[TextBlock]:
+    explicit = [word for word in words if is_v5_step_marker_word(word, words, image_size)]
+    candidates: list[TextBlock] = []
+    for word in words:
+        if not is_v5_numeric_bypass_text(word.text):
+            continue
+        cleaned = re.sub(r"\D", "", str(word.text or ""))
+        if not cleaned or len(cleaned) > 2:
+            continue
+        value = int(cleaned)
+        if value < 1 or value > 12:
+            continue
+        box = word.bbox
+        height = max(1, box[3] - box[1])
+        width = max(1, box[2] - box[0])
+        if height < max(18, int(image_size[1] * 0.018)):
+            continue
+        if width > height * 1.45:
+            continue
+        candidates.append(word)
+
+    if len(candidates) < 2:
+        detected = explicit
+    else:
+        heights = [max(1, item.bbox[3] - item.bbox[1]) for item in candidates]
+        median_height = sorted(heights)[len(heights) // 2]
+        similar = [
+            item
+            for item in candidates
+            if 0.45 <= (max(1, item.bbox[3] - item.bbox[1]) / max(1, median_height)) <= 2.2
+        ]
+        distinct_values = {int(re.sub(r"\D", "", str(item.text or ""))) for item in similar}
+        if len(similar) >= 2 and len(distinct_values) >= 2:
+            detected = explicit + similar
+        else:
+            detected = explicit
+
+    unique: list[TextBlock] = []
+    seen: set[tuple[str, tuple[int, int, int, int]]] = set()
+    for word in detected:
+        key = (str(word.text), word.bbox)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(word)
+    return unique
+
+
+def looks_like_numeric_marketing_claim_word(word: TextBlock, image_size: tuple[int, int]) -> bool:
+    text = str(word.text or "").strip().lower()
+    normalized = normalize_ocr_text(text)
+    if not normalized:
+        return False
+    if "%" in text or re.search(r"\d+\s*(h|hr|hrs|hour|hours|saat|sa)", normalized):
+        return True
+    box = word.bbox
+    height = max(1, box[3] - box[1])
+    center_y = (box[1] + box[3]) / 2.0
+    return bool(re.search(r"\d", normalized)) and height >= image_size[1] * 0.035 and image_size[1] * 0.12 <= center_y <= image_size[1] * 0.82
+
+
+def is_possible_v5_step_marker_candidate(word: TextBlock, image_size: tuple[int, int]) -> bool:
+    if not is_v5_numeric_bypass_text(word.text):
+        return False
+    cleaned = re.sub(r"\D", "", str(word.text or ""))
+    if not cleaned or len(cleaned) > 2:
+        return False
+    value = int(cleaned)
+    if value < 1 or value > 12:
+        return False
+    box = word.bbox
+    height = max(1, box[3] - box[1])
+    width = max(1, box[2] - box[0])
+    return height >= max(18, int(image_size[1] * 0.018)) and width <= height * 1.45
+
+
+def v5_words_sharing_line(word: TextBlock, words: list[TextBlock]) -> list[TextBlock]:
+    box = word.bbox
+    height = max(1, box[3] - box[1])
+    cy = (box[1] + box[3]) / 2.0
+    shared: list[TextBlock] = []
+    for other in words:
+        other_box = other.bbox
+        other_height = max(1, other_box[3] - other_box[1])
+        other_cy = (other_box[1] + other_box[3]) / 2.0
+        if abs(other_cy - cy) <= max(height, other_height) * 0.72:
+            shared.append(other)
+    return shared
+
+
+def has_instructional_line_context(word: TextBlock, words: list[TextBlock]) -> bool:
+    line_text = " ".join(item.text for item in sorted(v5_words_sharing_line(word, words), key=lambda item: item.bbox[0]))
+    return is_instructional_context_text(line_text)
+
+
+def is_probable_v5_ocr_noise_near_step_marker(word: TextBlock, step_markers: list[TextBlock], image_size: tuple[int, int]) -> bool:
+    text = str(word.text or "").strip()
+    if not text or normalize_ocr_text(text):
+        return False
+    if len(text) > 3 or not step_markers:
+        return False
+    box = word.bbox
+    height = max(1, box[3] - box[1])
+    center_x = (box[0] + box[2]) / 2.0
+    center_y = (box[1] + box[3]) / 2.0
+    for marker in step_markers:
+        marker_box = marker.bbox
+        marker_height = max(1, marker_box[3] - marker_box[1])
+        marker_center_x = (marker_box[0] + marker_box[2]) / 2.0
+        marker_center_y = (marker_box[1] + marker_box[3]) / 2.0
+        if abs(center_y - marker_center_y) <= max(height, marker_height) * 1.1 and abs(center_x - marker_center_x) <= max(
+            marker_height * 2.4, image_size[0] * 0.12
+        ):
+            return True
+    return False
 
 
 def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[list[TextBlock], list[TextBlock], dict[str, Any]]:
@@ -10466,13 +10818,26 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
     protected_words: list[TextBlock] = []
     for word in words:
         overlap = polygon_mask_overlap_fraction([word.polygon] if word.polygon else [], product_mask)
-        if overlap >= float(os.getenv("ADAPTIFAI_V5_PRODUCT_POLYGON_OVERLAP", "0.55")):
+        keep_as_overlay = (
+            should_translate_ocr_overlay_block(word, image.size)
+            or has_instructional_line_context(word, words)
+            or looks_like_numeric_marketing_claim_word(word, image.size)
+            or is_possible_v5_step_marker_candidate(word, image.size)
+        )
+        if overlap >= float(os.getenv("ADAPTIFAI_V5_PRODUCT_POLYGON_OVERLAP", "0.55")) and not keep_as_overlay:
             protected_words.append(word.model_copy(update={"translate": False, "surface": "packaging"}))
         else:
             overlay_words.append(word.model_copy(update={"translate": True, "surface": "overlay"}))
 
-    numeric_bypass_words = [word for word in overlay_words if is_v5_numeric_bypass_text(word.text)]
-    textual_overlay_words = [word for word in overlay_words if not is_v5_numeric_bypass_text(word.text)]
+    numeric_bypass_words = detect_v5_step_marker_words(overlay_words, image.size)
+    numeric_bypass_keys = {(word.text, word.bbox) for word in numeric_bypass_words}
+    textual_overlay_words = [
+        word
+        for word in overlay_words
+        if (word.text, word.bbox) not in numeric_bypass_keys
+        and not is_v5_numeric_bypass_text(word.text)
+        and not is_probable_v5_ocr_noise_near_step_marker(word, numeric_bypass_words, image.size)
+    ]
     ordered = sorted(textual_overlay_words, key=lambda item: ((item.bbox[1] + item.bbox[3]) / 2, item.bbox[0]))
     lines: list[list[TextBlock]] = []
     for word in ordered:
@@ -10491,29 +10856,52 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
         else:
             matched.append(word)
 
-    lines = [sorted(line, key=lambda item: item.bbox[0]) for line in lines]
+    split_lines: list[list[TextBlock]] = []
+    for line in lines:
+        sorted_line = sorted(line, key=lambda item: item.bbox[0])
+        if len(sorted_line) <= 1:
+            split_lines.append(sorted_line)
+            continue
+        heights = [max(1, item.bbox[3] - item.bbox[1]) for item in sorted_line]
+        median_height = sorted(heights)[len(heights) // 2]
+        current_run = [sorted_line[0]]
+        for item in sorted_line[1:]:
+            gap = item.bbox[0] - current_run[-1].bbox[2]
+            if gap >= max(24, int(median_height * 1.35)):
+                split_lines.append(current_run)
+                current_run = [item]
+            else:
+                current_run.append(item)
+        if current_run:
+            split_lines.append(current_run)
+    lines = split_lines
     lines.sort(key=lambda line: min(item.bbox[1] for item in line))
     groups: list[list[TextBlock]] = []
     for line in lines:
         line_box = union_bbox([item.bbox for item in line]) or line[0].bbox
         line_text = " ".join(item.text for item in line)
-        if not groups:
-            groups.append(line)
-            continue
-        prev = groups[-1]
-        prev_box = union_bbox([item.bbox for item in prev]) or prev[-1].bbox
-        prev_text = " ".join(item.text for item in prev)
-        gap_y = line_box[1] - prev_box[3]
-        overlap_x = max(0, min(line_box[2], prev_box[2]) - max(line_box[0], prev_box[0]))
-        min_width = max(1, min(line_box[2] - line_box[0], prev_box[2] - prev_box[0]))
-        same_column = overlap_x >= min_width * 0.20 or abs(line_box[0] - prev_box[0]) <= image.width * 0.075
-        semantic_continuation = (
-            not prev_text.strip().isupper()
-            or not line_text.strip().isupper()
-            or any(term in normalize_ocr_text(prev_text + " " + line_text) for term in ("use", "with", "apply", "remove", "cleanse", "rinse", "benefits", "look"))
-        )
-        if same_column and semantic_continuation and gap_y <= max(18, (line_box[3] - line_box[1]) * 0.95):
-            groups[-1].extend(line)
+        best_group_index: int | None = None
+        best_gap: float | None = None
+        for group_index, prev in enumerate(groups):
+            prev_box = union_bbox([item.bbox for item in prev]) or prev[-1].bbox
+            prev_text = " ".join(item.text for item in prev)
+            gap_y = line_box[1] - prev_box[3]
+            if gap_y < -max(10, (line_box[3] - line_box[1]) * 0.5):
+                continue
+            overlap_x = max(0, min(line_box[2], prev_box[2]) - max(line_box[0], prev_box[0]))
+            min_width = max(1, min(line_box[2] - line_box[0], prev_box[2] - prev_box[0]))
+            same_column = overlap_x >= min_width * 0.20 or abs(line_box[0] - prev_box[0]) <= image.width * 0.075
+            semantic_continuation = (
+                not prev_text.strip().isupper()
+                or not line_text.strip().isupper()
+                or any(term in normalize_ocr_text(prev_text + " " + line_text) for term in ("use", "with", "apply", "remove", "cleanse", "rinse", "benefits", "look", "tragen", "spray", "schuhe"))
+            )
+            if same_column and semantic_continuation and gap_y <= max(24, (line_box[3] - line_box[1]) * 1.25):
+                if best_gap is None or gap_y < best_gap:
+                    best_group_index = group_index
+                    best_gap = gap_y
+        if best_group_index is not None:
+            groups[best_group_index].extend(line)
         else:
             groups.append(line)
 
@@ -10577,6 +10965,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                                 "color": source_word_styles[0]["color"],
                                 "backgroundColor": source_word_styles[0].get("backgroundColor"),
                                 "hasTextBackground": bool(source_word_styles[0].get("hasTextBackground")),
+                                "backgroundContrast": source_word_styles[0].get("backgroundContrast", 0.0),
                                 "fontWeight": source_word_styles[0]["fontWeight"],
                                 "fontSize": source_word_styles[0].get("fontSize", block.font_size_estimate),
                                 "lineHeight": source_word_styles[0].get("lineHeight", block.line_height_estimate),
@@ -10649,6 +11038,7 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                     "color": word["color"],
                     "backgroundColor": word.get("backgroundColor"),
                     "hasTextBackground": bool(word.get("hasTextBackground")),
+                    "backgroundContrast": word.get("backgroundContrast", 0.0),
                     "fontWeight": word["fontWeight"],
                     "fontSize": word.get("fontSize", block.font_size_estimate),
                     "lineHeight": word.get("lineHeight", block.line_height_estimate),
@@ -13437,6 +13827,7 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "color": color,
                 "backgroundColor": inherited_style.get("backgroundColor"),
                 "hasTextBackground": bool(inherited_style.get("hasTextBackground")),
+                "backgroundContrast": float(inherited_style.get("backgroundContrast") or 0.0),
                 "casing": "uppercase" if is_uppercase else "mixed",
                 "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or inherited_style.get("fontCategory") or base_style.get("fontCategory")),
                 "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or inherited_style.get("strokeWidth") or 0),
@@ -13462,6 +13853,20 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "styleTransferMode": "deterministic_nm_source_word_foreground_style_cross_line",
             }
         )
+    if len([line for line in (block.line_texts or []) if str(line).strip()]) > 1:
+        for index in range(len(normalized) - 1):
+            current_lines = {
+                int(style.get("lineIndex"))
+                for style in normalized[index].get("sourceWordStyles", [])
+                if isinstance(style, dict) and style.get("lineIndex") is not None
+            }
+            next_lines = {
+                int(style.get("lineIndex"))
+                for style in normalized[index + 1].get("sourceWordStyles", [])
+                if isinstance(style, dict) and style.get("lineIndex") is not None
+            }
+            if current_lines and next_lines and current_lines != next_lines:
+                normalized[index]["forceBreakAfter"] = True
     return preserve_visual_heading_span_order(block, normalized)
 
 
@@ -13479,12 +13884,17 @@ def should_translate_ocr_overlay_block(block: TextBlock, image_size: tuple[int, 
     box_height = max(1, block.bbox[3] - block.bbox[1])
     image_width, image_height = image_size
     area_ratio = (box_width * box_height) / max(1, image_width * image_height)
-    if block.bbox[1] >= image_height * 0.45 and box_height <= image_height * 0.09 and area_ratio <= 0.014:
-        return False
     instructional_context = any(
         term in normalized
-        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
+        for term in (
+            "with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak",
+            "spray", "shoe", "shoes", "wear", "wipe", "dry", "shake",
+            "gebrauch", "schutteln", "schütteln", "tragen", "schuhe", "spruhen", "sprühen", "trocknen", "abwischen", "gelangt",
+            "ile", "uygula", "kullan", "durula", "temizle",
+        )
     )
+    if block.bbox[1] >= image_height * 0.45 and box_height <= image_height * 0.09 and area_ratio <= 0.014 and not instructional_context:
+        return False
     if has_packaging_cues(text) and not instructional_context:
         return False
     if any(token in normalized for token in ("www.", ".com", ".de", "http", "qr", "ask.naos")):
@@ -13500,7 +13910,12 @@ def is_instructional_context_text(text: str) -> bool:
     normalized = normalize_ocr_text(text)
     return any(
         term in normalized
-        for term in ("with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak", "ile", "uygula", "kullan", "durula", "temizle")
+        for term in (
+            "with", "apply", "use", "for", "remove", "rinse", "cleanse", "soak",
+            "spray", "shoe", "shoes", "wear", "wipe", "dry", "shake",
+            "gebrauch", "schutteln", "schütteln", "tragen", "schuhe", "spruhen", "sprühen", "trocknen", "abwischen", "gelangt",
+            "ile", "uygula", "kullan", "durula", "temizle",
+        )
     )
 
 
@@ -13863,11 +14278,14 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "HARD RULE: First decide how the marketing or instruction message is naturally said in the target language. Do not literal-translate source-language articles, filler words, or word order when the target language would omit or move them. Example for Turkish: 'Soak a cotton pad with SÃ©bium H2O' must become 'Pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n', not 'Bir pamuk pedi SÃ©bium H2O ile Ä±slatÄ±n'.",
             "HARD RULE: For Turkish skincare condition labels, do not create possessive forms such as 'ciltleri' or 'cildi' unless the source explicitly means 'their skin'. Translate standalone 'acne-prone adult skin' style labels as natural label copy such as 'akneye eÄŸilimli yetiÅŸkin ciltler/cilt'.",
             "HARD RULE: Brand/product tokens such as SÃ©bium H2O that are in overlay copy are movable semantic tokens. Place them where the target-language grammar requires; never lock them to their original source line or coordinate.",
+            "HARD RULE: Numeric marketing claims inside overlay copy are translatable/localizable text, not fixed step markers. Localize number, percent, decimal, duration, and unit formatting for the target language, e.g. English '90%' may become Turkish '%90', and '24h' may become the target-language natural short duration form.",
+            "HARD RULE: Pure numeric step/bullet markers are not included in input_blocks. If a number is present here, it is part of marketing or instructional copy and must be localized with the surrounding sentence.",
             "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
             "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
             "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with SÃ©bium H2O', Turkish target 'Pamuk pedi' inherits the grey/black source words 'a cotton pad', target 'SÃ©bium H2O ile' inherits the product/with source words, and target 'Ä±slatÄ±n' inherits only 'Soak'.",
+            "HARD RULE: Style inheritance is local to the current input block. Never copy color, boldness, casing, or source_word_ids from any other block.",
             "HARD RULE: For 1-to-N mapping, repeat the same source word id across all target segments that inherit that source word style.",
             "HARD RULE: For N-to-1 mapping, put all contributing source word ids in source_word_ids; the backend will apply dominant style.",
             "Do not invent colors or font weights. The backend will copy exact hex_color_from_foreground_pixels and font_weight from source_word_ids.",
@@ -14081,6 +14499,106 @@ def parse_hex_color(value: str, fallback: tuple[int, int, int] = (17, 17, 17)) -
         return fallback
 
 
+def is_v5_marketing_numeric_source_word(word: dict[str, Any]) -> bool:
+    text = str(word.get("text") or "").strip()
+    normalized = normalize_ocr_text(text)
+    role = str(word.get("semanticRole") or "").strip().lower()
+    return bool(
+        re.search(r"\d", normalized)
+        or "%" in text
+        or role in {"percentage", "numeric_claim", "duration", "measurement"}
+    )
+
+
+def is_v5_large_heading_source_word(word: dict[str, Any], image_size: tuple[int, int]) -> bool:
+    text = str(word.get("text") or "").strip()
+    if not text or is_decorative_or_numeric_only(text):
+        return False
+    box = v5_word_box(word)
+    if box is None:
+        return False
+    height = max(1, box[3] - box[1])
+    width = max(1, box[2] - box[0])
+    return (
+        height >= max(24, int(image_size[1] * 0.035))
+        and width >= image_size[0] * 0.12
+        and text.upper() == text
+        and any(char.isalpha() for char in text)
+    )
+
+
+def build_v5_word_box_support_mask(image_size: tuple[int, int], word: dict[str, Any], pad_px: int) -> Image.Image:
+    box = v5_word_box(word)
+    if box is None:
+        return Image.new("L", image_size, 0)
+    x1, y1, x2, y2 = expand_bbox(box, image_size, pad_px)
+    mask = Image.new("L", image_size, 0)
+    draw = ImageDraw.Draw(mask)
+    draw.rectangle((x1, y1, x2, y2), fill=255)
+    return mask
+
+
+def build_v5_foreground_pixel_word_mask(image: Image.Image, word: dict[str, Any], dilation_px: int) -> Image.Image:
+    import cv2
+
+    box = v5_word_box(word)
+    if box is None:
+        return Image.new("L", image.size, 0)
+    x1, y1, x2, y2 = expand_bbox(box, image.size, 1)
+    if x2 <= x1 or y2 <= y1:
+        return Image.new("L", image.size, 0)
+    crop = np.array(image.crop((x1, y1, x2, y2)).convert("RGB"), dtype=np.uint8)
+    if crop.size == 0:
+        return Image.new("L", image.size, 0)
+
+    text_rgb = np.array(parse_hex_color(str(word.get("color") or "#111111")), dtype=np.float32)
+    crop_f = crop.astype(np.float32)
+    border_pixels = np.concatenate(
+        [
+            crop[0:1, :, :].reshape(-1, 3),
+            crop[-1:, :, :].reshape(-1, 3),
+            crop[:, 0:1, :].reshape(-1, 3),
+            crop[:, -1:, :].reshape(-1, 3),
+        ],
+        axis=0,
+    ).astype(np.float32)
+    bg_rgb = np.median(border_pixels, axis=0)
+    dist_to_text = np.linalg.norm(crop_f - text_rgb, axis=2)
+    dist_to_bg = np.linalg.norm(crop_f - bg_rgb, axis=2)
+    luma = crop_f[:, :, 0] * 0.299 + crop_f[:, :, 1] * 0.587 + crop_f[:, :, 2] * 0.114
+    text_luma = float(np.dot(text_rgb, [0.299, 0.587, 0.114]))
+    bg_luma = float(np.dot(bg_rgb, [0.299, 0.587, 0.114]))
+
+    foreground = (dist_to_text <= 76.0) & (dist_to_bg >= 18.0)
+    if text_luma >= 205 and bg_luma < text_luma - 30:
+        foreground |= (luma >= text_luma - 52.0) & (dist_to_bg >= 22.0)
+    elif text_luma <= 80 and bg_luma > text_luma + 30:
+        foreground |= (luma <= text_luma + 52.0) & (dist_to_bg >= 22.0)
+
+    mask_np = foreground.astype(np.uint8) * 255
+    if mask_np.max() == 0:
+        return Image.new("L", image.size, 0)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+    filtered = np.zeros_like(mask_np)
+    crop_area = max(1, mask_np.shape[0] * mask_np.shape[1])
+    for label in range(1, num_labels):
+        _, _, _, _, area = stats[label]
+        if area < 2:
+            continue
+        if area / crop_area > 0.36:
+            continue
+        filtered[labels == label] = 255
+    if filtered.max() == 0:
+        filtered = mask_np
+    kernel_size = max(1, min(7, int(dilation_px) * 2 + 1))
+    if kernel_size >= 3:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        filtered = cv2.dilate(filtered, kernel, iterations=1)
+    full = Image.new("L", image.size, 0)
+    full.paste(Image.fromarray(filtered, "L"), (x1, y1))
+    return full
+
+
 def build_v5_polygon_text_mask(image: Image.Image, block: TextBlock) -> tuple[Image.Image, dict[str, Any]]:
     masks: list[Image.Image] = []
     word_reports: list[dict[str, Any]] = []
@@ -14111,9 +14629,25 @@ def build_v5_polygon_text_mask(image: Image.Image, block: TextBlock) -> tuple[Im
         if not polygons:
             continue
         stroke_width = int(word.get("strokeWidth") or 0)
+        has_source_text_background = bool(word.get("hasTextBackground") and word.get("backgroundColor"))
+        is_numeric_claim = is_v5_marketing_numeric_source_word(word) and not has_source_text_background
+        is_large_heading = is_v5_large_heading_source_word(word, image.size) and not has_source_text_background
         dilation_px = stroke_width + 5 if word.get("outline") or stroke_width > 0 else int(os.getenv("ADAPTIFAI_V5_POLYGON_DILATION_PX", "5"))
+        if is_numeric_claim:
+            dilation_px = max(dilation_px, int(os.getenv("ADAPTIFAI_V5_NUMERIC_CLAIM_DILATION_PX", "8")))
+        if is_large_heading:
+            dilation_px = max(dilation_px, int(os.getenv("ADAPTIFAI_V5_HEADING_DILATION_PX", "9")))
         dilation_px = max(3, min(16, dilation_px))
-        word_mask = polygon_mask(image.size, polygons, dilation_px=dilation_px)
+        if has_source_text_background:
+            word_mask = build_v5_foreground_pixel_word_mask(image, word, min(3, dilation_px))
+            if not word_mask.getbbox():
+                word_mask = polygon_mask(image.size, polygons, dilation_px=min(3, dilation_px))
+        else:
+            word_mask = polygon_mask(image.size, polygons, dilation_px=dilation_px)
+        if is_numeric_claim or is_large_heading:
+            support_pad = max(2, min(8, dilation_px // 2))
+            support_mask = build_v5_word_box_support_mask(image.size, word, support_pad)
+            word_mask = ImageChops.lighter(word_mask.convert("L"), support_mask.convert("L"))
         masks.append(word_mask)
         word_reports.append(
             {
@@ -14121,6 +14655,8 @@ def build_v5_polygon_text_mask(image: Image.Image, block: TextBlock) -> tuple[Im
                 "outline": bool(word.get("outline")),
                 "strokeWidth": stroke_width,
                 "dilationPx": dilation_px,
+                "numericClaimSupport": bool(is_numeric_claim),
+                "largeHeadingSupport": bool(is_large_heading),
                 "polygonCount": len(polygons),
             }
         )
@@ -14561,6 +15097,52 @@ def scrub_provider_residuals_inside_mask(result: Image.Image, source: Image.Imag
     return fill_remaining_mask_components(result, source, mask.convert("L"))
 
 
+def restore_v5_masked_background_by_source_style(result: Image.Image, source: Image.Image, blocks: list[TextBlock]) -> Image.Image:
+    output = result.convert("RGB")
+    base = source.convert("RGB")
+    for block in blocks:
+        if block.render_strategy == "v5_numeric_bypass":
+            continue
+        for word in block.source_word_styles or []:
+            if not isinstance(word, dict):
+                continue
+            if is_v5_isolated_step_marker_word(word, [item for item in block.source_word_styles if isinstance(item, dict)]):
+                continue
+            box = v5_word_box(word)
+            if box is None:
+                continue
+            has_bg = bool(word.get("hasTextBackground") and word.get("backgroundColor"))
+            if has_bg:
+                word_mask = build_v5_foreground_pixel_word_mask(source, word, 2)
+                fill_rgb = parse_hex_color(str(word.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255))
+            else:
+                raw_polygons = word.get("symbolPolygons") or ([word.get("polygon")] if word.get("polygon") else [])
+                polygons: list[list[tuple[int, int]]] = []
+                for raw_polygon in raw_polygons:
+                    if not isinstance(raw_polygon, list):
+                        continue
+                    polygon = [
+                        (int(point[0]), int(point[1]))
+                        for point in raw_polygon
+                        if isinstance(point, (list, tuple)) and len(point) >= 2
+                    ]
+                    if len(polygon) >= 3 and polygon_area(polygon) > 1:
+                        polygons.append(polygon)
+                if not polygons:
+                    continue
+                word_mask = polygon_mask(source.size, polygons, dilation_px=3)
+                sample_box = expand_bbox(box, source.size, max(8, int((box[3] - box[1]) * 0.9)))
+                sample = np.array(base.crop(sample_box).convert("RGB"))
+                local_mask = np.array(word_mask.crop(sample_box).convert("L")) > 16
+                fill_rgb = dominant_background_fill_color(sample, local_mask)
+            if not word_mask.getbbox():
+                continue
+            patch = Image.new("RGB", output.size, fill_rgb)
+            hard_mask = Image.fromarray(np.where(np.array(word_mask.convert("L"), dtype=np.uint8) > 16, 255, 0).astype(np.uint8), "L")
+            output = Image.composite(patch, output, hard_mask)
+    return output
+
+
 def strict_local_fill_cleanup(source: Image.Image, mask: Image.Image, blocks: list[TextBlock]) -> tuple[Image.Image, dict[str, Any]]:
     base = source.convert("RGB")
     result = base.copy()
@@ -14654,6 +15236,13 @@ def inpaint_localize_v2_base(image: Image.Image, mask: Image.Image, blocks: list
         if blocks:
             meta["splitCleanup"] = {"provider": "replicate", "maskMode": "contour" if not split_small_overlay else "split"}
         cleaned = composite_provider_cleanup_over_source(image, replicate_result, mask)
+        if is_v5_polygon_pipeline:
+            restored = restore_v5_masked_background_by_source_style(cleaned, image, blocks or [])
+            return restored, {
+                **meta,
+                "maskedPolish": "disabled_for_v5_polygon_to_prevent_color_bleed",
+                "residualScrub": "v5_word_level_source_background_restore",
+            }
         scrubbed = scrub_provider_residuals_inside_mask(cleaned, image, mask)
         return polish_masked_cleanup_with_opencv(scrubbed, mask), {**meta, "maskedPolish": "opencv-telea", "residualScrub": "inside-character-mask"}
     if is_v5_polygon_pipeline:
@@ -14916,6 +15505,14 @@ def fit_v62_geometric_typesetting(
     box: tuple[int, int, int, int],
 ) -> dict[str, Any]:
     max_width = max(1, box[2] - box[0])
+    max_height = max(1, box[3] - box[1])
+    source_line_widths = [
+        max(1, int(line_box[2] - line_box[0]))
+        for line_box in (block.line_boxes or [])
+        if isinstance(line_box, (list, tuple)) and len(line_box) >= 4 and int(line_box[2]) > int(line_box[0])
+    ]
+    if len(source_line_widths) > 1:
+        max_width = min(max_width, max(source_line_widths) + max(6, int(max(source_line_widths) * 0.06)))
     source_heights = v62_source_word_height_map(block)
     fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
 
@@ -14937,64 +15534,95 @@ def fit_v62_geometric_typesetting(
             "score": 1000,
         }
 
-    full_line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in tokens)
-    full_line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, full_line_font_size)
-    honor_force_breaks = full_line_width > max_width
-
-    lines: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-
-    for token in tokens:
-        candidate = current + [token]
-        candidate_font_size = max(v62_token_source_height(item, source_heights, fallback_size) for item in candidate)
-        candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
-        if current and candidate_width > max_width:
-            lines.append(current)
-            current = [token]
-        else:
-            current = candidate
-        if honor_force_breaks and token.get("forceBreakAfter") and current:
-            lines.append(current)
-            current = []
-
-    if current:
-        lines.append(current)
-
-    line_layouts: list[dict[str, Any]] = []
-    widest = 0
-    total_height = 0
-
-    for line in lines:
-        line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
-        line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
-
-        # V6.4 KuralÄ±: SatÄ±r ArasÄ± Ezilmeyi Ã‡Ã¶z (Typographic Leading/Line-Height)
-        line_height_measured = max_ascent + max_descent
-        line_height = int(round(line_height_measured + (line_font_size * 0.25)))
-
-        widest = max(widest, line_width)
-        total_height += line_height
-        line_layouts.append(
-            {
-                "tokens": metrics,
-                "lineWidth": line_width,
-                "lineHeight": line_height,
-                "maxAscent": max_ascent,
-                "maxDescent": max_descent,
-                "lineFontSize": line_font_size,
-            }
-        )
     block_center_x = (box[0] + box[2]) / 2.0
-    return {
+    preferred_line_count = max(1, len([line for line in (block.line_texts or []) if str(line).strip()]) or 1)
+    best_layout: dict[str, Any] | None = None
+    min_scale = float(os.getenv("ADAPTIFAI_V5_RENDER_MIN_SCALE", "0.45"))
+    for scale_factor in np.linspace(1.0, max(0.38, min_scale), 20):
+        scaled_height = lambda token: max(1, int(round(v62_token_source_height(token, source_heights, fallback_size) * float(scale_factor))))
+        full_line_font_size = max(scaled_height(token) for token in tokens)
+        full_line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, full_line_font_size)
+        honor_force_breaks = full_line_width > max_width
+
+        lines: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        for token in tokens:
+            candidate = current + [token]
+            candidate_font_size = max(scaled_height(item) for item in candidate)
+            candidate_width, _, _, _ = v62_measure_tokens_with_line_font(draw, candidate, candidate_font_size)
+            if current and candidate_width > max_width:
+                lines.append(current)
+                current = [token]
+            else:
+                current = candidate
+            if honor_force_breaks and token.get("forceBreakAfter") and current:
+                lines.append(current)
+                current = []
+        if current:
+            lines.append(current)
+
+        line_layouts: list[dict[str, Any]] = []
+        widest = 0
+        total_height = 0
+        for line in lines:
+            line_font_size = max(scaled_height(token) for token in line)
+            line_width, metrics, max_ascent, max_descent = v62_measure_tokens_with_line_font(draw, line, line_font_size)
+            line_height_measured = max_ascent + max_descent
+            line_height = int(round(line_height_measured + (line_font_size * 0.25)))
+            widest = max(widest, line_width)
+            total_height += line_height
+            line_layouts.append(
+                {
+                    "tokens": metrics,
+                    "lineWidth": line_width,
+                    "lineHeight": line_height,
+                    "maxAscent": max_ascent,
+                    "maxDescent": max_descent,
+                    "lineFontSize": line_font_size,
+                }
+            )
+        overflow_x = max(0, widest - max_width)
+        vertical_limit = max_height if preferred_line_count <= 1 else int(round(max_height * 1.55))
+        overflow_y = max(0, total_height - vertical_limit)
+        if preferred_line_count > 1 and len(lines) < preferred_line_count:
+            overflow_y += max_height * (preferred_line_count - len(lines))
+        line_delta = abs(len(lines) - preferred_line_count)
+        line_count_underflow = max(0, preferred_line_count - len(lines))
+        score = (
+            1000.0
+            - overflow_x * 12.0
+            - overflow_y * 5.0
+            - line_delta * 28.0
+            - line_count_underflow * 180.0
+            - max(0.0, 1.0 - float(scale_factor)) * 260.0
+        )
+        if line_count_underflow > 0:
+            score -= 100000.0 * line_count_underflow
+        layout = {
+            "scaleFactor": float(scale_factor),
+            "lines": line_layouts,
+            "widest": widest,
+            "totalHeight": total_height,
+            "overflow": overflow_x + overflow_y,
+            "verticalOverflowAllowed": True,
+            "blockCenterX": block_center_x,
+            "typesetting": "v6.6-calibrated-rich-v5-fit",
+            "score": score,
+        }
+        if best_layout is None or score > float(best_layout.get("score", -999999)):
+            best_layout = layout
+        if overflow_x == 0 and overflow_y == 0 and line_delta == 0:
+            break
+    return best_layout or {
         "scaleFactor": 1.0,
-        "lines": line_layouts,
-        "widest": widest,
-        "totalHeight": total_height,
-        "overflow": max(0, widest - max_width),
+        "lines": [],
+        "widest": 0,
+        "totalHeight": 0,
+        "overflow": max_width,
         "verticalOverflowAllowed": True,
         "blockCenterX": block_center_x,
-        "typesetting": "v6.5-calibrated-rich-v5",
-        "score": 1000 - max(0, widest - max_width) * 10,
+        "typesetting": "v6.6-calibrated-rich-v5-fit",
+        "score": 0,
     }
 
 
@@ -15073,6 +15701,8 @@ def expand_v5_single_line_render_box(
     box: tuple[int, int, int, int],
     canvas_size: tuple[int, int],
 ) -> tuple[int, int, int, int]:
+    if any(isinstance(word, dict) and word.get("hasTextBackground") for word in (block.source_word_styles or [])):
+        return box
     if len([line for line in (block.line_texts or []) if str(line).strip()]) != 1:
         return box
     if len(block.translated_style_spans or []) != 1:
@@ -15088,7 +15718,8 @@ def expand_v5_single_line_render_box(
         return box
     line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in tokens)
     line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, tokens, line_font_size)
-    needed_width = min(max_width, max(source_width, line_width))
+    max_expanded_width = int(round(source_width * float(os.getenv("ADAPTIFAI_V5_RENDER_BOX_MAX_EXPAND", "1.18"))))
+    needed_width = min(max_width, max(source_width, min(line_width, max_expanded_width)))
     if needed_width <= source_width:
         return box
     center_x = (box[0] + box[2]) / 2.0
@@ -15109,6 +15740,8 @@ def expand_v5_render_box_for_line_fit(
     box: tuple[int, int, int, int],
     canvas_size: tuple[int, int],
 ) -> tuple[int, int, int, int]:
+    if any(isinstance(word, dict) and word.get("hasTextBackground") for word in (block.source_word_styles or [])):
+        return box
     source_heights = v62_source_word_height_map(block)
     fallback_size = max(1, int(block.font_size_estimate or default_typography_style(block).get("fontSize", 16)))
     lines: list[list[dict[str, Any]]] = []
@@ -15125,11 +15758,12 @@ def expand_v5_render_box_for_line_fit(
     if not lines:
         return box
     source_width = max(1, box[2] - box[0])
+    max_expanded_width = int(round(source_width * float(os.getenv("ADAPTIFAI_V5_RENDER_BOX_MAX_EXPAND", "1.18"))))
     needed_width = source_width
     for line in lines:
         line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
         line_width, _, _, _ = v62_measure_tokens_with_line_font(draw, line, line_font_size)
-        needed_width = max(needed_width, line_width)
+        needed_width = max(needed_width, min(line_width, max_expanded_width))
     if needed_width <= source_width:
         return box
     left, top, right, bottom = box
@@ -15188,6 +15822,18 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
                 layout = fit_styled_spans_strict(
                     draw, block.translated_style_spans, render_box, base_typography, honor_force_breaks=True, allow_vertical_overflow=False,
                 )
+            if is_v5 and layout.get("verticalOverflowAllowed"):
+                total_height = int(layout.get("totalHeight", 0))
+                bottom_limit = canvas.height - 2
+                if render_box[1] + total_height > bottom_limit:
+                    shift_up = min(render_box[1], render_box[1] + total_height - bottom_limit)
+                    if shift_up > 0:
+                        render_box = (
+                            render_box[0],
+                            render_box[1] - shift_up,
+                            render_box[2],
+                            max(render_box[3] - shift_up, render_box[1] - shift_up + 1),
+                        )
                 
             # precise_inline=True parametresi korundu
             _, span_render_boxes = render_styled_spans(draw, layout, render_box, alignment=block.align, precise_inline=True)
@@ -15269,9 +15915,11 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
     for image_path in image_paths(paths):
         source_image = Image.open(image_path).convert("RGB")
         vision_words = google_vision_word_blocks(image_path, source_image.size)
+        vision_words, supplemental_ocr_meta = supplement_v5_ocr_words(image_path, source_image.size, vision_words)
         if not vision_words:
             raise RuntimeError("V5 polygon localize requires Google Cloud Vision boundingPoly OCR, but no words were returned.")
         ocr_layout_blocks, protected_ocr_lines, v5_meta = group_v5_polygon_words(vision_words, source_image)
+        v5_meta["supplementalOcr"] = supplemental_ocr_meta
         for language in languages:
             payload = analyze_localize_v212_ocr_translations(ocr_layout_blocks, language)
             blocks = [
