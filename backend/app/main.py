@@ -8518,7 +8518,8 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
         return source_word_ids
 
     force_break_after = bool(span.get("forceBreakAfter", False))
-    keep_whole = role in {"percentage", "numeric_claim", "condition_or_topic", "brand/product_name"} and len(source_word_styles) <= 1
+    split_tokens_preview = [token for token in text.split() if token]
+    keep_whole = role in {"percentage", "numeric_claim", "brand/product_name"} and len(source_word_styles) <= 1 and len(split_tokens_preview) <= 2
     if "[BOLD]" in text or "[/BOLD]" in text:
         bold_tokens: list[dict[str, Any]] = []
         for segment_text, segment_bold in parse_bold_markup(text):
@@ -8536,7 +8537,7 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
         return bold_tokens
     if keep_whole:
         return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after}]
-    split_tokens = [token for token in text.split() if token]
+    split_tokens = split_tokens_preview
     assignments = source_style_for_tokens(split_tokens)
     tokens = [
         {
@@ -15537,7 +15538,8 @@ def fit_v62_geometric_typesetting(
     block_center_x = (box[0] + box[2]) / 2.0
     preferred_line_count = max(1, len([line for line in (block.line_texts or []) if str(line).strip()]) or 1)
     best_layout: dict[str, Any] | None = None
-    min_scale = float(os.getenv("ADAPTIFAI_V5_RENDER_MIN_SCALE", "0.45"))
+    has_text_background = any(isinstance(word, dict) and word.get("hasTextBackground") for word in (block.source_word_styles or []))
+    min_scale = float(os.getenv("ADAPTIFAI_V5_BG_RENDER_MIN_SCALE", "0.28")) if has_text_background else float(os.getenv("ADAPTIFAI_V5_RENDER_MIN_SCALE", "0.45"))
     for scale_factor in np.linspace(1.0, max(0.38, min_scale), 20):
         scaled_height = lambda token: max(1, int(round(v62_token_source_height(token, source_heights, fallback_size) * float(scale_factor))))
         full_line_font_size = max(scaled_height(token) for token in tokens)
@@ -15582,21 +15584,26 @@ def fit_v62_geometric_typesetting(
                 }
             )
         overflow_x = max(0, widest - max_width)
-        vertical_limit = max_height if preferred_line_count <= 1 else int(round(max_height * 1.55))
+        vertical_limit = max_height if preferred_line_count <= 1 or has_text_background else int(round(max_height * 1.55))
         overflow_y = max(0, total_height - vertical_limit)
-        if preferred_line_count > 1 and len(lines) < preferred_line_count:
+        oversized_background_text = 0
+        if has_text_background:
+            target_line_height = max(1, int(max_height * 0.78))
+            oversized_background_text = sum(max(0, int(line.get("lineHeight", 0)) - target_line_height) for line in line_layouts)
+        if preferred_line_count > 1 and len(lines) < preferred_line_count and not has_text_background:
             overflow_y += max_height * (preferred_line_count - len(lines))
         line_delta = abs(len(lines) - preferred_line_count)
         line_count_underflow = max(0, preferred_line_count - len(lines))
         score = (
             1000.0
             - overflow_x * 12.0
-            - overflow_y * 5.0
+            - overflow_y * (18.0 if has_text_background else 5.0)
+            - oversized_background_text * (24.0 if has_text_background else 0.0)
             - line_delta * 28.0
             - line_count_underflow * 180.0
-            - max(0.0, 1.0 - float(scale_factor)) * 260.0
+            - max(0.0, 1.0 - float(scale_factor)) * (90.0 if has_text_background else 260.0)
         )
-        if line_count_underflow > 0:
+        if line_count_underflow > 0 and not has_text_background:
             score -= 100000.0 * line_count_underflow
         layout = {
             "scaleFactor": float(scale_factor),
