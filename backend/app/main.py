@@ -9025,6 +9025,8 @@ def choose_render_fill_for_style(
 ) -> Any:
     if not (style.get("hasTextBackground") and style.get("backgroundColor")):
         return fallback_fill
+    if style.get("color"):
+        return style.get("color")
     if not hasattr(draw, "_image"):
         return fallback_fill
 
@@ -9109,6 +9111,15 @@ def render_styled_spans(
                 stroke_width=stroke_width,
             )
             fill = choose_render_fill_for_style(draw, (int(left), int(top), int(right), int(bottom)), token_style, fill)
+            if token_style.get("hasTextBackground") and token_style.get("backgroundColor"):
+                bg_pad_x = max(1, int(round(float(token_style.get("sourcePixelHeight") or line_font_size or 16) * 0.12)))
+                bg_pad_y = max(1, int(round(float(token_style.get("sourcePixelHeight") or line_font_size or 16) * 0.10)))
+                bg_left = max(0, int(round(x)) - bg_pad_x)
+                bg_top = max(0, int(top) - bg_pad_y)
+                bg_right = min(getattr(draw._image, "width", int(right)), int(right) + bg_pad_x)
+                bg_bottom = min(getattr(draw._image, "height", int(bottom)), int(bottom) + bg_pad_y)
+                if bg_right > bg_left and bg_bottom > bg_top:
+                    draw.rectangle((bg_left, bg_top, bg_right, bg_bottom), fill=token_style.get("backgroundColor"))
             if shadow and shadow.get("enabled"):
                 shadow_fill = shadow.get("color", "#000000")
                 shadow_offset = int(shadow.get("offset", 2))
@@ -15728,7 +15739,9 @@ def v62_source_word_height_map(block: TextBlock) -> dict[str, int]:
         if not source_id:
             continue
         box = word.get("bbox") or word.get("estimatedBbox") or []
-        if isinstance(box, list) and len(box) == 4:
+        if word.get("peerRowFontSize"):
+            height = max(1, int(word.get("peerRowFontSize") or word.get("fontSize") or block.font_size_estimate or 16))
+        elif isinstance(box, list) and len(box) == 4:
             height = max(1, int(box[3]) - int(box[1]))
         else:
             height = max(1, int(word.get("fontSize") or block.font_size_estimate or 16))
@@ -15929,10 +15942,8 @@ def fit_v62_geometric_typesetting(
                 }
             )
         overflow_x = max(0, widest - max_width)
-        vertical_limit = int(round(max_height * 1.35)) if has_text_background else (
-            max_height if preferred_line_count <= 1 else int(round(max_height * 1.55))
-        )
-        overflow_y = max(0, total_height - vertical_limit)
+        vertical_limit = int(round(max_height * 1.35)) if has_text_background else max_height
+        overflow_y = max(0, total_height - vertical_limit) if has_text_background else 0
         oversized_background_text = 0
         if has_text_background:
             target_line_height = max(1, int(round(max_height * 1.35)))
@@ -16116,7 +16127,11 @@ def expand_v5_render_box_for_line_fit(
     if not lines:
         return box
     source_width = max(1, box[2] - box[0])
-    max_expanded_width = int(round(source_width * float(os.getenv("ADAPTIFAI_V5_RENDER_BOX_MAX_EXPAND", "1.18"))))
+    single_source_line = len([line for line in (block.line_texts or []) if str(line).strip()]) == 1 and len(lines) == 1
+    if single_source_line:
+        max_expanded_width = max(1, canvas_size[0] - 12)
+    else:
+        max_expanded_width = int(round(source_width * float(os.getenv("ADAPTIFAI_V5_RENDER_BOX_MAX_EXPAND", "1.18"))))
     needed_width = source_width
     for line in lines:
         line_font_size = max(v62_token_source_height(token, source_heights, fallback_size) for token in line)
@@ -16126,7 +16141,18 @@ def expand_v5_render_box_for_line_fit(
         return box
     left, top, right, bottom = box
     if block.align == "left":
-        right = min(canvas_size[0], left + int(round(needed_width)))
+        if single_source_line:
+            center_x = (left + right) / 2.0
+            left = int(round(center_x - needed_width / 2.0))
+            right = left + int(round(needed_width))
+            if left < 0:
+                right -= left
+                left = 0
+            if right > canvas_size[0]:
+                left -= right - canvas_size[0]
+                right = canvas_size[0]
+        else:
+            right = min(canvas_size[0], left + int(round(needed_width)))
     else:
         center_x = (left + right) / 2.0
         left = int(round(center_x - needed_width / 2.0))
@@ -16200,12 +16226,18 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
                 if word.get("hasTextBackground") and word.get("backgroundColor")
             ]
             bg_rgb = tuple(int(np.median([color[index] for color in bg_values])) for index in range(3)) if bg_values else (255, 255, 255)
-            left = max(0, min(min(box[0] for box in boxes), block.bbox[0]) - 2)
-            top = max(0, min(box[1] for box in boxes))
-            right = min(canvas.width, max(max(box[2] for box in boxes), block.bbox[2]) + 2)
-            bottom = min(canvas.height, max(box[3] for box in boxes))
+            line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
+            pad_x = max(8, int(round(line_height * 0.55)))
+            pad_y = max(5, int(round(line_height * 0.45)))
+            left = max(0, min(min(box[0] for box in boxes), block.bbox[0]) - pad_x)
+            top = max(0, min(min(box[1] for box in boxes), block.bbox[1]) - pad_y)
+            right = min(canvas.width, max(max(box[2] for box in boxes), block.bbox[2]) + pad_x)
+            bottom = min(canvas.height, max(max(box[3] for box in boxes), block.bbox[3]) + pad_y)
             if right > left and bottom > top:
-                draw.rectangle((left, top, right, bottom), fill=rgb_to_hex(bg_rgb))
+                draw.rectangle(
+                    (left, top, right, bottom),
+                    fill=fill_color_around_box(canvas, (left, top, right, bottom), exclude_color=bg_rgb),
+                )
             continue
         line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
         pad_x = max(4, int(round(line_height * 0.35)))
@@ -16292,9 +16324,77 @@ def restore_v5_numeric_bypass_from_source(canvas: Image.Image, source: Image.Ima
         canvas.alpha_composite(source_rgba.crop(restore_box), restore_box[:2])
 
 
+def normalize_v5_peer_row_font_sizes(blocks: list[TextBlock]) -> None:
+    def block_source_font_max(block: TextBlock) -> int:
+        sizes: list[int] = []
+        for word in block.source_word_styles or []:
+            if not isinstance(word, dict):
+                continue
+            raw_size = word.get("fontSize")
+            if raw_size:
+                sizes.append(int(raw_size))
+                continue
+            raw_box = word.get("bbox")
+            if isinstance(raw_box, list) and len(raw_box) >= 4:
+                sizes.append(max(1, int(raw_box[3]) - int(raw_box[1])))
+        return max(sizes or [max(1, int(block.font_size_estimate or 16))])
+
+    candidates = [
+        block
+        for block in blocks
+        if is_v5_block(block)
+        and block.render_strategy != "v5_numeric_bypass"
+        and block_has_rich_text_segments(block)
+        and not any(isinstance(word, dict) and word.get("hasTextBackground") for word in (block.source_word_styles or []))
+    ]
+    groups: list[list[TextBlock]] = []
+    for block in sorted(candidates, key=lambda item: (item.bbox[1] + item.bbox[3]) / 2.0):
+        top, bottom = int(block.bbox[1]), int(block.bbox[3])
+        height = max(1, bottom - top)
+        placed = False
+        for group in groups:
+            group_top = min(int(item.bbox[1]) for item in group)
+            group_bottom = max(int(item.bbox[3]) for item in group)
+            overlap = max(0, min(bottom, group_bottom) - max(top, group_top))
+            if overlap / float(height) >= 0.45:
+                group.append(block)
+                placed = True
+                break
+        if not placed:
+            groups.append([block])
+
+    for group in groups:
+        if len(group) < 2:
+            continue
+        row_font_size = max(block_source_font_max(block) for block in group)
+        row_line_height = max(row_font_size + 2, int(round(row_font_size * 1.12)))
+        for block in group:
+            block.font_size_estimate = max(int(block.font_size_estimate or 0), row_font_size)
+            block.line_height_estimate = max(int(block.line_height_estimate or 0), row_line_height)
+            for word in block.source_word_styles or []:
+                if not isinstance(word, dict):
+                    continue
+                word["fontSize"] = row_font_size
+                word["peerRowFontSize"] = row_font_size
+                word["lineHeight"] = row_line_height
+
+            for span in block.translated_style_spans or []:
+                if not isinstance(span, dict):
+                    continue
+                style = span.get("style")
+                if isinstance(style, dict):
+                    style["fontSize"] = row_font_size
+                    style["lineHeight"] = row_line_height
+                for source_style in span.get("sourceWordStyles") or []:
+                    if isinstance(source_style, dict):
+                        source_style["fontSize"] = row_font_size
+                        source_style["lineHeight"] = row_line_height
+
+
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
+    normalize_v5_peer_row_font_sizes(blocks)
     
     # Global Y de?i?keni yerine ?izilmi? bloklar?n listesi (?oklu kolon deste?i)
     rendered_boxes: list[tuple[int, int, int, int]] = []
@@ -16328,7 +16428,7 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             base_typography = default_typography_style(block)
             
             if is_v5:
-                render_spans = order_v62_spans_for_source_background_slots(block, block.translated_style_spans)
+                render_spans = block.translated_style_spans
                 layout = fit_v62_geometric_typesetting(draw, block, render_spans, render_box)
             else:
                 layout = fit_styled_spans_strict(
