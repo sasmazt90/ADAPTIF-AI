@@ -15963,6 +15963,8 @@ def fit_v62_geometric_typesetting(
             "typesetting": "v6.6-calibrated-rich-v5-fit",
             "score": score,
         }
+        if float(scale_factor) == 1.0 and overflow_x == 0 and overflow_y == 0:
+            return layout
         if best_layout is None or score > float(best_layout.get("score", -999999)):
             best_layout = layout
         if overflow_x == 0 and overflow_y == 0 and line_delta == 0:
