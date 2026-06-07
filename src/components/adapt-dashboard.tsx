@@ -2191,7 +2191,7 @@ export function AdaptDashboard() {
                 <ResizeAssetPreview output={activeResizeOutput} />
               ) : mode === "resize" ? (
                 <div className="flex items-start justify-center overflow-auto px-4 py-8">
-                <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} previewTemplateId={activePreviewVariant.templateId} />
+                <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={0} y={0} opacity={opacity} scale={100} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} previewTemplateId={activePreviewVariant.templateId} />
                 </div>
               ) : (
                 <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
