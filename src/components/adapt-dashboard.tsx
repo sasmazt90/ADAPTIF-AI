@@ -50,6 +50,7 @@ type ConsentChoice = "necessary" | "all" | null;
 type Device = "mobile" | "desktop";
 type FitMode = "contain" | "cover" | "fill";
 type CreativeMode = "single" | "carousel";
+type ResizeResultView = "asset" | "preview";
 type PreviewMetadata = PlatformPreviewMetadata;
 type ProgressStage = { label: string; detail: string };
 type RunProgress = {
@@ -158,6 +159,15 @@ const previewVariantsByPlacement: Record<string, PreviewVariant[]> = {
 };
 
 function previewVariantsForPlacement(placementId: string) {
+  if (placementId.startsWith("gdn-")) {
+    const isMobileGdn = placementId === "gdn-320x50" || placementId === "gdn-320x100";
+    return [{
+      id: `${placementId}-desktop`,
+      label: "Google Display Network",
+      device: isMobileGdn ? "Mobile" : "Desktop",
+      templateId: placementId.replace("gdn-", "gdn_") as PreviewTemplateKind,
+    }];
+  }
   return previewVariantsByPlacement[placementId] ?? previewVariantsByPlacement["custom-display"];
 }
 const sampleCopy = {
@@ -499,13 +509,13 @@ function Creative({ placement, copy, mode, x, y, opacity, scale, fit, imageUrl }
           src={imageUrl}
           alt="Generated output"
           className={["absolute inset-0 h-full w-full", fit === "contain" ? "object-contain bg-[#f7f4ed]" : fit === "fill" ? "object-fill" : "object-cover"].join(" ")}
-          style={{ transform: `scale(${scale / 100})` }}
+          style={{ transform: `translate(${x}px, ${y}px) scale(${scale / 100})`, transformOrigin: "center center" }}
         />
       ) : (
         <>
           <div
             className={["absolute inset-0 bg-[linear-gradient(135deg,#f9f4e8_0%,#f0d553_34%,#38b6a6_72%,#172320_100%)]", fit === "fill" ? "blur-[1px]" : ""].join(" ")}
-            style={{ transform: `scale(${scale / 100})` }}
+            style={{ transform: `translate(${x}px, ${y}px) scale(${scale / 100})`, transformOrigin: "center center" }}
           />
           <div className="absolute left-[8%] top-[13%] h-[16%] w-[28%] rounded-full bg-white/70" />
           <div className="absolute bottom-[12%] right-[8%] h-[24%] w-[38%] rounded-sm bg-[#ee4d6a]/70" />
@@ -656,6 +666,28 @@ function PreviewMetadataForm({ metadata, onChange }: { metadata: PreviewMetadata
   );
 }
 
+function ResizeAssetPreview({ output }: { output?: PipelineOutput | null }) {
+  return (
+    <div className="flex min-h-[300px] items-start justify-center bg-[#f3f0e8] px-4 py-8">
+      {output?.download_url ? (
+        <div className="grid gap-3">
+          <div className="overflow-auto rounded-md border border-[#151515]/10 bg-white p-3 shadow-sm">
+            <img src={output.download_url} alt="Resized output" className="block h-auto max-h-[760px] max-w-full object-contain" />
+          </div>
+          <div className="mx-auto rounded-md bg-[#111] px-3 py-2 text-[10px] font-semibold text-white">
+            {output.width}x{output.height} resized asset
+          </div>
+        </div>
+      ) : (
+        <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
+          <Frame className="h-12 w-12 opacity-30" />
+          <p className="text-sm">Select placements and click <span className="font-semibold text-[#555]">Run Resize</span> to see the resized image.</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CreativeModeControl({
   placement,
   value,
@@ -722,7 +754,7 @@ function ProcessingProgress({ progress }: { progress: RunProgress }) {
 
 function PhoneChrome({ children, dark = false }: { children: ReactNode; dark?: boolean }) {
   return (
-    <div className="mx-auto h-[560px] w-[258px] shrink-0 rounded-[42px] border-[10px] border-[#111] bg-[#111] shadow-2xl sm:h-[610px] sm:w-[282px]">
+    <div className="mx-auto h-[610px] w-[282px] shrink-0 overflow-hidden rounded-[42px] border-[10px] border-[#111] bg-[#111] shadow-2xl">
       <div className={["relative h-full w-full overflow-hidden rounded-[31px]", dark ? "bg-[#050506]" : "bg-white"].join(" ")}>
         <div className="pointer-events-none absolute left-1/2 top-2 z-30 h-6 w-24 -translate-x-1/2 rounded-full bg-black/90" />
         {children}
@@ -736,6 +768,35 @@ function BrandAvatar({ label, className = "" }: { label: string; className?: str
     <div className={["grid place-items-center rounded-full bg-[#111] text-xs font-black text-white", className].join(" ")}>
       {label.slice(0, 1).toUpperCase()}
     </div>
+  );
+}
+
+function InstagramLogo({ compact = false }: { compact?: boolean }) {
+  if (compact) {
+    return (
+      <span className="grid h-8 w-8 place-items-center rounded-[9px] bg-[radial-gradient(circle_at_30%_110%,#feda75_0_24%,#fa7e1e_34%,#d62976_56%,#962fbf_76%,#4f5bd5_100%)]">
+        <span className="relative h-4 w-4 rounded-[5px] border-2 border-white">
+          <span className="absolute right-0.5 top-0.5 h-1 w-1 rounded-full bg-white" />
+        </span>
+      </span>
+    );
+  }
+  return <span className="font-serif text-[28px] font-black tracking-normal text-[#111]">Instagram</span>;
+}
+
+function LinkedInLogo({ compact = true }: { compact?: boolean }) {
+  return (
+    <span className={["grid place-items-center rounded bg-[#0a66c2] font-black text-white", compact ? "h-8 w-8 text-lg" : "h-10 w-10 text-2xl"].join(" ")}>
+      in
+    </span>
+  );
+}
+
+function FacebookLogo({ compact = true }: { compact?: boolean }) {
+  return (
+    <span className={["grid place-items-center rounded-full bg-[#1877f2] font-black text-white", compact ? "h-9 w-9 text-2xl" : "h-10 w-10 text-3xl"].join(" ")}>
+      f
+    </span>
   );
 }
 
@@ -777,7 +838,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
   const framedCreative = <AdFrame placement={placement}>{asset}</AdFrame>;
   let shell: ReactNode = null;
 
-  if (shellTemplateId === "social_feed_square" || shellTemplateId === "social_feed_portrait") {
+  if (shellTemplateId === "social_feed_square" || shellTemplateId === "social_feed_portrait" || shellTemplateId === "instagram_feed") {
     shell = (
       <PhoneChrome>
         <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
@@ -785,7 +846,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
           <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
         </div>
         <div className="flex items-center justify-between border-b border-[#eceff3] px-4 py-2">
-          <p className="font-serif text-[28px] font-black tracking-normal">Instagram</p>
+          <InstagramLogo />
           <div className="flex items-center gap-4"><Heart className="h-6 w-6" /><Send className="h-6 w-6" /></div>
         </div>
         <div className="flex items-center justify-between px-4 py-3">
@@ -841,7 +902,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
           <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
         </div>
         <div className="flex items-center gap-3 border-b border-[#d6d9de] bg-white px-4 py-3">
-          <div className="grid h-8 w-8 place-items-center rounded bg-[#0a66c2] text-lg font-black text-white">in</div>
+          <LinkedInLogo />
           <div className="flex h-8 flex-1 items-center gap-2 rounded-md bg-[#eef3f8] px-3 text-[#586069]"><Search className="h-4 w-4" /><span className="text-xs">Search</span></div>
           <MessageCircle className="h-5 w-5 text-[#555]" />
         </div>
@@ -864,7 +925,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
     shell = (
       <div className="mx-auto w-full max-w-[900px] overflow-hidden rounded-xl border border-[#d6d9de] bg-[#f3f2ef] shadow-xl">
         <div className="flex items-center gap-6 border-b border-[#d6d9de] bg-white px-6 py-3">
-          <div className="grid h-10 w-10 place-items-center rounded bg-[#0a66c2] text-2xl font-black text-white">in</div>
+          <LinkedInLogo compact={false} />
           <div className="flex h-10 flex-1 items-center gap-2 rounded-md bg-[#eef3f8] px-3 text-[#586069]"><Search className="h-4 w-4" /><span className="text-sm">Search</span></div>
           <Home className="h-5 w-5 text-[#555]" /><Users className="h-5 w-5 text-[#555]" /><BriefcaseBusiness className="h-5 w-5 text-[#555]" /><MessageCircle className="h-5 w-5 text-[#555]" /><Bell className="h-5 w-5 text-[#555]" />
         </div>
@@ -881,7 +942,29 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
         </div>
       </div>
     );
-  } else if (shellTemplateId === "google_responsive_landscape" || shellTemplateId === "google_responsive_square" || shellTemplateId === "google_responsive_vertical") {
+  } else if (shellTemplateId === "google_responsive_vertical" && device === "mobile") {
+    shell = (
+      <PhoneChrome>
+        <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
+          <span>10:11</span>
+          <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
+        </div>
+        <div className="border-b border-[#e6e8ec] bg-white px-4 py-3">
+          <div className="flex h-8 items-center gap-2 rounded-full border border-[#dfe1e5] bg-[#f8fafd] px-3 text-[11px] text-[#5f6368]">
+            <Globe2 className="h-3.5 w-3.5" />
+            <span>publisher.example</span>
+          </div>
+        </div>
+        <div className="bg-[#f8fafc] px-4 py-3 text-[11px] font-bold uppercase text-[#5f6368]">Advertisement</div>
+        <div className="px-4">{framedCreative}</div>
+        <div className="space-y-2 px-4 py-3">
+          <p className="text-[14px] font-black">{metadata.headline}</p>
+          <p className="text-[12px] leading-4 text-[#5f6368]">{metadata.description}</p>
+          <button type="button" className="rounded bg-[#1a73e8] px-3 py-1.5 text-[11px] font-bold text-white">{metadata.ctaText}</button>
+        </div>
+      </PhoneChrome>
+    );
+  } else if (shellTemplateId === "google_responsive_landscape" || shellTemplateId === "google_responsive_square") {
     shell = (
       <div className="mx-auto w-full max-w-[880px] overflow-hidden rounded-xl border border-[#dfe1e5] bg-white shadow-xl">
         <div className="flex items-center gap-2 border-b border-[#dfe1e5] bg-[#f8fafd] px-4 py-2 text-xs text-[#5f6368]">
@@ -901,10 +984,19 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
 
   if (!shell && shellTemplateId === "facebook_feed") {
     shell = (
-      <div className="mx-auto w-full max-w-[440px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
+      <PhoneChrome>
+      <div className="h-full overflow-auto bg-white">
+        <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
+          <span>10:11</span>
+          <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
+        </div>
+        <div className="flex items-center gap-3 border-b border-[#eff2f7] px-4 py-3">
+          <FacebookLogo />
+          <div className="flex h-9 flex-1 items-center gap-2 rounded-full bg-[#f0f2f5] px-3 text-[12px] text-[#65676b]"><Search className="h-4 w-4" /><span>Search Facebook</span></div>
+        </div>
         <div className="flex items-center justify-between border-b border-[#eff2f7] px-4 py-3">
           <div className="flex items-center gap-2">
-            <div className="grid h-9 w-9 place-items-center rounded-full bg-[#1877f2] text-xs font-black text-white">{metadata.brandName.slice(0, 1)}</div>
+            <BrandAvatar label={metadata.brandName} className="h-9 w-9" />
             <div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
           </div>
           <span className="text-[#666]">•••</span>
@@ -919,13 +1011,15 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
           <span>Like</span><span>Comment</span><span>Share</span>
         </div>
       </div>
+      </PhoneChrome>
     );
   } else if (!shell && (shellTemplateId === "social_feed_square" || shellTemplateId === "social_feed_portrait" || shellTemplateId === "instagram_feed")) {
     shell = (
-      <div className="mx-auto w-full max-w-[420px] overflow-hidden rounded-[28px] border border-[#151515]/10 bg-white shadow-xl">
+      <PhoneChrome>
+      <div className="h-full overflow-auto bg-white">
         <div className="flex items-center justify-between px-4 py-3">
           <div className="flex items-center gap-2">
-            <div className="grid h-8 w-8 place-items-center rounded-full bg-[#151515] text-xs font-black text-white">{metadata.brandName.slice(0, 1)}</div>
+            <InstagramLogo compact />
             <div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
           </div>
           <span className="text-[#666]">•••</span>
@@ -942,18 +1036,21 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
           <button type="button" className="mt-2 rounded-full bg-[#2550a8] px-4 py-2 text-[11px] font-bold text-white">{metadata.ctaText}</button>
         </div>
       </div>
+      </PhoneChrome>
     );
   } else if (!shell && (shellTemplateId === "story_image" || shellTemplateId === "instagram_story")) {
     shell = (
-      <div className="relative mx-auto w-full max-w-[300px] overflow-hidden rounded-[36px] border-[10px] border-[#111] bg-black shadow-2xl">
+      <PhoneChrome dark>
+      <div className="relative h-full">
         <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 5 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
         <div className="absolute left-4 right-4 top-6 z-20 flex items-center justify-between text-white">
           <div className="flex items-center gap-2"><div className="grid h-8 w-8 place-items-center rounded-full bg-white/20 text-xs font-black">{metadata.brandName.slice(0, 1)}</div><div><p className="text-[12px] font-bold">{metadata.username}</p><p className="text-[10px] text-white/70">{metadata.sponsorLabel}</p></div></div>
           <span className="text-lg">×</span>
         </div>
-        <div className="relative">{asset}</div>
+        <div className="absolute inset-0">{asset}</div>
         <div className="absolute inset-x-4 bottom-4 z-20 rounded-full bg-white px-4 py-3 text-center text-[12px] font-black text-[#111] shadow-lg">{metadata.ctaText}</div>
       </div>
+      </PhoneChrome>
     );
   } else if (shellTemplateId === "instagram_reels") {
     shell = (
@@ -1091,7 +1188,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
     shell = (
       <div className="mx-auto w-full max-w-[560px] overflow-hidden rounded-2xl border border-[#d8dce6] bg-white shadow-xl">
         <div className="flex items-center gap-3 border-b border-[#eff2f7] px-4 py-3">
-          <div className="grid h-9 w-9 place-items-center rounded-full bg-[#0a66c2] text-xs font-black text-white">in</div>
+          <LinkedInLogo />
           <div><p className="text-[12px] font-bold">{metadata.brandName}</p><p className="text-[10px] text-[#666]">{metadata.sponsorLabel}</p></div>
         </div>
         <div className="p-3">{framedCreative}</div>
@@ -1107,21 +1204,24 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
     );
   } else if (shellTemplateId === "snap_top_snap") {
     shell = (
-      <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
-        <div className="pointer-events-none absolute left-1/2 top-2 z-20 h-5 w-24 -translate-x-1/2 rounded-full bg-black/85" />
-        <div className="overflow-hidden rounded-[28px]">{asset}</div>
+      <PhoneChrome dark>
+      <div className="relative h-full bg-[#fffc00]">
+        <div className="absolute inset-0">{asset}</div>
         <div className="absolute left-4 right-4 top-6 z-20 flex justify-between text-[10px] font-bold text-white"><span>{metadata.brandName}</span><span>{metadata.sponsorLabel}</span></div>
         <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
       </div>
+      </PhoneChrome>
     );
   } else if (shellTemplateId === "snap_story_ad") {
     shell = (
-      <div className="relative mx-auto w-[236px] overflow-hidden rounded-[36px] border-[9px] border-[#111] bg-[#fffc00] shadow-2xl">
+      <PhoneChrome dark>
+      <div className="relative h-full bg-[#fffc00]">
         <div className="absolute inset-x-4 top-3 z-20 flex gap-1">{Array.from({ length: 4 }).map((_, index) => <span key={index} className={["h-1 flex-1 rounded-full", index === 0 ? "bg-white" : "bg-white/35"].join(" ")} />)}</div>
-        <div className="overflow-hidden rounded-[28px]">{asset}</div>
+        <div className="absolute inset-0">{asset}</div>
         <div className="absolute left-4 right-4 top-6 z-20 flex justify-between text-[10px] font-bold text-white"><span>{metadata.brandName}</span><span>{metadata.sponsorLabel}</span></div>
         <div className="absolute bottom-4 left-6 right-6 z-20 rounded-full bg-white px-3 py-2 text-center text-[10px] font-black">{metadata.ctaText}</div>
       </div>
+      </PhoneChrome>
     );
   } else if (!shell && (shellTemplateId === "google_responsive_landscape" || shellTemplateId === "google_responsive_square" || shellTemplateId === "google_responsive_vertical")) {
     shell = (
@@ -1140,6 +1240,22 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
           </div>
         </div>
       </div>
+    );
+  } else if ((shellTemplateId === "gdn_320x50" || shellTemplateId === "gdn_320x100") && device === "mobile") {
+    shell = (
+      <PhoneChrome>
+        <div className="flex h-10 items-end justify-between px-5 pb-2 text-[12px] font-semibold text-[#111]">
+          <span>10:11</span>
+          <span className="flex items-center gap-1"><span className="h-2.5 w-4 rounded-sm border border-[#111]" /><span>5G</span></span>
+        </div>
+        <div className="space-y-3 bg-white px-4 py-3">
+          <div className="flex h-8 items-center gap-2 rounded-full border border-[#dfe1e5] bg-[#f8fafd] px-3 text-[11px] text-[#5f6368]"><Globe2 className="h-3.5 w-3.5" /> publisher.example</div>
+          <div className="h-20 rounded-lg bg-[#f1f3f4]" />
+          <div className="text-[10px] font-bold uppercase text-[#5f6368]">Advertisement</div>
+          {framedCreative}
+          <div className="h-40 rounded-lg bg-[#f1f3f4]" />
+        </div>
+      </PhoneChrome>
     );
   } else if (shellTemplateId === "gdn_300x250") {
     shell = (
@@ -1203,7 +1319,7 @@ function Preview({ placement, mode, device, copy, x, y, opacity, scale, fit, ima
   }
 
   return (
-    <div className="flex min-h-[300px] max-h-[calc(100svh-230px)] flex-col justify-center gap-2 overflow-hidden bg-[#f3f0e8] p-2">
+    <div className="flex min-h-[300px] flex-col justify-center gap-2 overflow-visible bg-[#f3f0e8] p-4">
       {shell}
       <div className="mx-auto flex w-full max-w-[540px] justify-between rounded-md bg-[#111] px-3 py-2 text-[10px] text-white">
         <span>{template.placementType} / {placement.width}x{placement.height}</span>
@@ -1327,6 +1443,7 @@ export function AdaptDashboard() {
   const [textItalic, setTextItalic] = useState(false);
   const [textUnderline, setTextUnderline] = useState(false);
   const [textStrike, setTextStrike] = useState(false);
+  const [resizeResultView, setResizeResultView] = useState<ResizeResultView>("asset");
   const [isDraggingPreview, setIsDraggingPreview] = useState(false);
   const previewDragRef = useRef<{ mouseX: number; mouseY: number; startX: number; startY: number } | null>(null);
   const [fit, setFit] = useState<FitMode>("cover");
@@ -2021,11 +2138,23 @@ export function AdaptDashboard() {
           )}
         </aside>
 
-        <section className="overflow-hidden rounded-md border border-[#151515]/10 bg-white">
+        <section className="overflow-visible rounded-md border border-[#151515]/10 bg-white">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#151515]/10 px-4 py-3">
             <div><h2 className="font-semibold">{mode === "adapt" ? "Localize Result" : "Resize Result"}</h2><p className="text-xs text-[#666]">{mode === "adapt" ? "Localized creative preview without platform template chrome" : "Selected placement rendered inside platform UI with safe-zone masks"}</p></div>
             {mode === "resize" && (
               <div className="flex flex-wrap items-center gap-2">
+                <div className="grid grid-cols-2 gap-1 rounded-md bg-[#f1eee6] p-1">
+                  {(["asset", "preview"] as const).map((item) => (
+                    <button
+                      key={item}
+                      type="button"
+                      onClick={() => setResizeResultView(item)}
+                      className={["h-9 rounded px-3 text-xs font-semibold transition", resizeResultView === item ? "bg-[#151515] text-white" : "text-[#555] hover:bg-white"].join(" ")}
+                    >
+                      {item === "asset" ? "Resized image" : "Platform preview"}
+                    </button>
+                  ))}
+                </div>
                 {resizeSourceNames.length > 1 && (
                   <select className="h-9 rounded-md border border-[#151515]/15 bg-white px-3 text-xs font-semibold outline-none focus:border-[#0f766e]" value={effectiveResizeSource} onChange={(e) => setActiveResizeSource(e.target.value)}>
                     {resizeSourceNames.map((sourceName) => <option key={sourceName} value={sourceName}>{sourceName}</option>)}
@@ -2057,16 +2186,20 @@ export function AdaptDashboard() {
               onNext={() => selectOutput(activeOutputIndex + 1)}
             />
           ) : (
-            <div className="flex items-center justify-center overflow-x-auto py-6">
-              {mode === "resize" ? (
+            <>
+              {resizeResultView === "asset" ? (
+                <ResizeAssetPreview output={activeResizeOutput} />
+              ) : mode === "resize" ? (
+                <div className="flex items-start justify-center overflow-auto px-4 py-8">
                 <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={x} y={y} opacity={opacity} scale={scale} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} previewTemplateId={activePreviewVariant.templateId} />
+                </div>
               ) : (
                 <div className="flex flex-col items-center gap-3 py-16 text-[#aaa]">
                   <Frame className="h-12 w-12 opacity-30" />
                   <p className="text-sm">Select placements and click <span className="font-semibold text-[#555]">Run Resize</span> to see the preview.</p>
                 </div>
               )}
-            </div>
+            </>
           )}
           <div className="border-t border-[#151515]/10 p-4">
             {error && <div className="mb-3 flex gap-2 rounded-md bg-[#fff0d8] p-3 text-sm text-[#6b3b00]"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />{error}</div>}

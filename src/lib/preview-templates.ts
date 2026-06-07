@@ -26,8 +26,13 @@ export type PreviewTemplateKind =
   | "gdn_300x250"
   | "gdn_728x90"
   | "gdn_160x600"
+  | "gdn_120x600"
   | "gdn_320x50"
+  | "gdn_320x100"
   | "gdn_300x600"
+  | "gdn_336x280"
+  | "gdn_970x250"
+  | "gdn_300x1050"
   | "youtube_instream"
   | "youtube_shorts"
   | "custom_display";
@@ -100,14 +105,15 @@ export function derivePreviewMetadata(
   sourceName: string | undefined,
   userIdentity: string,
 ): PreviewMetadata {
+  void sourceName;
+  void userIdentity;
   const lines = (translatedText ?? "")
     .split(/\n+/)
     .map((line) => line.trim())
     .filter(Boolean);
   const schemaPlacement = sharedPreviewPlacementMap[placement.id];
-  const brandSeed = sourceName?.replace(/\.[^.]+$/, "") ?? "AdaptifAI";
-  const brandName = toTitleCase(brandSeed.split(/[-_]/).slice(0, 2).join(" ") || "AdaptifAI");
-  const username = userIdentity.includes("@") ? userIdentity.split("@")[0] : userIdentity;
+  const brandName = "ADAPTIF-AI";
+  const username = "ADAPTIF-AI";
   const headline = lines.slice(0, Math.min(2, lines.length)).join(" ").trim() || "Localized campaign headline";
   const description = lines.slice(2).join(" ").trim() || "Adapted creative placed inside a native platform preview.";
   const ctaByPlacement: Record<string, string> = {
@@ -135,8 +141,13 @@ export function derivePreviewMetadata(
     "gdn-300x250": "Open",
     "gdn-728x90": "Open",
     "gdn-160x600": "Open",
+    "gdn-120x600": "Open",
     "gdn-320x50": "Open",
+    "gdn-320x100": "Open",
     "gdn-300x600": "Open",
+    "gdn-336x280": "Open",
+    "gdn-970x250": "Open",
+    "gdn-300x1050": "Open",
     "youtube-instream": "Learn More",
     "youtube-shorts": "Shop Now",
     "custom-display": "Read More",
