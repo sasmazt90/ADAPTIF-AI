@@ -2402,7 +2402,11 @@ def preserve_visual_heading_span_order(block: TextBlock, spans: list[dict[str, A
         return min(source_style_line_index(style) for style in styles)
 
     ordered = sorted(enumerate(spans), key=lambda item: (span_line_index(item[1]), item[0]))
-    result = [{**span, "forceBreakAfter": index < len(ordered) - 1} for index, (_original_index, span) in enumerate(ordered)]
+    result: list[dict[str, Any]] = []
+    for index, (_original_index, span) in enumerate(ordered):
+        current_line = span_line_index(span)
+        next_line = span_line_index(ordered[index + 1][1]) if index < len(ordered) - 1 else current_line
+        result.append({**span, "forceBreakAfter": index < len(ordered) - 1 and current_line != next_line})
     return result
 
 
@@ -8598,6 +8602,7 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
 
     force_break_after = bool(span.get("forceBreakAfter", False))
     split_tokens_preview = [token for token in text.split() if token]
+    punctuation_only = bool(re.fullmatch(r"[!?.,;:%]+", text))
     keep_whole = role in {"percentage", "numeric_claim", "brand/product_name"} and len(source_word_styles) <= 1 and len(split_tokens_preview) <= 2
     if "[BOLD]" in text or "[/BOLD]" in text:
         bold_tokens: list[dict[str, Any]] = []
@@ -8615,7 +8620,7 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
             bold_tokens[-1]["forceBreakAfter"] = force_break_after
         return bold_tokens
     if keep_whole:
-        return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after}]
+        return [{"text": text, "style": style, "role": role, "sourceWordIds": source_word_ids, "forceBreakAfter": force_break_after, "noSpaceBefore": punctuation_only}]
     split_tokens = split_tokens_preview
     assignments = source_style_for_tokens(split_tokens)
     tokens = [
@@ -8625,6 +8630,7 @@ def tokenize_style_span(span: dict[str, Any]) -> list[dict[str, Any]]:
             "role": role,
             "sourceWordIds": token_source_ids_from_source(source_style),
             "forceBreakAfter": False,
+            "noSpaceBefore": bool(re.fullmatch(r"[!?.,;:%]+", token)),
         }
         for token, source_style in zip(split_tokens, assignments, strict=False)
     ]
@@ -14278,6 +14284,15 @@ def natural_language_violations(payload: dict[str, Any], candidates: list[TextBl
                     "reason": "literal_turkish_skin_possessive_label",
                 }
             )
+        if target_language.upper() == "TR" and ("&" in translated or re.search(r"\s/\s", translated)):
+            violations.append(
+                {
+                    "id": block.id,
+                    "sourceText": block.text,
+                    "translatedText": translated,
+                    "reason": "literal_symbol_punctuation_in_turkish_copy",
+                }
+            )
         for word in block.source_word_styles or []:
             if not isinstance(word, dict):
                 continue
@@ -14323,6 +14338,61 @@ def repair_turkish_skin_label_text(text: str, source_text: str) -> str:
         flags=re.IGNORECASE,
     )
     return repaired
+
+
+def normalize_translated_punctuation_spacing(text: str) -> str:
+    repaired = re.sub(r"\s+([!?.,;:%])", r"\1", text or "")
+    repaired = re.sub(r"([¿¡])\s+", r"\1", repaired)
+    return repaired
+
+
+def normalize_payload_punctuation_spacing(payload: dict[str, Any]) -> dict[str, Any]:
+    items = payload.get("blocks", [])
+    if not isinstance(items, list):
+        return payload
+    changed = False
+    normalized_items: list[Any] = []
+    for item in items:
+        if not isinstance(item, dict):
+            normalized_items.append(item)
+            continue
+        updated = dict(item)
+        for key in ("translated_text", "text", "translatedText"):
+            if key in updated and isinstance(updated.get(key), str):
+                value = normalize_translated_punctuation_spacing(str(updated.get(key) or ""))
+                if value != updated.get(key):
+                    updated[key] = value
+                    changed = True
+        lines = updated.get("lines")
+        if isinstance(lines, list):
+            normalized_lines: list[Any] = []
+            for line in lines:
+                if not isinstance(line, dict):
+                    normalized_lines.append(line)
+                    continue
+                line_copy = dict(line)
+                segments = line_copy.get("segments")
+                if isinstance(segments, list):
+                    normalized_segments: list[Any] = []
+                    for segment in segments:
+                        if not isinstance(segment, dict):
+                            normalized_segments.append(segment)
+                            continue
+                        segment_copy = dict(segment)
+                        for key in ("text", "translatedText"):
+                            if key in segment_copy and isinstance(segment_copy.get(key), str):
+                                value = normalize_translated_punctuation_spacing(str(segment_copy.get(key) or ""))
+                                if value != segment_copy.get(key):
+                                    segment_copy[key] = value
+                                    changed = True
+                        normalized_segments.append(segment_copy)
+                    line_copy["segments"] = normalized_segments
+                normalized_lines.append(line_copy)
+            updated["lines"] = normalized_lines
+        normalized_items.append(updated)
+    if changed:
+        return {**payload, "blocks": normalized_items, "punctuationSpacingNormalized": True}
+    return payload
 
 
 def repair_target_language_morphology(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> dict[str, Any]:
@@ -14383,7 +14453,8 @@ def repair_target_language_morphology(payload: dict[str, Any], candidates: list[
 
 def finalize_v212_translation_payload(payload: dict[str, Any], candidates: list[TextBlock], target_language: str) -> dict[str, Any]:
     punctuated = repair_missing_expressive_punctuation(payload, candidates)
-    return repair_target_language_morphology(punctuated, candidates, target_language)
+    spaced = normalize_payload_punctuation_spacing(punctuated)
+    return repair_target_language_morphology(spaced, candidates, target_language)
 
 
 def repair_missing_expressive_punctuation(payload: dict[str, Any], candidates: list[TextBlock]) -> dict[str, Any]:
@@ -14466,6 +14537,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
             "HARD RULE: Pure numeric step/bullet markers are not included in input_blocks. If a number is present here, it is part of marketing or instructional copy and must be localized with the surrounding sentence.",
             "HARD RULE: Do not preserve source line order when it harms target-language grammar. Decide target lines only after semantic translation.",
             "HARD RULE: Preserve expressive punctuation exactly or with a target-language equivalent. Every source ! must remain ! in the target, every source ? must remain ?. Validate before returning JSON.",
+            "HARD RULE: Do not preserve connector symbols literally when they are unnatural in the target language. For Turkish, translate '&' as 've' when it means 'and', and convert slash alternatives into natural wording unless the slash is a required product/SKU token.",
             "Return target-language copy as lines[].segments[]. Target lines may differ from source lines when grammar requires it.",
             "HARD RULE: For every target segment, set source_word_ids to one or more source_words ids whose meaning/emphasis the segment inherited.",
             "HARD RULE: source_word_ids must be the exact semantic counterpart of the target segment, not the entire source line. Example: if source is 'Soak a cotton pad with SÃ©bium H2O', Turkish target 'Pamuk pedi' inherits the grey/black source words 'a cotton pad', target 'SÃ©bium H2O ile' inherits the product/with source words, and target 'Ä±slatÄ±n' inherits only 'Soak'.",
@@ -14494,7 +14566,7 @@ def analyze_localize_v212_ocr_translations(blocks: list[TextBlock], target_langu
                 if natural_language_violations(parsed, candidates, target_language):
                     retry_prompt = {
                         **prompt,
-                        "retry_reason": "Previous response violated natural target-language wording. For Turkish, do not carry English articles such as 'a/an' into literal 'Bir ...' unless the meaning is numeric one. Rewrite as natural Turkish while preserving source_word_ids style mapping.",
+                        "retry_reason": "Previous response violated natural target-language wording. For Turkish, do not carry English articles such as 'a/an' into literal 'Bir ...' unless the meaning is numeric one, and do not keep '&' or spaced slash connectors when Turkish natural copy should use words. Rewrite naturally while preserving source_word_ids style mapping.",
                         "previous_response": parsed,
                     }
                     retry = generate_vertex_gemini_json(retry_prompt, timeout=int(os.getenv("VERTEX_GEMINI_TIMEOUT", "55")))
@@ -15650,11 +15722,12 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
 
         token_text = token["text"]
 
-        # KESÄ°N MATEMATÄ°K: Kelime ve boÅŸluk geniÅŸliÄŸini ayrÄ± ayrÄ± topla
+        next_token = tokens[index + 1] if index < len(tokens) - 1 else None
+        add_trailing_space = bool(next_token) and not bool(next_token.get("noSpaceBefore"))
         try:
-            width = draw.textlength(token_text, font=font) + draw.textlength(" ", font=font)
+            width = draw.textlength(token_text, font=font) + (draw.textlength(" ", font=font) if add_trailing_space else 0.0)
         except AttributeError:
-            width = text_width(draw, token_text, font) + text_width(draw, " ", font)
+            width = text_width(draw, token_text, font) + (text_width(draw, " ", font) if add_trailing_space else 0.0)
 
         line_width += width
         max_ascent = max(max_ascent, ascent)
@@ -15669,15 +15742,9 @@ def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[di
             "style": style,
             "role": token.get("role", "benefit"),
             "text": token["text"],
-            "xAdvance": width,  # Ä°lerleme Ã¶lÃ§Ã¼sÃ¼nÃ¼ aÃ§Ä±kÃ§a render dÃ¶ngÃ¼sÃ¼ne aktar
+            "xAdvance": width,
+            "noSpaceBefore": bool(token.get("noSpaceBefore")),
         })
-
-    if metrics:
-        try:
-            last_space = draw.textlength(" ", font=metrics[-1]["font"])
-        except AttributeError:
-            last_space = text_width(draw, " ", metrics[-1]["font"])
-        line_width = max(0.0, line_width - last_space)
 
     return int(round(line_width)), metrics, max_ascent, max_descent
 
@@ -15767,11 +15834,13 @@ def fit_v62_geometric_typesetting(
                 }
             )
         overflow_x = max(0, widest - max_width)
-        vertical_limit = max_height if preferred_line_count <= 1 or has_text_background else int(round(max_height * 1.55))
+        vertical_limit = int(round(max_height * 1.35)) if has_text_background else (
+            max_height if preferred_line_count <= 1 else int(round(max_height * 1.55))
+        )
         overflow_y = max(0, total_height - vertical_limit)
         oversized_background_text = 0
         if has_text_background:
-            target_line_height = max(1, int(max_height * 0.78))
+            target_line_height = max(1, int(round(max_height * 1.35)))
             oversized_background_text = sum(max(0, int(line.get("lineHeight", 0)) - target_line_height) for line in line_layouts)
         if preferred_line_count > 1 and len(lines) < preferred_line_count and not has_text_background:
             overflow_y += max_height * (preferred_line_count - len(lines))
