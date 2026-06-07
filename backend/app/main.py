@@ -1882,7 +1882,9 @@ def analyze_text_decoration_traits(raw_mask: np.ndarray, text_mask: np.ndarray) 
                 continue
             slopes.append(slope)
         if slopes:
-            italic = abs(float(np.median(slopes))) >= 0.16
+            median_slope = float(np.median(slopes))
+            same_direction = sum(1 for slope in slopes if (slope < 0) == (median_slope < 0)) / max(1, len(slopes))
+            italic = len(slopes) >= 2 and same_direction >= 0.72 and abs(median_slope) >= 0.32
 
     return {"isItalic": bool(italic), "isUnderlined": bool(underline), "isStrikethrough": bool(strike)}
 
@@ -10988,18 +10990,19 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
     product_mask = build_sam_or_vision_product_mask(image)
     overlay_words: list[TextBlock] = []
     protected_words: list[TextBlock] = []
+    product_overlap_threshold = float(os.getenv("ADAPTIFAI_V5_PRODUCT_POLYGON_OVERLAP", "0.55"))
     for word in words:
         overlap = polygon_mask_overlap_fraction([word.polygon] if word.polygon else [], product_mask)
+        if overlap >= product_overlap_threshold:
+            protected_words.append(word.model_copy(update={"translate": False, "surface": "packaging"}))
+            continue
         keep_as_overlay = (
             should_translate_ocr_overlay_block(word, image.size)
             or has_instructional_line_context(word, words)
             or looks_like_numeric_marketing_claim_word(word, image.size)
             or is_possible_v5_step_marker_candidate(word, image.size)
         )
-        if overlap >= float(os.getenv("ADAPTIFAI_V5_PRODUCT_POLYGON_OVERLAP", "0.55")) and not keep_as_overlay:
-            protected_words.append(word.model_copy(update={"translate": False, "surface": "packaging"}))
-        else:
-            overlay_words.append(word.model_copy(update={"translate": True, "surface": "overlay"}))
+        overlay_words.append(word.model_copy(update={"translate": True, "surface": "overlay"}))
 
     numeric_bypass_words = detect_v5_step_marker_words(overlay_words, image.size)
     numeric_bypass_keys = {(word.text, word.bbox) for word in numeric_bypass_words}
