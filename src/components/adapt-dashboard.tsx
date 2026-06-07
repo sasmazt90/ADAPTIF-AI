@@ -91,6 +91,29 @@ function formatTimeRemaining(seconds: number) {
   return `${minutes}m ${String(remainder).padStart(2, "0")}s left`;
 }
 
+function splitFilename(value: string) {
+  const name = value.split(/[\\/]/).pop() ?? value;
+  const dotIndex = name.lastIndexOf(".");
+  if (dotIndex <= 0) return { stem: name, suffix: "" };
+  return { stem: name.slice(0, dotIndex), suffix: name.slice(dotIndex).toLowerCase() };
+}
+
+function backendUploadNameCandidates(file: File) {
+  const { stem, suffix } = splitFilename(file.name);
+  const safeStem = stem.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80) || "upload";
+  return [
+    file.name,
+    `${safeStem}${suffix}`,
+    `${safeStem}-1${suffix}`,
+    `${safeStem}-2${suffix}`,
+    `${safeStem}-3${suffix}`,
+  ];
+}
+
+function normalizePreviewName(value: string) {
+  return (value.split(/[\\/]/).pop() ?? value).trim().toLowerCase();
+}
+
 const platformOrder = ["SOCIAL", "GOOGLE", "CUSTOM"];
 type PreviewVariant = {
   id: string;
@@ -1332,9 +1355,18 @@ export function AdaptDashboard() {
   const currentUserEmail = authUser?.email ?? userId;
   const activeCreativeMode = activePlacement.supportsCarousel ? (creativeModesByPlacement[activePlacement.id] ?? "single") : "single";
   const isAdmin = currentUserEmail.trim().toLowerCase() === (process.env.NEXT_PUBLIC_ADMIN_EMAIL ?? "tolgar@sasmaz.digital").trim().toLowerCase();
-  const filePreviewUrls = useMemo(() => Object.fromEntries(files.map((file) => [file.name, URL.createObjectURL(file)])), [files]);
+  const filePreviewUrls = useMemo(() => {
+    const entries: Array<[string, string]> = [];
+    for (const file of files) {
+      const url = URL.createObjectURL(file);
+      for (const candidate of backendUploadNameCandidates(file)) {
+        entries.push([candidate, url], [normalizePreviewName(candidate), url]);
+      }
+    }
+    return Object.fromEntries(entries);
+  }, [files]);
   const activeOutput = result?.outputs[activeOutputIndex] ?? null;
-  const activeOriginalUrl = activeOutput ? filePreviewUrls[activeOutput.source_name] : undefined;
+  const activeOriginalUrl = activeOutput ? filePreviewUrls[activeOutput.source_name] ?? filePreviewUrls[normalizePreviewName(activeOutput.source_name)] : undefined;
   const resizeSourceNames = useMemo(() => Array.from(new Set((result?.outputs ?? []).map((output) => output.source_name))).filter(Boolean), [result]);
   const effectiveResizeSource = activeResizeSource || resizeSourceNames[0] || "";
   const activeResizeOutput = result?.outputs.find((output) => output.placement_id === activePlacementId && output.source_name === effectiveResizeSource)
