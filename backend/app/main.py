@@ -9079,7 +9079,12 @@ def render_styled_spans(
                         int(token_box[2]) + pad_x,
                         int(token_box[3]) + pad_y,
                     )
-                    if current_run and current_run["color"] == str(bg_color) and padded_box[0] <= current_run["box"][2] + max(3, pad_x * 2):
+                    bg_rgb = parse_hex_color(str(bg_color), fallback=(255, 255, 255))
+                    color_close = (
+                        current_run is not None
+                        and np.linalg.norm(np.array(current_run["rgb"], dtype=np.float32) - np.array(bg_rgb, dtype=np.float32)) <= 24.0
+                    )
+                    if current_run and color_close and padded_box[0] <= current_run["box"][2] + max(3, pad_x * 2):
                         rb = current_run["box"]
                         current_run["box"] = (
                             min(rb[0], padded_box[0]),
@@ -9087,8 +9092,13 @@ def render_styled_spans(
                             max(rb[2], padded_box[2]),
                             max(rb[3], padded_box[3]),
                         )
+                        current_run["colors"].append(bg_rgb)
+                        current_run["rgb"] = tuple(
+                            int(np.median([color[channel] for color in current_run["colors"]])) for channel in range(3)
+                        )
+                        current_run["color"] = rgb_to_hex(current_run["rgb"])
                     else:
-                        current_run = {"color": str(bg_color), "box": padded_box}
+                        current_run = {"color": rgb_to_hex(bg_rgb), "rgb": bg_rgb, "colors": [bg_rgb], "box": padded_box}
                         background_runs.append(current_run)
                 else:
                     current_run = None
@@ -16146,7 +16156,7 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
     words = [
         word
         for word in (block.source_word_styles or [])
-        if isinstance(word, dict) and word.get("hasTextBackground") and word.get("backgroundColor")
+        if isinstance(word, dict) and (word.get("estimatedBbox") or word.get("bbox"))
     ]
     if not words:
         return
@@ -16162,19 +16172,24 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
                 boxes.append((int(box[0]), int(box[1]), int(box[2]), int(box[3])))
         if not boxes:
             continue
+        has_background = any(bool(word.get("hasTextBackground") and word.get("backgroundColor")) for word in line_words)
         line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
         pad_x = max(4, int(round(line_height * 0.35)))
-        pad_y = max(4, int(round(line_height * 0.28)))
-        left = max(0, min(min(box[0] for box in boxes), block.bbox[0]) - pad_x)
+        pad_y = max(7, int(round(line_height * 0.50)))
+        left_edge = min(min(box[0] for box in boxes), block.bbox[0]) if has_background else min(box[0] for box in boxes)
+        right_edge = max(max(box[2] for box in boxes), block.bbox[2]) if has_background else max(box[2] for box in boxes)
+        left = max(0, left_edge - pad_x)
         top = max(0, min(box[1] for box in boxes) - pad_y)
-        right = min(canvas.width, max(max(box[2] for box in boxes), block.bbox[2]) + pad_x)
+        right = min(canvas.width, right_edge + pad_x)
         bottom = min(canvas.height, max(box[3] for box in boxes) + pad_y)
         if right <= left or bottom <= top:
             continue
-        bg_colors = [
-            parse_hex_color(str(word.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255))
-            for word in line_words
-        ]
+        bg_colors = []
+        for word in line_words:
+            if word.get("hasTextBackground") and word.get("backgroundColor"):
+                bg_colors.append(parse_hex_color(str(word.get("backgroundColor") or "#ffffff"), fallback=(255, 255, 255)))
+            elif word.get("color"):
+                bg_colors.append(parse_hex_color(str(word.get("color") or "#111111"), fallback=(17, 17, 17)))
         exclude_color = tuple(int(np.median([color[index] for color in bg_colors])) for index in range(3)) if bg_colors else None
         draw.rectangle(
             (left, top, right, bottom),
