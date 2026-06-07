@@ -15744,6 +15744,43 @@ def v62_token_source_height(token: dict[str, Any], source_heights: dict[str, int
     return max(1, int(fallback_size))
 
 
+def order_v62_spans_for_source_background_slots(block: TextBlock, spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_words = [word for word in (block.source_word_styles or []) if isinstance(word, dict)]
+    if not any(word.get("hasTextBackground") and word.get("backgroundColor") for word in source_words):
+        return spans
+    if len(spans) <= 1:
+        return spans
+
+    word_line_by_id = {
+        str(word.get("id") or ""): int(word.get("lineIndex") or 0)
+        for word in source_words
+        if str(word.get("id") or "")
+    }
+
+    def span_line_index(span: dict[str, Any], fallback: int) -> int:
+        source_styles = [item for item in (span.get("sourceWordStyles") or []) if isinstance(item, dict)]
+        line_indexes = [int(item.get("lineIndex") or 0) for item in source_styles if item.get("lineIndex") is not None]
+        if line_indexes:
+            return min(line_indexes)
+        ids = []
+        raw_ids = span.get("sourceWordIds") or span.get("source_word_ids") or []
+        if isinstance(raw_ids, list):
+            ids.extend(str(value) for value in raw_ids if str(value))
+        source_id = str(span.get("sourceWordId") or span.get("source_word_id") or "")
+        if source_id:
+            ids.append(source_id)
+        matched = [word_line_by_id[source_id] for source_id in ids if source_id in word_line_by_id]
+        return min(matched) if matched else fallback
+
+    return [
+        span
+        for _, _, span in sorted(
+            (span_line_index(span, index), index, span)
+            for index, span in enumerate(spans)
+        )
+    ]
+
+
 def v62_measure_tokens_with_line_font(draw: ImageDraw.ImageDraw, tokens: list[dict[str, Any]], line_font_size: int) -> tuple[int, list[dict[str, Any]], int, int]:
     line_width = 0.0
     metrics: list[dict[str, Any]] = []
@@ -16152,6 +16189,8 @@ def clear_v5_source_background_lines(canvas: Image.Image, block: TextBlock) -> N
         if not boxes:
             continue
         has_background = any(bool(word.get("hasTextBackground") and word.get("backgroundColor")) for word in line_words)
+        if has_background:
+            continue
         line_height = max(1, max(box[3] for box in boxes) - min(box[1] for box in boxes))
         pad_x = max(4, int(round(line_height * 0.35)))
         pad_y = max(7, int(round(line_height * 0.50)))
@@ -16212,7 +16251,8 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             base_typography = default_typography_style(block)
             
             if is_v5:
-                layout = fit_v62_geometric_typesetting(draw, block, block.translated_style_spans, render_box)
+                render_spans = order_v62_spans_for_source_background_slots(block, block.translated_style_spans)
+                layout = fit_v62_geometric_typesetting(draw, block, render_spans, render_box)
             else:
                 layout = fit_styled_spans_strict(
                     draw, block.translated_style_spans, render_box, base_typography, honor_force_breaks=True, allow_vertical_overflow=False,
