@@ -237,7 +237,7 @@ LOCALIZE_V2_RICH_TEXT_PROMPT_RULES = [
     "Map style by meaning, not by source position or source line. If a styled source phrase moves to another target line because of target-language syntax, apply that style to the translated phrase that carries the same meaning on its new line.",
     "Support N:M style inheritance: one source word may map to multiple target words, and multiple source words may map to one target word.",
     "Preserve punctuation intent exactly. Exclamation marks, question marks, slashes, and other expressive punctuation must not be silently converted to periods or removed unless the target language requires equivalent punctuation.",
-    "Preserve emphasis from bold, heavier weight, distinctive color, all-caps, numeric claims, discount percentages, and key benefit phrases.",
+    "Preserve emphasis from bold, heavier weight, italic, underline, strikethrough, distinctive color, all-caps, numeric claims, discount percentages, and key benefit phrases.",
     "Do not apply a source style to the wrong translated word just because it is in the same visual position or same line.",
     "Return font_category for each segment from the visual source style: sans-serif, serif, slab-serif, display, handwriting, or monospace.",
     "Product or brand names that are part of overlay marketing/instruction copy are movable semantic tokens; do not lock them to their original coordinate or source line.",
@@ -261,6 +261,9 @@ LOCALIZE_V212_TRANSLATION_SCHEMA = {
                             "source_word_ids": ["one or more source word ids for N:M style inheritance"],
                             "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
                             "font_category": "sans-serif | serif | slab-serif | display | handwriting | monospace",
+                            "is_italic": False,
+                            "is_underlined": False,
+                            "is_strikethrough": False,
                         }
                     ]
                 }
@@ -274,6 +277,9 @@ LOCALIZE_V212_TRANSLATION_SCHEMA = {
                     "source_segment_hint": "source word or phrase whose meaning/style this segment inherited",
                     "semantic_role": "discount | modifier | product_condition | benefit | instruction | cta | other",
                     "font_category": "sans-serif | serif | slab-serif | display | handwriting | monospace",
+                    "is_italic": False,
+                    "is_underlined": False,
+                    "is_strikethrough": False,
                 }
             ],
         }
@@ -1825,6 +1831,62 @@ def anti_ghost_text_dilation_px(image_size: tuple[int, int]) -> int:
     return max(6, min(8, int(round(max(image_size) * 0.014))))
 
 
+def analyze_text_decoration_traits(raw_mask: np.ndarray, text_mask: np.ndarray) -> dict[str, bool]:
+    """Detect simple word-level typography traits from foreground geometry."""
+    try:
+        import cv2
+    except Exception:
+        return {"isItalic": False, "isUnderlined": False, "isStrikethrough": False}
+
+    if raw_mask.size == 0 or not raw_mask.any():
+        return {"isItalic": False, "isUnderlined": False, "isStrikethrough": False}
+
+    raw = raw_mask.astype(np.uint8) * 255
+    text = text_mask.astype(np.uint8) * 255 if text_mask.size == raw_mask.size else raw
+    height, width = raw.shape[:2]
+    min_line_width = max(6, int(width * 0.45))
+    max_line_height = max(2, int(height * 0.16))
+    underline = False
+    strike = False
+    contours, _hierarchy = cv2.findContours(raw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        if w < min_line_width or h > max_line_height:
+            continue
+        aspect = w / max(1, h)
+        if aspect < 5.0:
+            continue
+        center_y = y + h / 2.0
+        if center_y >= height * 0.72:
+            underline = True
+        elif height * 0.38 <= center_y <= height * 0.66:
+            strike = True
+
+    italic = False
+    if text.any():
+        text_contours, _hierarchy = cv2.findContours(text, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        slopes: list[float] = []
+        for contour in text_contours:
+            if cv2.contourArea(contour) < 4:
+                continue
+            points = contour.reshape(-1, 2)
+            if len(points) < 5:
+                continue
+            ys = points[:, 1].astype(np.float32)
+            xs = points[:, 0].astype(np.float32)
+            if float(ys.max() - ys.min()) < max(5.0, height * 0.35):
+                continue
+            try:
+                slope = float(np.polyfit(ys, xs, 1)[0])
+            except Exception:
+                continue
+            slopes.append(slope)
+        if slopes:
+            italic = abs(float(np.median(slopes))) >= 0.16
+
+    return {"isItalic": bool(italic), "isUnderlined": bool(underline), "isStrikethrough": bool(strike)}
+
+
 def sample_word_foreground_style(
     image: Image.Image,
     bbox: tuple[int, int, int, int],
@@ -1836,7 +1898,9 @@ def sample_word_foreground_style(
     if right <= left or bottom <= top:
         return {"color": fallback_color, "fontWeight": fallback_weight, "isBold": fallback_weight >= 700}
     crop_rgb = np.array(image.crop((left, top, right, bottom)).convert("RGB"), dtype=np.uint8)
-    mask = choose_foreground_text_mask(crop_rgb)
+    raw_mask = choose_raw_foreground_mask(crop_rgb)
+    mask = filter_character_like_contours(raw_mask)
+    traits = analyze_text_decoration_traits(raw_mask, mask)
     if mask.any():
         import cv2
 
@@ -1904,6 +1968,7 @@ def sample_word_foreground_style(
         "foregroundDensity": round(density, 4),
         "coreForegroundDensity": round(core_density, 4),
         "foregroundBbox": foreground_bbox,
+        **traits,
     }
 
 
@@ -1937,6 +2002,9 @@ def build_source_word_styles(block: TextBlock, image: Image.Image) -> list[dict[
                     "fontCategory": style.get("fontCategory", "sans-serif"),
                     "isBold": style["isBold"],
                     "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
+                    "isItalic": bool(style.get("isItalic")),
+                    "isUnderlined": bool(style.get("isUnderlined")),
+                    "isStrikethrough": bool(style.get("isStrikethrough")),
                     "semanticRole": classify_semantic_role(text),
                     "foregroundDensity": style.get("foregroundDensity", 0.0),
                     "coreForegroundDensity": style.get("coreForegroundDensity", 0.0),
@@ -1965,7 +2033,7 @@ def sample_polygon_foreground_style(
     polygon_region = np.array(polygon_mask((right - left, bottom - top), [local_polygon]).convert("L")) > 0
     if not polygon_region.any():
         return sample_word_foreground_style(image, envelope, fallback_color=fallback_color, fallback_weight=fallback_weight)
-    raw_foreground = choose_foreground_text_mask(crop_rgb)
+    raw_foreground = choose_raw_foreground_mask(crop_rgb)
     foreground = raw_foreground & polygon_region
     if int(foreground.sum()) < 3:
         gray = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2GRAY)
@@ -2047,6 +2115,7 @@ def sample_polygon_foreground_style(
         and color_chroma(contrast_color) >= 18
         and not green_dominant_solid
     )
+    traits = analyze_text_decoration_traits(raw_foreground & polygon_region, foreground)
     stroke_width = max(2, min(9, int(round(height * 0.09)))) if outline_like else 0
     if outline_like:
         color = contrast_color
@@ -2097,6 +2166,7 @@ def sample_polygon_foreground_style(
         "outline": bool(outline_like),
         "strokeWidth": stroke_width,
         "strokeFill": color if outline_like else None,
+        **traits,
     }
 
 
@@ -2147,6 +2217,9 @@ def build_v5_polygon_source_word_styles(group: list[TextBlock], block: TextBlock
                 "fontCategory": style.get("fontCategory", "sans-serif"),
                 "isBold": style["isBold"],
                 "isUppercase": text.upper() == text and any(char.isalpha() for char in text),
+                "isItalic": bool(style.get("isItalic")),
+                "isUnderlined": bool(style.get("isUnderlined")),
+                "isStrikethrough": bool(style.get("isStrikethrough")),
                 "semanticRole": classify_semantic_role(text),
                 "foregroundDensity": style.get("foregroundDensity", 0.0),
                 "coreForegroundDensity": style.get("coreForegroundDensity", 0.0),
@@ -2262,6 +2335,9 @@ def dominant_source_style(source_styles: list[dict[str, Any]], base_style: dict[
             "strokeWidth": max(int(item.get("strokeWidth") or 0) for item in source_styles),
             "strokeFill": next((item.get("strokeFill") for item in source_styles if item.get("strokeFill")), None),
             "fillTransparent": any(bool(item.get("outline") or item.get("fillTransparent")) for item in source_styles),
+            "isItalic": any(bool(item.get("isItalic")) for item in source_styles),
+            "isUnderlined": any(bool(item.get("isUnderlined")) for item in source_styles),
+            "isStrikethrough": any(bool(item.get("isStrikethrough")) for item in source_styles),
         }
     )
     return dominant
@@ -2350,6 +2426,9 @@ def style_from_source_word_style(source_style: dict[str, Any], base_style: dict[
             "strokeWidth": int(source_style.get("strokeWidth") or 0),
             "strokeFill": source_style.get("strokeFill"),
             "fillTransparent": bool(source_style.get("outline") or source_style.get("fillTransparent")),
+            "isItalic": bool(source_style.get("isItalic")),
+            "isUnderlined": bool(source_style.get("isUnderlined")),
+            "isStrikethrough": bool(source_style.get("isStrikethrough")),
         }
     )
     return style
@@ -8860,6 +8939,76 @@ def analyze_semantic_grouping(blocks: list[TextBlock], image_size: tuple[int, in
     }
 
 
+def draw_rich_text_token(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[float, float],
+    text: str,
+    *,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    fill: Any,
+    stroke_width: int,
+    stroke_fill: Any,
+    italic: bool,
+) -> None:
+    if not italic or not hasattr(draw, "_image"):
+        draw.text(position, text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+        return
+
+    x, y = position
+    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
+    width = max(1, bbox[2] - bbox[0])
+    height = max(1, bbox[3] - bbox[1])
+    pad = max(4, stroke_width + 3)
+    shear = 0.22
+    shear_px = int(round(height * shear))
+    layer_width = width + pad * 2 + shear_px + 2
+    layer_height = height + pad * 2 + 2
+    layer = Image.new("RGBA", (layer_width, layer_height), (0, 0, 0, 0))
+    layer_draw = ImageDraw.Draw(layer)
+    layer_draw.text(
+        (pad - bbox[0], pad - bbox[1]),
+        text,
+        fill=fill,
+        font=font,
+        stroke_width=stroke_width,
+        stroke_fill=stroke_fill,
+    )
+    try:
+        sheared = layer.transform(
+            (layer_width, layer_height),
+            Image.Transform.AFFINE,
+            (1, shear, -shear * layer_height, 0, 1, 0),
+            resample=Image.Resampling.BICUBIC,
+            fillcolor=(0, 0, 0, 0),
+        )
+        draw._image.alpha_composite(sheared, (int(round(x)) - pad, int(round(y)) - pad))
+    except Exception:
+        draw.text(position, text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+
+
+def draw_rich_text_decorations(
+    draw: ImageDraw.ImageDraw,
+    bbox: tuple[int, int, int, int],
+    *,
+    style: dict[str, Any],
+    fill: Any,
+) -> None:
+    if not (style.get("isUnderlined") or style.get("isStrikethrough")):
+        return
+    left, top, right, bottom = bbox
+    if right <= left or bottom <= top:
+        return
+    color = style.get("decorationColor") or style.get("color") or fill or "#111111"
+    source_height = int(style.get("sourcePixelHeight") or style.get("fontSize") or max(1, bottom - top))
+    line_width = max(1, int(round(source_height * 0.07)))
+    if style.get("isUnderlined"):
+        y = bottom + max(1, int(round(source_height * 0.08)))
+        draw.line((left, y, right, y), fill=color, width=line_width)
+    if style.get("isStrikethrough"):
+        y = top + int(round((bottom - top) * 0.54))
+        draw.line((left, y, right, y), fill=color, width=line_width)
+
+
 def render_styled_spans(
     draw: ImageDraw.ImageDraw,
     layout: dict[str, Any],
@@ -8902,7 +9051,7 @@ def render_styled_spans(
             stroke_width = max(0, min(14, int(round(float(token_style.get("strokeWidth") or 0)))))
             stroke_fill = token_style.get("strokeFill") or fill
             
-            # KURAL: 8-Y?nl? d?ng? silindi, Pillow Native RGBA Transparency kullan?l?yor
+            # Use Pillow native stroke/transparent fill instead of the old 8-direction loop.
             if token_style.get("fillTransparent"):
                 fill = (0, 0, 0, 0)
 
@@ -8924,21 +9073,37 @@ def render_styled_spans(
                 draw.text((x + shadow_offset, baseline - token["ascent"] + shadow_offset), token_text, fill=shadow_fill, font=font)
             
             text_y = baseline - token["ascent"]
-            # Pillow stroke_width ve stroke_fill parametreleri ile tek kalemde ?izim:
             if token_style.get("fillTransparent") and stroke_width > 0 and hasattr(draw, "_image"):
                 overlay = Image.new("RGBA", draw._image.size, (0, 0, 0, 0))
                 overlay_draw = ImageDraw.Draw(overlay)
-                overlay_draw.text(
+                draw_rich_text_token(
+                    overlay_draw,
                     (x, text_y),
                     token_text,
                     fill=(0, 0, 0, 0),
                     font=font,
                     stroke_width=stroke_width,
                     stroke_fill=stroke_fill,
+                    italic=bool(token_style.get("isItalic")),
                 )
                 draw._image.alpha_composite(overlay)
             else:
-                draw.text((x, text_y), token_text, fill=fill, font=font, stroke_width=stroke_width, stroke_fill=stroke_fill)
+                draw_rich_text_token(
+                    draw,
+                    (x, text_y),
+                    token_text,
+                    fill=fill,
+                    font=font,
+                    stroke_width=stroke_width,
+                    stroke_fill=stroke_fill,
+                    italic=bool(token_style.get("isItalic")),
+                )
+            draw_rich_text_decorations(
+                draw,
+                (int(left), int(top), int(right), int(bottom)),
+                style=token_style,
+                fill=stroke_fill if token_style.get("fillTransparent") else fill,
+            )
             
             rendered_spans.append({
                 "lineIndex": line_index,
@@ -10972,11 +11137,17 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                                 "lineHeight": source_word_styles[0].get("lineHeight", block.line_height_estimate),
                                 "fontCategory": source_word_styles[0].get("fontCategory", "sans-serif"),
                                 "casing": "uppercase" if source_word_styles[0].get("isUppercase") else "mixed",
+                                "isItalic": bool(source_word_styles[0].get("isItalic")),
+                                "isUnderlined": bool(source_word_styles[0].get("isUnderlined")),
+                                "isStrikethrough": bool(source_word_styles[0].get("isStrikethrough")),
                             },
                             "color": source_word_styles[0]["color"],
                             "fontWeight": source_word_styles[0]["fontWeight"],
                             "fontCategory": source_word_styles[0].get("fontCategory", "sans-serif"),
                             "casing": "uppercase" if source_word_styles[0].get("isUppercase") else "mixed",
+                            "isItalic": bool(source_word_styles[0].get("isItalic")),
+                            "isUnderlined": bool(source_word_styles[0].get("isUnderlined")),
+                            "isStrikethrough": bool(source_word_styles[0].get("isStrikethrough")),
                             "forceBreakAfter": False,
                         }
                     ],
@@ -11048,11 +11219,17 @@ def group_v5_polygon_words(words: list[TextBlock], image: Image.Image) -> tuple[
                     "strokeFill": word.get("strokeFill"),
                     "fillTransparent": bool(word.get("outline")),
                     "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                    "isItalic": bool(word.get("isItalic")),
+                    "isUnderlined": bool(word.get("isUnderlined")),
+                    "isStrikethrough": bool(word.get("isStrikethrough")),
                 },
                 "color": word["color"],
                 "fontWeight": word["fontWeight"],
                 "fontCategory": word.get("fontCategory", "sans-serif"),
                 "casing": "uppercase" if word.get("isUppercase") else "mixed",
+                "isItalic": bool(word.get("isItalic")),
+                "isUnderlined": bool(word.get("isUnderlined")),
+                "isStrikethrough": bool(word.get("isStrikethrough")),
                 "forceBreakAfter": False,
             }
             for word in source_word_styles
@@ -13763,6 +13940,9 @@ def normalize_rich_text_segments(raw_segments: Any, *, block: TextBlock, transla
                 "fontCategory": normalize_font_category(raw.get("font_category") or raw.get("fontCategory") or base_style.get("fontCategory")),
                 "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or 0),
                 "strokeFill": raw.get("stroke_fill") or raw.get("strokeFill"),
+                "isItalic": normalize_bool(raw.get("is_italic", raw.get("isItalic", raw.get("italic", False)))),
+                "isUnderlined": normalize_bool(raw.get("is_underlined", raw.get("isUnderlined", raw.get("underline", raw.get("underlined", False))))),
+                "isStrikethrough": normalize_bool(raw.get("is_strikethrough", raw.get("isStrikethrough", raw.get("strikethrough", raw.get("strike", False))))),
             }
         )
         segment_text = text.upper() if is_uppercase else text
@@ -13834,6 +14014,9 @@ def normalize_cross_line_rich_text_segments(item: dict[str, Any], *, block: Text
                 "strokeWidth": int(raw.get("stroke_width") or raw.get("strokeWidth") or inherited_style.get("strokeWidth") or 0),
                 "strokeFill": raw.get("stroke_fill") or raw.get("strokeFill") or inherited_style.get("strokeFill"),
                 "fillTransparent": bool(raw.get("fill_transparent") or raw.get("fillTransparent") or inherited_style.get("fillTransparent")),
+                "isItalic": bool(raw.get("is_italic") or raw.get("isItalic") or raw.get("italic") or inherited_style.get("isItalic")),
+                "isUnderlined": bool(raw.get("is_underlined") or raw.get("isUnderlined") or raw.get("underline") or raw.get("underlined") or inherited_style.get("isUnderlined")),
+                "isStrikethrough": bool(raw.get("is_strikethrough") or raw.get("isStrikethrough") or raw.get("strikethrough") or raw.get("strike") or inherited_style.get("isStrikethrough")),
             }
         )
         segment_text = text.upper() if is_uppercase else text
