@@ -13691,11 +13691,6 @@ PLACEMENT_ID_ALIASES = {
     "youtube-16x9": "google-responsive-landscape",
     "youtube-instream": "google-responsive-landscape",
     "youtube-shorts": "story-image",
-    "gdn-300x250": "google-responsive-square",
-    "gdn-728x90": "google-responsive-landscape",
-    "gdn-160x600": "google-responsive-vertical",
-    "gdn-320x50": "google-responsive-landscape",
-    "gdn-300x600": "google-responsive-vertical",
     "native-custom": "custom-display",
 }
 
