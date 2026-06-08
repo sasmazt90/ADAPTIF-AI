@@ -382,7 +382,7 @@ def composite_relayout_layers(
     return output.convert("RGB"), {"compositedLayers": composited, "compositedLayerCount": len(composited)}
 
 
-def should_preserve_source_card(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
+def should_use_vertical_band_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
     target_ratio = width / max(1, height)
     source_ratio = source.width / max(1, source.height)
     if target_ratio >= 0.75:
@@ -395,38 +395,100 @@ def should_preserve_source_card(source: Image.Image, width: int, height: int, an
     return abs(source_ratio - target_ratio) >= 0.42 or text_area >= 0.10
 
 
-def composite_preserved_source_card(canvas: Image.Image, source: Image.Image, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
+def _paste_crop_inside(
+    output: Image.Image,
+    crop_source: Image.Image,
+    source_box: tuple[int, int, int, int],
+    target_box: tuple[int, int, int, int],
+    *,
+    layer_id: str,
+    role: str,
+) -> dict[str, Any]:
+    crop = crop_source.crop(source_box).convert("RGBA")
+    paste_left, paste_top, paste_right, paste_bottom, scale = _fit_inside(crop.size, target_box)
+    resized = crop.resize((paste_right - paste_left, paste_bottom - paste_top), Image.Resampling.LANCZOS)
+    output.alpha_composite(resized, (paste_left, paste_top))
+    return {
+        "layerId": layer_id,
+        "role": role,
+        "sourceBox": list(source_box),
+        "targetBox": list(target_box),
+        "pasteBox": [paste_left, paste_top, paste_right, paste_bottom],
+        "scale": round(scale, 4),
+    }
+
+
+def composite_vertical_band_relayout(
+    canvas: Image.Image,
+    source: Image.Image,
+    foreground_source: Image.Image,
+    width: int,
+    height: int,
+    analysis: VisualAnalysis,
+) -> tuple[Image.Image, dict[str, Any]]:
     output = canvas.convert("RGBA")
-    card = source.convert("RGBA")
     source_ratio = source.width / max(1, source.height)
+    composited: list[dict[str, Any]] = []
+
     if source_ratio > 1.35:
-        target_w = int(width * 0.94)
-        max_h = int(height * 0.48)
-        top_bias = 0.34
+        text_box = _clip_box((0, 0, int(source.width * 0.48), source.height), source.width, source.height)
+        visual_box = _clip_box((int(source.width * 0.52), 0, source.width, source.height), source.width, source.height)
+        composited.append(
+            _paste_crop_inside(
+                output,
+                source,
+                text_box,
+                (int(width * 0.055), int(height * 0.18), int(width * 0.945), int(height * 0.43)),
+                layer_id="source-text-zone",
+                role="preserved_text_band",
+            )
+        )
+        composited.append(
+            _paste_crop_inside(
+                output,
+                source,
+                visual_box,
+                (int(width * 0.07), int(height * 0.43), int(width * 0.93), int(height * 0.74)),
+                layer_id="source-visual-zone",
+                role="relayout_visual_band",
+            )
+        )
     else:
-        target_w = int(width * 0.88)
-        max_h = int(height * 0.70)
-        top_bias = 0.30
-    scale = min(target_w / max(1, source.width), max_h / max(1, source.height))
-    scale = max(0.05, scale)
-    paste_w = max(1, int(round(source.width * scale)))
-    paste_h = max(1, int(round(source.height * scale)))
-    resized = card.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
-    paste_x = max(0, (width - paste_w) // 2)
-    paste_y = max(0, min(height - paste_h, int(round(height * top_bias))))
-    output.alpha_composite(resized, (paste_x, paste_y))
+        text_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.marketing_text_layers]
+        if text_boxes:
+            upper_text_boxes = [box for box in text_boxes if box[1] < int(source.height * 0.46)] or text_boxes
+            text_bottom = max(box[3] for box in upper_text_boxes)
+            text_bottom = min(source.height, max(text_bottom + int(source.height * 0.045), int(source.height * 0.26)))
+        else:
+            text_bottom = int(source.height * 0.35)
+        text_box = _clip_box((0, 0, source.width, text_bottom), source.width, source.height)
+        visual_top = max(0, min(text_bottom - int(source.height * 0.045), int(source.height * 0.42)))
+        visual_box = _clip_box((0, visual_top, source.width, source.height), source.width, source.height)
+        composited.append(
+            _paste_crop_inside(
+                output,
+                source,
+                text_box,
+                (int(width * 0.065), int(height * 0.22), int(width * 0.935), int(height * 0.47)),
+                layer_id="source-text-zone",
+                role="preserved_text_band",
+            )
+        )
+        composited.append(
+            _paste_crop_inside(
+                output,
+                foreground_source,
+                visual_box,
+                (int(width * 0.065), int(height * 0.47), int(width * 0.935), int(height * 0.81)),
+                layer_id="source-visual-zone",
+                role="relayout_visual_band",
+            )
+        )
+
     return output.convert("RGB"), {
-        "compositedLayers": [
-            {
-                "layerId": "source-creative-card",
-                "role": "preserved_source_creative",
-                "sourceBox": [0, 0, source.width, source.height],
-                "pasteBox": [paste_x, paste_y, paste_x + paste_w, paste_y + paste_h],
-                "scale": round(scale, 4),
-            }
-        ],
-        "compositedLayerCount": 1,
-        "preserveSourceCard": True,
+        "compositedLayers": composited,
+        "compositedLayerCount": len(composited),
+        "verticalBandRelayout": True,
     }
 
 
@@ -453,8 +515,8 @@ def render_deterministic_compositor(
         outpaint_renderer=outpaint_renderer,
         fallback_renderer=fallback_renderer,
     )
-    if should_preserve_source_card(source, width, height, analysis):
-        rendered, relayout_meta = composite_preserved_source_card(background, source, width, height)
+    if should_use_vertical_band_relayout(source, width, height, analysis):
+        rendered, relayout_meta = composite_vertical_band_relayout(background, source, foreground_source, width, height, analysis)
         return rendered.convert("RGB"), {
             "backgroundStrategy": background_meta.get("strategy"),
             "backgroundSource": background_meta.get("backgroundSource"),
@@ -465,7 +527,7 @@ def render_deterministic_compositor(
             **background_meta,
             **relayout_meta,
             "provider": background_meta.get("provider", "local"),
-            "strategy": "deterministic_compositor_preserved_source_card",
+            "strategy": "deterministic_compositor_vertical_band_relayout",
         }
     relayout, relayout_meta = composite_relayout_layers(background, source, foreground_source, plan, analysis)
     rendered = draw_text(relayout, text_blocks) if text_blocks else relayout
