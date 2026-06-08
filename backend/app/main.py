@@ -2511,6 +2511,52 @@ def run_trocr_ocr_on_image(image_path: Path) -> list[TextBlock]:
     return merge_blocks_into_lines(blocks, image.size)
 
 
+def run_resize_raw_ocr_on_image(image_path: Path) -> list[TextBlock]:
+    detector = load_ocr_detector()
+    image = Image.open(image_path).convert("RGB")
+    ocr_image, scale = fit_for_ocr(image)
+    detections = detector.readtext(
+        np.array(ocr_image),
+        detail=1,
+        paragraph=False,
+        batch_size=int(os.getenv("ADAPTIFAI_OCR_BATCH_SIZE", "1")),
+        width_ths=float(os.getenv("ADAPTIFAI_RESIZE_OCR_WIDTH_THS", "0.35")),
+        decoder=os.getenv("ADAPTIFAI_EASYOCR_DECODER", "greedy"),
+    )
+    blocks: list[TextBlock] = []
+    min_confidence = float(os.getenv("ADAPTIFAI_RESIZE_OCR_MIN_CONFIDENCE", "0.36"))
+    for points, detected_text, confidence in detections:
+        if confidence < min_confidence:
+            continue
+        text = str(detected_text or "").strip()
+        if not text:
+            continue
+        xs = [int(point[0] / scale) for point in points]
+        ys = [int(point[1] / scale) for point in points]
+        padding = int(os.getenv("ADAPTIFAI_RESIZE_OCR_BOX_PADDING", "4"))
+        left = max(0, min(xs) - padding)
+        top = max(0, min(ys) - padding)
+        right = min(image.width, max(xs) + padding)
+        bottom = min(image.height, max(ys) + padding)
+        if right <= left or bottom <= top:
+            continue
+        crop = image.crop((left, top, right, bottom))
+        blocks.append(
+            TextBlock(
+                text=text,
+                role=classify_text_role(text),
+                translate=True,
+                bbox=(left, top, right, bottom),
+                color=estimate_text_color(crop),
+                font_weight=800 if text.isupper() else 700,
+                align=infer_alignment((left, top, right, bottom), image.width),
+                line_boxes=[(left, top, right, bottom)],
+                line_texts=[text],
+            )
+        )
+    return blocks
+
+
 def marketing_filter(blocks: list[TextBlock]) -> list[TextBlock]:
     filtered: list[TextBlock] = []
     for block in blocks:
@@ -12382,8 +12428,8 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
     temp_path = temp_root() / f"{uuid4().hex}-resize-analysis.png"
     try:
         source.save(temp_path, "PNG")
-        detector_blocks = marketing_filter(run_trocr_ocr_on_image(temp_path))
-        for index, block in enumerate(detector_blocks[:6]):
+        detector_blocks = marketing_filter(run_resize_raw_ocr_on_image(temp_path) or run_trocr_ocr_on_image(temp_path))
+        for index, block in enumerate(detector_blocks[:16]):
             sampled_color = sample_marketing_text_color(
                 source,
                 block.bbox,

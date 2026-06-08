@@ -409,6 +409,60 @@ def should_use_landscape_width_anchor(source: Image.Image, width: int, height: i
     return source_ratio > 1.35 and target_ratio > 1.35 and source_ratio > target_ratio and abs(source_ratio - target_ratio) > 0.18
 
 
+def suppress_generated_foreground_below_anchor(output: Image.Image, source: Image.Image, paste_h: int, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
+    if paste_h >= height - 4:
+        return output, {"generatedForegroundSuppression": "skipped_no_gap"}
+    try:
+        import cv2
+
+        start_y = max(0, min(height - 1, paste_h - max(8, height // 80)))
+        region = np.array(output.crop((0, start_y, width, height)).convert("RGB"), dtype=np.uint8)
+        if region.size == 0:
+            return output, {"generatedForegroundSuppression": "skipped_empty_region"}
+
+        replacement = build_deterministic_background_canvas(source, width, height).convert("RGBA").crop((0, start_y, width, height))
+        replacement_np = np.array(replacement.convert("RGB"), dtype=np.uint8)
+        color_delta = np.linalg.norm(region.astype(np.float32) - replacement_np.astype(np.float32), axis=2)
+        gray = cv2.cvtColor(region, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 45, 130)
+        hsv = cv2.cvtColor(region, cv2.COLOR_RGB2HSV)
+        saturation = hsv[:, :, 1]
+        high_detail = ((edges > 0) | (saturation > 62) | (color_delta > 30)).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        high_detail = cv2.dilate(high_detail, kernel, iterations=2)
+        high_detail = cv2.morphologyEx(high_detail, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats((high_detail > 0).astype(np.uint8), connectivity=8)
+        mask = np.zeros_like(high_detail)
+        min_area = max(90, int(width * height * 0.0012))
+        suppressed_components = 0
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            comp_y = int(stats[label, cv2.CC_STAT_TOP])
+            comp_h = int(stats[label, cv2.CC_STAT_HEIGHT])
+            if area < min_area:
+                continue
+            if comp_y + comp_h < max(10, region.shape[0] // 5):
+                continue
+            mask[labels == label] = 255
+            suppressed_components += 1
+        if not suppressed_components:
+            return output, {"generatedForegroundSuppression": "no_generated_foreground_detected"}
+
+        soft_mask = Image.fromarray(mask, "L").filter(ImageFilter.GaussianBlur(radius=max(3, width // 260)))
+        cleaned = output.convert("RGBA")
+        cleaned_region = cleaned.crop((0, start_y, width, height))
+        cleaned_region.paste(replacement, (0, 0), soft_mask)
+        cleaned.paste(cleaned_region, (0, start_y))
+        return cleaned, {
+            "generatedForegroundSuppression": "removed_high_detail_generated_area",
+            "generatedForegroundComponents": suppressed_components,
+            "generatedForegroundStartY": start_y,
+        }
+    except Exception as exc:
+        return output, {"generatedForegroundSuppression": "failed_passthrough", "generatedForegroundSuppressionError": str(exc)}
+
+
 def composite_landscape_width_anchor(
     canvas: Image.Image,
     source: Image.Image,
@@ -458,6 +512,9 @@ def composite_landscape_width_anchor(
             for x in range(paste_w):
                 alpha_px[x, y] = value
         resized.putalpha(alpha)
+    suppression_meta: dict[str, Any] = {}
+    if preserve_canvas_fill and paste_h < height:
+        output, suppression_meta = suppress_generated_foreground_below_anchor(output, source, paste_h, width, height)
     output.alpha_composite(resized, (0, 0))
     return output.convert("RGB"), {
         "compositedLayers": [
@@ -475,6 +532,7 @@ def composite_landscape_width_anchor(
         ],
         "compositedLayerCount": 1,
         "landscapeWidthAnchor": True,
+        **suppression_meta,
     }
 
 
