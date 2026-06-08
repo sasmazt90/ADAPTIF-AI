@@ -666,6 +666,7 @@ def render_deterministic_compositor(
 ) -> tuple[Image.Image, dict[str, Any]]:
     foreground_source, _foreground_text_mask, foreground_meta = clean_overlay_text_only(source, analysis)
     clean_source, text_mask, cleanup_meta = clean_compositor_background_source(source, analysis)
+    landscape_anchor = should_use_landscape_width_anchor(source, width, height)
     should_seed_outpaint_with_foreground = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
     background_seed = foreground_source if should_seed_outpaint_with_foreground else clean_source
     background, background_meta = render_background(
@@ -677,15 +678,13 @@ def render_deterministic_compositor(
         outpaint_renderer=outpaint_renderer,
         fallback_renderer=fallback_renderer,
     )
-    if should_use_landscape_width_anchor(source, width, height):
-        generative_fill = background_meta.get("backgroundSource") == "clean_base_outpaint"
+    if landscape_anchor:
         rendered, landscape_meta = composite_landscape_width_anchor(
             background,
             source,
             width,
             height,
-            fill_source=None if generative_fill else clean_source,
-            preserve_canvas_fill=generative_fill,
+            preserve_canvas_fill=True,
         )
         return rendered.convert("RGB"), {
             "backgroundStrategy": background_meta.get("strategy"),

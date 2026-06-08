@@ -13109,13 +13109,14 @@ def build_compositor_background_outpaint_prompt(plan: Any, analysis: VisualAnaly
         for layer in analysis.other_layers[:4]
     ) or analysis.saliency_summary or "the original campaign background style"
     return (
-        "Create a clean advertising background extension only. "
-        "The provided image has had all foreground products, logos, and marketing text removed; treat those blank/cleaned areas as background context, not as objects to preserve. "
-        "Fill transparent or empty areas with a natural continuation of the existing background, matching lighting, color, grain, texture, perspective, and campaign theme. "
-        "Do not generate any letters, words, numbers, symbols, pseudo-text, captions, labels, logos, watermarks, packaging, products, people, UI, buttons, or readable marks anywhere in the image. "
-        "The final product and final typography will be composited later by deterministic code, so the result must be background-only. "
+        "Extend this advertising creative only into the transparent or masked canvas area. "
+        "The opaque seed pixels are protected and must remain visually unchanged: preserve existing product shape, product label, logo, lighting, shadows, and background exactly where they already exist. "
+        "Marketing text may have been removed from the seed; do not recreate it during outpaint because deterministic code will composite final typography later. "
+        "Fill only missing canvas with a natural continuation of the existing scene, matching lighting, color, grain, texture, perspective, and campaign theme. "
+        "If an existing protected product or material is visibly cut by the canvas boundary, continue only that same visible form naturally; do not invent additional products, props, panels, UI, labels, packaging, people, or decorative objects. "
+        "Do not generate any letters, words, numbers, symbols, pseudo-text, captions, labels, logos, watermarks, or readable marks anywhere in the newly generated area. "
         f"Theme reference: {theme_notes}. "
-        "Return a clean background canvas only."
+        "Return a clean completed creative canvas with no new text and no new objects."
     )
 
 
