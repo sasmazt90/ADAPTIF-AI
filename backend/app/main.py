@@ -13103,6 +13103,22 @@ def build_openai_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
     )
 
 
+def build_compositor_background_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
+    theme_notes = "; ".join(
+        f"{layer.id}:{layer.notes or layer.role.value}"
+        for layer in analysis.other_layers[:4]
+    ) or analysis.saliency_summary or "the original campaign background style"
+    return (
+        "Create a clean advertising background extension only. "
+        "The provided image has had all foreground products, logos, and marketing text removed; treat those blank/cleaned areas as background context, not as objects to preserve. "
+        "Fill transparent or empty areas with a natural continuation of the existing background, matching lighting, color, grain, texture, perspective, and campaign theme. "
+        "Do not generate any letters, words, numbers, symbols, pseudo-text, captions, labels, logos, watermarks, packaging, products, people, UI, buttons, or readable marks anywhere in the image. "
+        "The final product and final typography will be composited later by deterministic code, so the result must be background-only. "
+        f"Theme reference: {theme_notes}. "
+        "Return a clean background canvas only."
+    )
+
+
 def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -13145,6 +13161,53 @@ def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int,
         "model": model,
         "quality": quality,
         "strategy": "openai_outpaint",
+        "apiVariant": api_variant,
+        **seed_meta,
+    }
+
+
+def render_openai_compositor_background_outpaint(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required for OpenAI compositor background outpaint.")
+
+    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
+    quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
+    if quality not in {"low", "medium", "high", "auto"}:
+        quality = "medium"
+
+    seed, mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
+    image_file = io.BytesIO()
+    seed.save(image_file, format="PNG")
+    image_file.seek(0)
+    mask_file = io.BytesIO()
+    mask.save(mask_file, format="PNG")
+    mask_file.seek(0)
+
+    client = OpenAI(api_key=api_key)
+    response, api_variant = create_openai_image_edit_with_fallback(
+        client,
+        {
+            "model": model,
+            "image": ("compositor-background-seed.png", image_file, "image/png"),
+            "mask": ("compositor-background-mask.png", mask_file, "image/png"),
+            "prompt": build_compositor_background_outpaint_prompt(plan, analysis),
+            "quality": quality,
+        },
+        [image_file, mask_file],
+        output_format="png",
+        size="auto",
+        width=width,
+        height=height,
+    )
+    rendered = decode_openai_image_response(response)
+    if rendered.size != (width, height):
+        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
+    return rendered, {
+        "provider": "openai",
+        "model": model,
+        "quality": quality,
+        "strategy": "openai_compositor_background_outpaint",
         "apiVariant": api_variant,
         **seed_meta,
     }
@@ -13254,6 +13317,78 @@ def render_vertex_outpaint_reframe(source: Image.Image, width: int, height: int,
     }
 
 
+def render_vertex_compositor_background_outpaint(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    if not vertex_available():
+        raise RuntimeError("Vertex service account is not configured.")
+    seed, _openai_mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
+    base_image, mask_image = build_vertex_outpaint_base_and_mask(seed, seed_meta)
+    project_id = vertex_project_id()
+    location = vertex_location()
+    model = vertex_imagen_edit_model()
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
+        f"locations/{location}/publishers/google/models/{model}:predict"
+    )
+    response = vertex_authorized_session().post(
+        endpoint,
+        json={
+            "instances": [
+                {
+                    "prompt": build_compositor_background_outpaint_prompt(plan, analysis),
+                    "referenceImages": [
+                        {
+                            "referenceType": "REFERENCE_TYPE_RAW",
+                            "referenceId": 1,
+                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(base_image)},
+                        },
+                        {
+                            "referenceType": "REFERENCE_TYPE_MASK",
+                            "referenceId": 2,
+                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(mask_image)},
+                            "maskImageConfig": {
+                                "maskMode": "MASK_MODE_USER_PROVIDED",
+                                "dilation": float(os.getenv("VERTEX_IMAGEN_MASK_DILATION", "0.03")),
+                            },
+                        },
+                    ],
+                }
+            ],
+            "parameters": {
+                "sampleCount": 1,
+                "editMode": "EDIT_MODE_OUTPAINT",
+                "editConfig": {
+                    "baseSteps": int(os.getenv("VERTEX_IMAGEN_EDIT_STEPS", "35")),
+                    "outpaintingConfig": {
+                        "blendingMode": os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_MODE", "alpha-blending"),
+                        "blendingFactor": float(os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_FACTOR", "0.01")),
+                    },
+                },
+                "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
+                "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
+            },
+        },
+        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "35")),
+    )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(f"Vertex Imagen compositor background outpaint failed with HTTP {response.status_code}: {response.text[:1200]}") from exc
+    payload = response.json()
+    predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
+    if not predictions:
+        raise ValueError("Vertex Imagen compositor background outpaint returned no predictions.")
+    rendered = decode_vertex_imagen_prediction(predictions[0])
+    if rendered.size != (width, height):
+        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
+    return rendered, {
+        "provider": "vertex",
+        "model": model,
+        "location": location,
+        "strategy": "vertex_compositor_background_outpaint",
+        **seed_meta,
+    }
+
+
 def smart_reframe_text_style_to_block_color(style: TextStyle | None) -> str:
     if style is None:
         return "#111111"
@@ -13358,15 +13493,15 @@ def render_clean_base_outpaint_for_compositor(source: Image.Image, width: int, h
     vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
     if openai_outpaint_enabled:
         try:
-            rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
+            rendered, meta = render_openai_compositor_background_outpaint(source, width, height, plan, analysis)
             return rendered, {**meta, "strategy": "openai_outpaint_clean_base"}
         except Exception as exc:
             if vertex_outpaint_enabled and vertex_available():
-                rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+                rendered, meta = render_vertex_compositor_background_outpaint(source, width, height, plan, analysis)
                 return rendered, {**meta, "strategy": "vertex_outpaint_clean_base_after_openai_failed", "openaiFallbackReason": str(exc)}
             raise
     if vertex_outpaint_enabled and vertex_available():
-        rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+        rendered, meta = render_vertex_compositor_background_outpaint(source, width, height, plan, analysis)
         return rendered, {**meta, "strategy": "vertex_outpaint_clean_base"}
     raise RuntimeError("No outpaint provider is enabled for deterministic compositor.")
 

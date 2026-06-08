@@ -56,26 +56,50 @@ def build_overlay_text_mask(source: Image.Image, analysis: VisualAnalysis) -> tu
     return mask, {"maskedTextLayers": masked_layers, "textMaskMode": "bbox-dilated-overlay-text"}
 
 
-def clean_overlay_text(source: Image.Image, analysis: VisualAnalysis) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
+def build_compositor_background_mask(source: Image.Image, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
     mask, mask_meta = build_overlay_text_mask(source, analysis)
-    if not mask_meta["maskedTextLayers"]:
-        return source.convert("RGB"), mask, {**mask_meta, "textCleanup": "skipped_no_overlay_text"}
+    draw = ImageDraw.Draw(mask)
+    removed_foreground = 0
+    for layer in [*analysis.product_layers, *analysis.logo_layers]:
+        left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
+        box_w = max(1, right - left)
+        box_h = max(1, bottom - top)
+        pad_x = max(4, min(30, int(round(box_w * 0.05))))
+        pad_y = max(4, min(30, int(round(box_h * 0.05))))
+        draw.rectangle(
+            _clip_box((left - pad_x, top - pad_y, right + pad_x, bottom + pad_y), source.width, source.height),
+            fill=255,
+        )
+        removed_foreground += 1
+    if removed_foreground:
+        mask = mask.filter(ImageFilter.GaussianBlur(radius=0.75))
+    return mask, {
+        **mask_meta,
+        "removedForegroundLayers": removed_foreground,
+        "backgroundMaskMode": "text-product-logo-removal",
+    }
+
+
+def clean_compositor_background_source(source: Image.Image, analysis: VisualAnalysis) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
+    mask, mask_meta = build_compositor_background_mask(source, analysis)
+    if not mask_meta["maskedTextLayers"] and not mask_meta["removedForegroundLayers"]:
+        return source.convert("RGB"), mask, {**mask_meta, "backgroundCleanup": "skipped_no_foreground"}
     try:
         import cv2
 
         source_np = np.array(source.convert("RGB"), dtype=np.uint8)
         mask_np = np.array(mask, dtype=np.uint8)
         mask_np = (mask_np > 24).astype(np.uint8) * 255
-        cleaned = cv2.inpaint(source_np, mask_np, 5, cv2.INPAINT_TELEA)
+        cleaned = cv2.inpaint(source_np, mask_np, 7, cv2.INPAINT_TELEA)
         return Image.fromarray(cleaned, "RGB"), Image.fromarray(mask_np, "L"), {
             **mask_meta,
-            "textCleanup": "opencv_telea",
+            "backgroundCleanup": "opencv_telea_background_only",
         }
     except Exception as exc:
         return source.convert("RGB"), mask, {
             **mask_meta,
-            "textCleanup": "failed_passthrough",
-            "textCleanupError": str(exc),
+            "backgroundCleanup": "failed_passthrough",
+            "backgroundCleanupError": str(exc),
         }
 
 
@@ -187,7 +211,7 @@ def render_deterministic_compositor(
     outpaint_renderer: ImageRenderer | None,
     fallback_renderer: FallbackRenderer,
 ) -> tuple[Image.Image, dict[str, Any]]:
-    clean_source, text_mask, cleanup_meta = clean_overlay_text(source, analysis)
+    clean_source, text_mask, cleanup_meta = clean_compositor_background_source(source, analysis)
     background, background_meta = render_background(
         clean_source,
         width,
