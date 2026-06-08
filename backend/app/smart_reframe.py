@@ -289,7 +289,7 @@ def preferred_zones_for(bucket: LogicBucket, width: int, height: int) -> tuple[B
     if bucket == LogicBucket.LARGE_RECTANGLE:
         return _bbox(430, 460, 900, 940), _bbox(110, 80, 410, 900)
     if ratio < 0.75:
-        return _bbox(90, 360, 910, 835), _bbox(95, 130, 905, 330)
+        return _bbox(360, 90, 835, 910), _bbox(130, 95, 330, 905)
     return _bbox(455, 170, 895, 880), _bbox(80, 80, 390, 920)
 
 
