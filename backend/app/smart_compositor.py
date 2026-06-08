@@ -137,7 +137,7 @@ def render_background(
 ) -> tuple[Image.Image, dict[str, Any]]:
     should_outpaint = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
     texture = float(getattr(analysis.background, "texture_complexity", 0.0) or 0.0)
-    if texture < float(__import__("os").getenv("ADAPTIFAI_COMPOSITOR_AI_TEXTURE_THRESHOLD", "0.46")):
+    if not should_outpaint and texture < float(__import__("os").getenv("ADAPTIFAI_COMPOSITOR_AI_TEXTURE_THRESHOLD", "0.46")):
         return build_deterministic_background_canvas(clean_source, width, height), {
             "provider": "local",
             "strategy": "deterministic_background_canvas",
@@ -409,16 +409,55 @@ def should_use_landscape_width_anchor(source: Image.Image, width: int, height: i
     return source_ratio > 1.35 and target_ratio > 1.35 and source_ratio > target_ratio and abs(source_ratio - target_ratio) > 0.18
 
 
-def composite_landscape_width_anchor(canvas: Image.Image, source: Image.Image, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
-    output = canvas.convert("RGBA")
+def composite_landscape_width_anchor(
+    canvas: Image.Image,
+    source: Image.Image,
+    width: int,
+    height: int,
+    *,
+    fill_source: Image.Image | None = None,
+    preserve_canvas_fill: bool = False,
+) -> tuple[Image.Image, dict[str, Any]]:
+    source_rgba = source.convert("RGBA")
+    cover_scale = max(width / max(1, source.width), height / max(1, source.height))
+    crop_left = 0
+    crop_top = 0
+    crop_right = width
+    crop_bottom = height
+    if preserve_canvas_fill:
+        output = canvas.convert("RGBA").resize((width, height), Image.Resampling.LANCZOS)
+        fill_mode = "generative_canvas_underlay"
+    else:
+        fill_rgba = (fill_source or source).convert("RGBA")
+        cover_w = max(1, int(round(source.width * cover_scale)))
+        cover_h = max(1, int(round(source.height * cover_scale)))
+        cover = fill_rgba.resize((cover_w, cover_h), Image.Resampling.LANCZOS)
+        crop_left = max(0, (cover_w - width) // 2)
+        crop_right = min(cover_w, crop_left + width)
+        crop_bottom = min(cover_h, crop_top + height)
+        output = cover.crop((crop_left, crop_top, crop_right, crop_bottom))
+        if output.size != (width, height):
+            output = output.resize((width, height), Image.Resampling.LANCZOS)
+        fill_mode = "cover_clean_content_underlay"
+
     scale = width / max(1, source.width)
     paste_w = width
     paste_h = max(1, int(round(source.height * scale)))
-    resized = source.convert("RGBA").resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+    resized = source_rgba.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
     if paste_h >= height:
         crop_top = 0
         resized = resized.crop((0, crop_top, paste_w, crop_top + height))
         paste_h = height
+    elif paste_h < height:
+        seam = max(10, min(36, height // 24, paste_h // 5))
+        alpha = Image.new("L", resized.size, 255)
+        alpha_px = alpha.load()
+        for y in range(max(0, paste_h - seam), paste_h):
+            t = (y - (paste_h - seam)) / max(1, seam - 1)
+            value = int(round(255 * (1.0 - t)))
+            for x in range(paste_w):
+                alpha_px[x, y] = value
+        resized.putalpha(alpha)
     output.alpha_composite(resized, (0, 0))
     return output.convert("RGB"), {
         "compositedLayers": [
@@ -429,6 +468,9 @@ def composite_landscape_width_anchor(canvas: Image.Image, source: Image.Image, w
                 "targetBox": [0, 0, width, height],
                 "pasteBox": [0, 0, paste_w, paste_h],
                 "scale": round(scale, 4),
+                "fillScale": round(cover_scale, 4),
+                "fillCropBox": [crop_left, crop_top, crop_right, crop_bottom],
+                "fillMode": fill_mode,
             }
         ],
         "compositedLayerCount": 1,
@@ -624,8 +666,10 @@ def render_deterministic_compositor(
 ) -> tuple[Image.Image, dict[str, Any]]:
     foreground_source, _foreground_text_mask, foreground_meta = clean_overlay_text_only(source, analysis)
     clean_source, text_mask, cleanup_meta = clean_compositor_background_source(source, analysis)
+    should_seed_outpaint_with_foreground = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
+    background_seed = foreground_source if should_seed_outpaint_with_foreground else clean_source
     background, background_meta = render_background(
-        clean_source,
+        background_seed,
         width,
         height,
         plan,
@@ -634,7 +678,15 @@ def render_deterministic_compositor(
         fallback_renderer=fallback_renderer,
     )
     if should_use_landscape_width_anchor(source, width, height):
-        rendered, landscape_meta = composite_landscape_width_anchor(background, source, width, height)
+        generative_fill = background_meta.get("backgroundSource") == "clean_base_outpaint"
+        rendered, landscape_meta = composite_landscape_width_anchor(
+            background,
+            source,
+            width,
+            height,
+            fill_source=None if generative_fill else clean_source,
+            preserve_canvas_fill=generative_fill,
+        )
         return rendered.convert("RGB"), {
             "backgroundStrategy": background_meta.get("strategy"),
             "backgroundSource": background_meta.get("backgroundSource"),
