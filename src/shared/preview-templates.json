@@ -177,9 +177,7 @@
         1
       ],
       "safeArea": {
-        "warnings": [
-          "Review top story header and bottom CTA/message space before export."
-        ],
+        "warnings": [],
         "zones": [
           {
             "id": "story-header",
