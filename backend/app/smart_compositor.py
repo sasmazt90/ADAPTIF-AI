@@ -396,13 +396,44 @@ def should_use_vertical_band_relayout(source: Image.Image, width: int, height: i
 def should_use_source_fit(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
     target_ratio = width / max(1, height)
     source_ratio = source.width / max(1, source.height)
-    if source_ratio > 1.35 and target_ratio > 1.35:
-        return True
     if abs(source_ratio - target_ratio) <= 0.18:
         return True
     if target_ratio >= 0.75 and target_ratio <= 1.25 and abs(source_ratio - target_ratio) <= 0.32:
         return True
     return not analysis.marketing_text_layers and abs(source_ratio - target_ratio) <= 0.45
+
+
+def should_use_landscape_width_anchor(source: Image.Image, width: int, height: int) -> bool:
+    target_ratio = width / max(1, height)
+    source_ratio = source.width / max(1, source.height)
+    return source_ratio > 1.35 and target_ratio > 1.35 and source_ratio > target_ratio and abs(source_ratio - target_ratio) > 0.18
+
+
+def composite_landscape_width_anchor(canvas: Image.Image, source: Image.Image, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
+    output = canvas.convert("RGBA")
+    scale = width / max(1, source.width)
+    paste_w = width
+    paste_h = max(1, int(round(source.height * scale)))
+    resized = source.convert("RGBA").resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+    if paste_h >= height:
+        crop_top = 0
+        resized = resized.crop((0, crop_top, paste_w, crop_top + height))
+        paste_h = height
+    output.alpha_composite(resized, (0, 0))
+    return output.convert("RGB"), {
+        "compositedLayers": [
+            {
+                "layerId": "source-landscape-width-anchor",
+                "role": "preserved_landscape_width_anchor",
+                "sourceBox": [0, 0, source.width, source.height],
+                "targetBox": [0, 0, width, height],
+                "pasteBox": [0, 0, paste_w, paste_h],
+                "scale": round(scale, 4),
+            }
+        ],
+        "compositedLayerCount": 1,
+        "landscapeWidthAnchor": True,
+    }
 
 
 def composite_source_fit(canvas: Image.Image, source: Image.Image, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
@@ -602,6 +633,20 @@ def render_deterministic_compositor(
         outpaint_renderer=outpaint_renderer,
         fallback_renderer=fallback_renderer,
     )
+    if should_use_landscape_width_anchor(source, width, height):
+        rendered, landscape_meta = composite_landscape_width_anchor(background, source, width, height)
+        return rendered.convert("RGB"), {
+            "backgroundStrategy": background_meta.get("strategy"),
+            "backgroundSource": background_meta.get("backgroundSource"),
+            "textRedrawBlocks": 0,
+            "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
+            **cleanup_meta,
+            **foreground_meta,
+            **background_meta,
+            **landscape_meta,
+            "provider": background_meta.get("provider", "local"),
+            "strategy": "deterministic_compositor_landscape_width_anchor",
+        }
     if should_use_source_fit(source, width, height, analysis):
         rendered, fit_meta = composite_source_fit(background, source, width, height)
         return rendered.convert("RGB"), {
