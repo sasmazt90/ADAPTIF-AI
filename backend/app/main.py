@@ -13519,7 +13519,7 @@ def build_resize_compositor_text_blocks(
 
 
 def render_clean_base_outpaint_for_compositor(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
-    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "1").strip().lower() in {"1", "true", "yes", "on"}
     vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
     if openai_outpaint_enabled:
         try:
@@ -13552,7 +13552,7 @@ def render_smart_reframe_image(source: Image.Image, width: int, height: int, pla
         )
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
-    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "1").strip().lower() in {"1", "true", "yes", "on"}
     vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
     should_try_outpaint = should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT
     if should_try_outpaint and openai_outpaint_enabled:
