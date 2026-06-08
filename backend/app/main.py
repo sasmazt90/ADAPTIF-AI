@@ -13406,6 +13406,16 @@ def build_resize_compositor_text_blocks(
     blocks: list[TextBlock] = []
     area_scale = ((width * height) / max(1, source.width * source.height)) ** 0.5
     area_scale = max(0.72, min(2.35, area_scale))
+    text_source_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.marketing_text_layers]
+    if text_source_boxes:
+        text_source_union = (
+            min(box[0] for box in text_source_boxes),
+            min(box[1] for box in text_source_boxes),
+            max(box[2] for box in text_source_boxes),
+            max(box[3] for box in text_source_boxes),
+        )
+    else:
+        text_source_union = (0, 0, source.width, max(1, int(source.height * 0.35)))
     for placement in sorted(plan.placements, key=lambda item: item.z_index):
         if placement.role not in {LayerRole.MARKETING_TEXT, LayerRole.CTA}:
             continue
@@ -13413,7 +13423,26 @@ def build_resize_compositor_text_blocks(
         if layer is None or not layer.original_text.strip():
             continue
         source_box = layer.bbox.to_pixel_box(source.width, source.height)
-        target_box = placement.target_bbox.to_pixel_box(width, height)
+        placement_box = placement.target_bbox.to_pixel_box(width, height)
+        union_w = max(1, text_source_union[2] - text_source_union[0])
+        union_h = max(1, text_source_union[3] - text_source_union[1])
+        rel_left = (source_box[0] - text_source_union[0]) / union_w
+        rel_top = (source_box[1] - text_source_union[1]) / union_h
+        rel_right = (source_box[2] - text_source_union[0]) / union_w
+        rel_bottom = (source_box[3] - text_source_union[1]) / union_h
+        placement_w = max(1, placement_box[2] - placement_box[0])
+        placement_h = max(1, placement_box[3] - placement_box[1])
+        target_box = (
+            placement_box[0] + int(round(rel_left * placement_w)),
+            placement_box[1] + int(round(rel_top * placement_h)),
+            placement_box[0] + int(round(rel_right * placement_w)),
+            placement_box[1] + int(round(rel_bottom * placement_h)),
+        )
+        min_box_h = max(18, int((source_box[3] - source_box[1]) * area_scale * 0.75))
+        if target_box[3] - target_box[1] < min_box_h:
+            target_box = (target_box[0], target_box[1], target_box[2], min(placement_box[3], target_box[1] + min_box_h))
+        if target_box[2] - target_box[0] < max(40, int((source_box[2] - source_box[0]) * area_scale * 0.55)):
+            target_box = (target_box[0], target_box[1], min(placement_box[2], target_box[0] + max(40, int((source_box[2] - source_box[0]) * area_scale * 0.55))), target_box[3])
         style = layer.text_style
         source_height = max(1, source_box[3] - source_box[1])
         source_lines = [line.strip() for line in layer.original_text.splitlines() if line.strip()]
