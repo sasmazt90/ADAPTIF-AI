@@ -289,7 +289,7 @@ def preferred_zones_for(bucket: LogicBucket, width: int, height: int) -> tuple[B
     if bucket == LogicBucket.LARGE_RECTANGLE:
         return _bbox(430, 460, 900, 940), _bbox(110, 80, 410, 900)
     if ratio < 0.75:
-        return _bbox(445, 115, 805, 885), _bbox(150, 95, 410, 905)
+        return _bbox(90, 340, 910, 900), _bbox(95, 95, 905, 335)
     return _bbox(455, 170, 895, 880), _bbox(80, 80, 390, 920)
 
 
@@ -466,7 +466,7 @@ class SmartReframe:
                 )
             )
 
-        for index, layer in enumerate(self.analysis.marketing_text_layers[:3]):
+        for index, layer in enumerate(self.analysis.marketing_text_layers[:12]):
             instructions.append(
                 PlacementInstruction(
                     layer_id=layer.id,

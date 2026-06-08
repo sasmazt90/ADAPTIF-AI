@@ -336,7 +336,7 @@ def composite_relayout_layers(
             max(p.target_bbox.to_pixel_box(output.width, output.height)[2] for p in product_placements),
             max(p.target_bbox.to_pixel_box(output.width, output.height)[3] for p in product_placements),
         )
-        crop, source_box, extraction_meta = crop_text_clean_visual_area(source, analysis)
+        crop, source_box, extraction_meta = crop_text_clean_visual_area(foreground_source, analysis)
         paste_left, paste_top, paste_right, paste_bottom, scale = _fit_inside(crop.size, target_union)
         resized = crop.resize((paste_right - paste_left, paste_bottom - paste_top), Image.Resampling.LANCZOS)
         output.alpha_composite(resized, (paste_left, paste_top))
@@ -382,6 +382,54 @@ def composite_relayout_layers(
     return output.convert("RGB"), {"compositedLayers": composited, "compositedLayerCount": len(composited)}
 
 
+def should_preserve_source_card(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
+    target_ratio = width / max(1, height)
+    source_ratio = source.width / max(1, source.height)
+    if target_ratio >= 0.75:
+        return False
+    if width < 700:
+        return False
+    if not analysis.marketing_text_layers:
+        return False
+    text_area = sum(layer.bbox.area_ratio() for layer in analysis.marketing_text_layers)
+    return abs(source_ratio - target_ratio) >= 0.42 or text_area >= 0.10
+
+
+def composite_preserved_source_card(canvas: Image.Image, source: Image.Image, width: int, height: int) -> tuple[Image.Image, dict[str, Any]]:
+    output = canvas.convert("RGBA")
+    card = source.convert("RGBA")
+    source_ratio = source.width / max(1, source.height)
+    if source_ratio > 1.35:
+        target_w = int(width * 0.94)
+        max_h = int(height * 0.48)
+        top_bias = 0.34
+    else:
+        target_w = int(width * 0.88)
+        max_h = int(height * 0.70)
+        top_bias = 0.30
+    scale = min(target_w / max(1, source.width), max_h / max(1, source.height))
+    scale = max(0.05, scale)
+    paste_w = max(1, int(round(source.width * scale)))
+    paste_h = max(1, int(round(source.height * scale)))
+    resized = card.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
+    paste_x = max(0, (width - paste_w) // 2)
+    paste_y = max(0, min(height - paste_h, int(round(height * top_bias))))
+    output.alpha_composite(resized, (paste_x, paste_y))
+    return output.convert("RGB"), {
+        "compositedLayers": [
+            {
+                "layerId": "source-creative-card",
+                "role": "preserved_source_creative",
+                "sourceBox": [0, 0, source.width, source.height],
+                "pasteBox": [paste_x, paste_y, paste_x + paste_w, paste_y + paste_h],
+                "scale": round(scale, 4),
+            }
+        ],
+        "compositedLayerCount": 1,
+        "preserveSourceCard": True,
+    }
+
+
 def render_deterministic_compositor(
     source: Image.Image,
     width: int,
@@ -405,6 +453,20 @@ def render_deterministic_compositor(
         outpaint_renderer=outpaint_renderer,
         fallback_renderer=fallback_renderer,
     )
+    if should_preserve_source_card(source, width, height, analysis):
+        rendered, relayout_meta = composite_preserved_source_card(background, source, width, height)
+        return rendered.convert("RGB"), {
+            "backgroundStrategy": background_meta.get("strategy"),
+            "backgroundSource": background_meta.get("backgroundSource"),
+            "textRedrawBlocks": 0,
+            "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
+            **cleanup_meta,
+            **foreground_meta,
+            **background_meta,
+            **relayout_meta,
+            "provider": background_meta.get("provider", "local"),
+            "strategy": "deterministic_compositor_preserved_source_card",
+        }
     relayout, relayout_meta = composite_relayout_layers(background, source, foreground_source, plan, analysis)
     rendered = draw_text(relayout, text_blocks) if text_blocks else relayout
     return rendered.convert("RGB"), {
