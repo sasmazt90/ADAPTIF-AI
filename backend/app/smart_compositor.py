@@ -727,15 +727,24 @@ def render_deterministic_compositor(
     landscape_anchor = should_use_landscape_width_anchor(source, width, height)
     should_seed_outpaint_with_foreground = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
     background_seed = foreground_source if should_seed_outpaint_with_foreground else clean_source
-    background, background_meta = render_background(
-        background_seed,
-        width,
-        height,
-        plan,
-        analysis,
-        outpaint_renderer=outpaint_renderer,
-        fallback_renderer=fallback_renderer,
-    )
+    if landscape_anchor:
+        background = build_deterministic_background_canvas(foreground_source, width, height)
+        background_meta = {
+            "provider": "local",
+            "strategy": "deterministic_landscape_background_continuation",
+            "backgroundSource": "text_clean_source_background_continuation",
+            "productionReady": True,
+        }
+    else:
+        background, background_meta = render_background(
+            background_seed,
+            width,
+            height,
+            plan,
+            analysis,
+            outpaint_renderer=outpaint_renderer,
+            fallback_renderer=fallback_renderer,
+        )
     if landscape_anchor:
         rendered, landscape_meta = composite_landscape_width_anchor(
             background,
