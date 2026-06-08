@@ -92,6 +92,7 @@ try:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
+    from app.smart_compositor import render_deterministic_compositor
 except ImportError:
     from backend.app.smart_reframe import (  # type: ignore[no-redef]
         BackgroundStyle,
@@ -110,6 +111,7 @@ except ImportError:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
+    from backend.app.smart_compositor import render_deterministic_compositor  # type: ignore[no-redef]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13252,7 +13254,137 @@ def render_vertex_outpaint_reframe(source: Image.Image, width: int, height: int,
     }
 
 
+def smart_reframe_text_style_to_block_color(style: TextStyle | None) -> str:
+    if style is None:
+        return "#111111"
+    return rgb_to_hex(style.color_rgb.as_tuple())
+
+
+def build_resize_compositor_text_blocks(
+    source: Image.Image,
+    width: int,
+    height: int,
+    plan: Any,
+    analysis: VisualAnalysis,
+) -> list[TextBlock]:
+    layers_by_id = {layer.id: layer for layer in analysis.marketing_text_layers}
+    blocks: list[TextBlock] = []
+    area_scale = ((width * height) / max(1, source.width * source.height)) ** 0.5
+    area_scale = max(0.72, min(2.35, area_scale))
+    for placement in sorted(plan.placements, key=lambda item: item.z_index):
+        if placement.role not in {LayerRole.MARKETING_TEXT, LayerRole.CTA}:
+            continue
+        layer = layers_by_id.get(placement.layer_id)
+        if layer is None or not layer.original_text.strip():
+            continue
+        source_box = layer.bbox.to_pixel_box(source.width, source.height)
+        target_box = placement.target_bbox.to_pixel_box(width, height)
+        style = layer.text_style
+        source_height = max(1, source_box[3] - source_box[1])
+        source_lines = [line.strip() for line in layer.original_text.splitlines() if line.strip()]
+        line_count = max(1, len(source_lines))
+        source_font_size = int(style.estimated_font_size) if style and style.estimated_font_size else max(8, int(source_height / line_count * 0.72))
+        target_line_capacity = max(8, int(max(1, target_box[3] - target_box[1]) / line_count * 0.76))
+        font_size = max(8, min(180, int(round(min(source_font_size * area_scale, target_line_capacity)))))
+        color = smart_reframe_text_style_to_block_color(style)
+        font_weight = 700 if style is None or style.is_bold else 400
+        align = style.alignment if style and style.alignment != "unknown" else "center"
+        font_category = (style.font_type if style and style.font_type != "unknown" else "sans-serif").replace("script", "handwriting")
+        words = [word for word in layer.original_text.replace("\n", " ").split() if word]
+        source_word_styles = [
+            {
+                "id": f"{layer.id}-w{index}",
+                "text": word,
+                "bbox": [target_box[0], target_box[1], target_box[0] + max(1, font_size), target_box[1] + font_size],
+                "fontSize": font_size,
+                "peerRowFontSize": font_size,
+                "fontWeight": font_weight,
+                "fontCategory": font_category,
+                "color": color,
+                "lineIndex": 0,
+            }
+            for index, word in enumerate(words)
+        ]
+        spans = [
+            {
+                "translatedText": layer.translated_text.strip() or layer.original_text.strip(),
+                "sourceText": layer.original_text.strip(),
+                "semanticRole": layer.role.value,
+                "matchedSourceRole": layer.role.value,
+                "sourceWordStyles": source_word_styles,
+                "sourceWordIds": [item["id"] for item in source_word_styles],
+                "style": {
+                    "fontFamily": "DejaVu Sans",
+                    "fontCategory": font_category,
+                    "fontWeight": font_weight,
+                    "fontSize": font_size,
+                    "color": color,
+                    "opacity": 1.0,
+                    "letterSpacing": 0.0,
+                    "lineHeight": int(round(font_size * 1.18)),
+                    "alignment": align,
+                    "casing": "uppercase" if style and style.uppercase else "mixed",
+                    "strokeWidth": 0,
+                    "strokeFill": None,
+                },
+            }
+        ]
+        block = TextBlock(
+            id=f"v5-resize-{layer.id}",
+            text=layer.original_text.strip(),
+            translated_text=layer.translated_text.strip() or layer.original_text.strip(),
+            role=layer.role.value,
+            translate=True,
+            bbox=target_box,
+            clean_box=target_box,
+            font_weight=font_weight,
+            font_size_estimate=font_size,
+            line_height_estimate=int(round(font_size * 1.18)),
+            color=color,
+            align=align,
+            surface="overlay",
+            line_boxes=[target_box],
+            line_texts=source_lines or [layer.original_text.strip()],
+            source_word_styles=source_word_styles,
+            translated_style_spans=spans,
+            render_strategy="resize_compositor_redraw",
+        )
+        blocks.append(block)
+    return blocks
+
+
+def render_clean_base_outpaint_for_compositor(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
+    vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
+    if openai_outpaint_enabled:
+        try:
+            rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
+            return rendered, {**meta, "strategy": "openai_outpaint_clean_base"}
+        except Exception as exc:
+            if vertex_outpaint_enabled and vertex_available():
+                rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+                return rendered, {**meta, "strategy": "vertex_outpaint_clean_base_after_openai_failed", "openaiFallbackReason": str(exc)}
+            raise
+    if vertex_outpaint_enabled and vertex_available():
+        rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
+        return rendered, {**meta, "strategy": "vertex_outpaint_clean_base"}
+    raise RuntimeError("No outpaint provider is enabled for deterministic compositor.")
+
+
 def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+    if env_flag("ADAPTIFAI_ENABLE_DETERMINISTIC_COMPOSITOR", "1"):
+        text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
+        return render_deterministic_compositor(
+            source,
+            width,
+            height,
+            plan,
+            analysis,
+            text_blocks=text_blocks,
+            draw_text=draw_fitted_localize_v2_text,
+            outpaint_renderer=render_clean_base_outpaint_for_compositor,
+            fallback_renderer=render_nonblur_contain_placeholder,
+        )
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
     openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
