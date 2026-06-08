@@ -396,6 +396,8 @@ def should_use_vertical_band_relayout(source: Image.Image, width: int, height: i
 def should_use_source_fit(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
     target_ratio = width / max(1, height)
     source_ratio = source.width / max(1, source.height)
+    if source_ratio > 1.35 and target_ratio > 1.35:
+        return True
     if abs(source_ratio - target_ratio) <= 0.18:
         return True
     if target_ratio >= 0.75 and target_ratio <= 1.25 and abs(source_ratio - target_ratio) <= 0.32:
