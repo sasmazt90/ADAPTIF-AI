@@ -547,6 +547,9 @@ def build_visual_analysis_prompt(target_language: str) -> str:
         f"Target language: {target_language}. "
         "For background, classify type as solid, gradient, soft_blur, photographic, textured, patterned, or unknown; "
         "estimate texture_complexity from 0 to 1 and can_extend_without_ai. Include exact source_width and source_height. "
+        "Use these exact top-level keys whenever possible: background, product_layers, text_layers, logo_layers, other_layers, saliency_summary, quality_warnings. "
+        "Prefer bbox objects like {\"ymin\": 0, \"xmin\": 0, \"ymax\": 100, \"xmax\": 100}; do not use unlabeled bbox arrays unless unavoidable. "
+        "Every layer must include id, role, bbox, confidence, saliency, protected, and notes. Text layers must also include original_text, translated_text, translate, and text_style. "
         "In saliency_summary, describe the main protected subject, visual theme, and which side elements can be partial in narrower formats. "
         "Do not include markdown."
     )
@@ -574,10 +577,39 @@ def _normalize_layer_payload(layer: Any, index: int, prefix: str) -> dict[str, A
                 break
     if "bbox" not in normalized:
         return None
+    if isinstance(normalized.get("bbox"), list):
+        try:
+            values = [max(0, min(1000, round(float(item)))) for item in normalized["bbox"][:4]]
+            # Vision models frequently emit list boxes as [xmin, ymin, xmax, ymax]
+            # even when prompted otherwise. Object-shaped bboxes remain authoritative;
+            # bare lists are normalized as xyxy to avoid transposed product/text layers.
+            normalized["bbox"] = BBox1000(
+                ymin=values[1],
+                xmin=values[0],
+                ymax=values[3],
+                xmax=values[2],
+            ).model_dump()
+        except Exception:
+            return None
+    elif isinstance(normalized.get("bbox"), dict):
+        try:
+            bbox = dict(normalized["bbox"])
+            for key in ("ymin", "xmin", "ymax", "xmax"):
+                if key in bbox:
+                    bbox[key] = max(0, min(1000, round(float(bbox[key]))))
+            normalized["bbox"] = bbox
+        except Exception:
+            return None
     normalized["notes"] = _stringify_notes(normalized.get("notes", ""))
     role = normalized.get("role")
     if isinstance(role, str):
-        normalized["role"] = role.strip().lower()
+        normalized["role"] = role.strip().lower().replace(" ", "_").replace("-", "_")
+    elif prefix == "product":
+        normalized["role"] = LayerRole.PRODUCT.value
+    elif prefix == "logo":
+        normalized["role"] = LayerRole.LOGO.value
+    else:
+        normalized.setdefault("role", LayerRole.UNKNOWN.value)
     return normalized
 
 
@@ -585,9 +617,41 @@ def _normalize_text_layer_payload(layer: Any, index: int) -> dict[str, Any] | No
     normalized = _normalize_layer_payload(layer, index, "text")
     if normalized is None:
         return None
+    role = str(normalized.get("role") or "").strip().lower().replace(" ", "_").replace("-", "_")
+    if role not in {LayerRole.MARKETING_TEXT.value, LayerRole.CTA.value, LayerRole.PRODUCT_LABEL_TEXT.value}:
+        normalized["role"] = LayerRole.MARKETING_TEXT.value
     text = normalized.get("original_text") or normalized.get("text") or normalized.get("copy") or ""
     normalized["original_text"] = str(text)
     normalized.setdefault("translated_text", normalized["original_text"])
+    text_style = normalized.get("text_style") or normalized.get("textStyle") or normalized.get("style")
+    if isinstance(text_style, str):
+        lowered = text_style.lower()
+        normalized["text_style"] = {
+            "color_rgb": normalized.get("color_rgb") or normalized.get("colorRgb") or {"r": 17, "g": 17, "b": 17},
+            "is_bold": "bold" in lowered,
+            "font_type": "sans-serif",
+            "estimated_font_size": normalized.get("estimated_font_size") or normalized.get("font_size"),
+            "uppercase": "uppercase" in lowered or "all_caps" in lowered,
+            "alignment": normalized.get("alignment") or "unknown",
+        }
+    elif isinstance(text_style, dict):
+        color = text_style.get("color_rgb") or text_style.get("colorRgb") or text_style.get("color")
+        if isinstance(color, list):
+            color = RGBColor.from_list(color).model_dump()
+        if isinstance(color, str) and color.startswith("#") and len(color) in {7, 9}:
+            color = {
+                "r": int(color[1:3], 16),
+                "g": int(color[3:5], 16),
+                "b": int(color[5:7], 16),
+            }
+        normalized["text_style"] = {
+            "color_rgb": color or {"r": 17, "g": 17, "b": 17},
+            "is_bold": bool(text_style.get("is_bold") or text_style.get("bold") or text_style.get("font_weight") == 700),
+            "font_type": str(text_style.get("font_type") or text_style.get("fontCategory") or text_style.get("font_family") or "sans-serif").lower().replace("_", "-"),
+            "estimated_font_size": text_style.get("estimated_font_size") or text_style.get("fontSize") or text_style.get("font_size"),
+            "uppercase": bool(text_style.get("uppercase") or text_style.get("is_uppercase") or text_style.get("all_caps")),
+            "alignment": str(text_style.get("alignment") or text_style.get("align") or "unknown").lower(),
+        }
     return normalized
 
 
@@ -611,14 +675,64 @@ def parse_visual_analysis_payload(payload: dict[str, Any]) -> VisualAnalysis:
     if not normalized["background"]["dominant_color_rgb"]:
         normalized["background"]["dominant_color_rgb"] = {"r": 245, "g": 245, "b": 245}
 
+    layer_aliases = {
+        "product_layers": (
+            "product_layers",
+            "productLayers",
+            "products",
+            "product_foreground",
+            "productForeground",
+            "foreground_layers",
+            "foregroundLayers",
+            "main_subject_layers",
+            "mainSubjectLayers",
+        ),
+        "logo_layers": ("logo_layers", "logoLayers", "logos", "brand_layers", "brandLayers"),
+        "other_layers": (
+            "other_layers",
+            "otherLayers",
+            "decorative_layers",
+            "decorativeLayers",
+            "background_layers",
+            "backgroundLayers",
+            "secondary_theme_elements",
+            "secondaryThemeElements",
+            "theme_elements",
+            "themeElements",
+            "props",
+        ),
+    }
     for key, prefix in (("product_layers", "product"), ("logo_layers", "logo"), ("other_layers", "layer")):
-        source_layers = normalized.get(key) or normalized.get(key.replace("_", "")) or []
+        source_layers = []
+        for alias in layer_aliases[key]:
+            value = normalized.get(alias)
+            if isinstance(value, list):
+                source_layers = value
+                break
         normalized[key] = [
             item
             for index, layer in enumerate(source_layers if isinstance(source_layers, list) else [])
             if (item := _normalize_layer_payload(layer, index, prefix)) is not None
         ]
-    source_text_layers = normalized.get("text_layers") or normalized.get("textLayers") or []
+    source_text_layers = []
+    for alias in (
+        "text_layers",
+        "textLayers",
+        "marketing_text_layers",
+        "marketingTextLayers",
+        "marketing_copy_layers",
+        "marketingCopyLayers",
+        "copy_layers",
+        "copyLayers",
+        "cta_layers",
+        "ctaLayers",
+        "texts",
+        "text",
+    ):
+        value = normalized.get(alias)
+        if isinstance(value, list):
+            source_text_layers = value
+            break
     normalized["text_layers"] = [
         item
         for index, layer in enumerate(source_text_layers if isinstance(source_text_layers, list) else [])

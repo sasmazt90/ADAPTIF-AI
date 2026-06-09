@@ -227,6 +227,7 @@ class TextBlock(BaseModel):
     source_word_styles: list[dict[str, Any]] = Field(default_factory=list)
     translation_candidates: list[dict[str, str]] = Field(default_factory=list)
     target_language: str | None = None
+    resize_source_box: tuple[int, int, int, int] | None = None
     cleanup_confidence: float = 1.0
     cleanup_strategy: str = "clean_replace"
     render_strategy: str = "clean_replace"
@@ -9172,7 +9173,7 @@ def render_styled_spans(
                 bg_pad_y = max(1, int(round(float(token_style.get("sourcePixelHeight") or line_font_size or 16) * 0.10)))
                 bg_left = max(0, int(round(x)) - bg_pad_x)
                 bg_top = max(0, int(top) - bg_pad_y)
-                bg_right = min(getattr(draw._image, "width", int(right)), int(right) + bg_pad_x)
+                bg_right = min(getattr(draw._image, "width", int(right)), int(round(x + advance)) + bg_pad_x)
                 bg_bottom = min(getattr(draw._image, "height", int(bottom)), int(bottom) + bg_pad_y)
                 if bg_right > bg_left and bg_bottom > bg_top:
                     draw.rectangle((bg_left, bg_top, bg_right, bg_bottom), fill=token_style.get("backgroundColor"))
@@ -12351,6 +12352,17 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         analysis = parse_visual_analysis_payload(payload)
         if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
             raise ValueError("openai analysis returned no actionable visual layers")
+        source_ratio = source.width / max(1, source.height)
+        if source_ratio > 1.35 and analysis.product_layers:
+            usable_products = []
+            for layer in analysis.product_layers:
+                left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
+                height_ratio = (bottom - top) / max(1, source.height)
+                center_y = (top + bottom) / 2
+                if height_ratio >= 0.38 and center_y >= source.height * 0.24:
+                    usable_products.append(layer)
+            if not usable_products:
+                raise ValueError("openai analysis product boxes are label/top fragments, not full visual subjects")
         if analysis.source_width != source.width or analysis.source_height != source.height:
             analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
         warnings = [*analysis.quality_warnings, "analysis_provider:openai"]
@@ -12413,6 +12425,17 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
         analysis = parse_visual_analysis_payload(parsed)
         if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
             raise ValueError("gemini analysis returned no actionable visual layers")
+        source_ratio = source.width / max(1, source.height)
+        if source_ratio > 1.35 and analysis.product_layers:
+            usable_products = []
+            for layer in analysis.product_layers:
+                left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
+                height_ratio = (bottom - top) / max(1, source.height)
+                center_y = (top + bottom) / 2
+                if height_ratio >= 0.38 and center_y >= source.height * 0.24:
+                    usable_products.append(layer)
+            if not usable_products:
+                raise ValueError("gemini analysis product boxes are label/top fragments, not full visual subjects")
         if analysis.source_width != source.width or analysis.source_height != source.height:
             analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
         warnings = [*analysis.quality_warnings, "analysis_provider:gemini"]
@@ -13106,6 +13129,20 @@ def should_outpaint_uncertain_full_subject(analysis: VisualAnalysis) -> bool:
 
 def build_outpaint_seed_and_mask(source: Image.Image, width: int, height: int, plan: Any) -> tuple[Image.Image, Image.Image, dict[str, Any]]:
     source_rgba = source.convert("RGBA")
+    if source_rgba.size == (width, height) and source_rgba.getchannel("A").getbbox():
+        alpha = source_rgba.getchannel("A")
+        alpha_values = np.array(alpha, dtype=np.uint8)
+        if int(np.count_nonzero(alpha_values < 250)) > 0:
+            mask = Image.new("RGBA", (width, height), (255, 255, 255, 0))
+            protected = Image.new("RGBA", (width, height), (255, 255, 255, 255))
+            protected.putalpha(alpha)
+            mask.alpha_composite(protected, (0, 0))
+            return source_rgba, mask, {
+                "sourcePasteBox": [0, 0, width, height],
+                "sourceScale": 1.0,
+                "layoutSeedAlphaProtectedPixels": int(np.count_nonzero(alpha_values >= 250)),
+                "layoutSeedTransparentPixels": int(np.count_nonzero(alpha_values < 250)),
+            }
     seed = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     mask = Image.new("RGBA", (width, height), (255, 255, 255, 0))
 
@@ -13157,6 +13194,9 @@ def build_compositor_background_outpaint_prompt(plan: Any, analysis: VisualAnaly
     return (
         "Extend this advertising creative only into the transparent or masked canvas area. "
         "The opaque seed pixels are protected and must remain visually unchanged: preserve existing product shape, product label, logo, lighting, shadows, and background exactly where they already exist. "
+        "Do not redesign the ad. Do not add frames, cards, black bars, torn-paper edges, borders, panels, UI, stickers, or decorative graphic systems. "
+        "Do not create any new product, bottle, package, cap, pump, person, badge, icon, label, or logo. "
+        "Do not alter, rewrite, regenerate, translate, or approximate any visible product-label text or brand marks in the protected seed. "
         "Marketing text may have been removed from the seed; do not recreate it during outpaint because deterministic code will composite final typography later. "
         "Fill only missing canvas with a natural continuation of the existing scene, matching lighting, color, grain, texture, perspective, and campaign theme. "
         "If an existing protected product or material is visibly cut by the canvas boundary, continue only that same visible form naturally; do not invent additional products, props, panels, UI, labels, packaging, people, or decorative objects. "
@@ -13269,7 +13309,9 @@ def build_vertex_outpaint_base_and_mask(seed: Image.Image, seed_meta: dict[str, 
     rgba_seed = seed.convert("RGBA")
     alpha = np.array(rgba_seed.getchannel("A"), dtype=np.uint8)
     rgb_seed = rgba_seed.convert("RGB")
-    if int(np.count_nonzero(alpha)) < seed.width * seed.height:
+    if seed_meta.get("layoutSeedTransparentPixels"):
+        base = rgb_seed
+    elif int(np.count_nonzero(alpha)) < seed.width * seed.height:
         visible = np.array(rgb_seed, dtype=np.uint8)[alpha > 0]
         fill_color = tuple(int(value) for value in (visible.mean(axis=0) if visible.size else np.array([245, 245, 245])))
         base = Image.new("RGB", seed.size, fill_color)
@@ -13277,17 +13319,21 @@ def build_vertex_outpaint_base_and_mask(seed: Image.Image, seed_meta: dict[str, 
     else:
         base = rgb_seed
 
-    mask = Image.new("L", seed.size, 255)
-    mask_draw = ImageDraw.Draw(mask)
-    mask_draw.rectangle(
-        (
-            max(0, min(seed.width, left)),
-            max(0, min(seed.height, top)),
-            max(0, min(seed.width, right)),
-            max(0, min(seed.height, bottom)),
-        ),
-        fill=0,
-    )
+    if seed_meta.get("layoutSeedTransparentPixels"):
+        mask_arr = np.where(alpha >= 250, 0, 255).astype(np.uint8)
+        mask = Image.fromarray(mask_arr, "L")
+    else:
+        mask = Image.new("L", seed.size, 255)
+        mask_draw = ImageDraw.Draw(mask)
+        mask_draw.rectangle(
+            (
+                max(0, min(seed.width, left)),
+                max(0, min(seed.height, top)),
+                max(0, min(seed.width, right)),
+                max(0, min(seed.height, bottom)),
+            ),
+            fill=0,
+        )
     return base, mask.convert("RGB")
 
 
@@ -13442,6 +13488,50 @@ def smart_reframe_text_style_to_block_color(style: TextStyle | None) -> str:
     return rgb_to_hex(style.color_rgb.as_tuple())
 
 
+def sample_resize_text_background_color(source: Image.Image, source_box: tuple[int, int, int, int], text_color: str) -> tuple[bool, str | None]:
+    try:
+        fg = parse_hex_color(text_color, fallback=(17, 17, 17))
+        fg_luma = 0.2126 * fg[0] + 0.7152 * fg[1] + 0.0722 * fg[2]
+        left, top, right, bottom = source_box
+        pad_x = max(8, int((right - left) * 0.28))
+        pad_y = max(5, int((bottom - top) * 0.40))
+        crop_box = (
+            max(0, left - pad_x),
+            max(0, top - pad_y),
+            min(source.width, right + pad_x),
+            min(source.height, bottom + pad_y),
+        )
+        if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+            return False, None
+        arr = np.array(source.crop(crop_box).convert("RGB"), dtype=np.uint8).reshape(-1, 3)
+        if arr.size == 0:
+            return False, None
+        fg_arr = np.array(fg, dtype=np.float32)
+        dist = np.linalg.norm(arr.astype(np.float32) - fg_arr, axis=1)
+        candidates = arr[dist > 52]
+        if candidates.size == 0:
+            return False, None
+        saturated = np.empty((0, 3), dtype=np.uint8)
+        try:
+            import cv2
+
+            hsv = cv2.cvtColor(candidates.reshape(-1, 1, 3), cv2.COLOR_RGB2HSV).reshape(-1, 3)
+            saturated = candidates[(hsv[:, 1] > 48) & (hsv[:, 2] > 80)]
+            if saturated.size:
+                candidates = saturated
+        except Exception:
+            pass
+        if fg_luma < 210:
+            return False, None
+        bg = np.median(candidates.reshape(-1, 3), axis=0).astype(int)
+        bg_tuple = (int(bg[0]), int(bg[1]), int(bg[2]))
+        if saturated.size == 0 and contrast_ratio(bg_tuple, fg) < 2.1:
+            return False, None
+        return True, rgb_to_hex(bg_tuple)
+    except Exception:
+        return False, None
+
+
 def build_resize_compositor_text_blocks(
     source: Image.Image,
     width: int,
@@ -13451,8 +13541,12 @@ def build_resize_compositor_text_blocks(
 ) -> list[TextBlock]:
     layers_by_id = {layer.id: layer for layer in analysis.marketing_text_layers}
     blocks: list[TextBlock] = []
-    area_scale = ((width * height) / max(1, source.width * source.height)) ** 0.5
-    area_scale = max(0.72, min(2.35, area_scale))
+    source_area = max(1, source.width * source.height)
+    target_area = max(1, width * height)
+    # Resize typography follows the actual requested canvas area, not the
+    # narrowest axis. A larger target should let marketing copy grow; a smaller
+    # target should shrink copy while preserving the original style hierarchy.
+    area_scale = max(0.42, min(2.35, (target_area / source_area) ** 0.5))
     text_source_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.marketing_text_layers]
     if text_source_boxes:
         text_source_union = (
@@ -13498,6 +13592,26 @@ def build_resize_compositor_text_blocks(
         target_line_capacity = max(8, int(max(1, target_box[3] - target_box[1]) / line_count * 0.76))
         font_size = max(8, min(180, int(round(min(source_font_size * area_scale, target_line_capacity)))))
         color = smart_reframe_text_style_to_block_color(style)
+        _has_text_background, _text_background_color = sample_resize_text_background_color(source, source_box, color)
+        # Resize redraw must not invent solid rectangular backing plates. Those
+        # plates can cover the recomposed product layer and make the output look
+        # like text was drawn inside a foreign frame. Saturated source highlight
+        # bars are allowed; neutral white/gray backing plates are suppressed.
+        has_text_background = False
+        text_background_color = None
+        if _has_text_background and _text_background_color:
+            try:
+                bg_r, bg_g, bg_b = hex_to_rgb(_text_background_color)
+                bg_max = max(bg_r, bg_g, bg_b)
+                bg_min = min(bg_r, bg_g, bg_b)
+                bg_saturation = (bg_max - bg_min) / max(1, bg_max)
+                bg_luma = 0.2126 * bg_r + 0.7152 * bg_g + 0.0722 * bg_b
+                if bg_saturation >= 0.18 and bg_luma < 248:
+                    has_text_background = True
+                    text_background_color = _text_background_color
+            except Exception:
+                has_text_background = False
+                text_background_color = None
         font_weight = 700 if style is None or style.is_bold else 400
         align = style.alignment if style and style.alignment != "unknown" else "center"
         font_category = (style.font_type if style and style.font_type != "unknown" else "sans-serif").replace("script", "handwriting")
@@ -13512,6 +13626,8 @@ def build_resize_compositor_text_blocks(
                 "fontWeight": font_weight,
                 "fontCategory": font_category,
                 "color": color,
+                "hasTextBackground": has_text_background,
+                "backgroundColor": text_background_color,
                 "lineIndex": 0,
             }
             for index, word in enumerate(words)
@@ -13530,6 +13646,8 @@ def build_resize_compositor_text_blocks(
                     "fontWeight": font_weight,
                     "fontSize": font_size,
                     "color": color,
+                    "hasTextBackground": has_text_background,
+                    "backgroundColor": text_background_color,
                     "opacity": 1.0,
                     "letterSpacing": 0.0,
                     "lineHeight": int(round(font_size * 1.18)),
@@ -13556,6 +13674,7 @@ def build_resize_compositor_text_blocks(
             surface="overlay",
             line_boxes=[target_box],
             line_texts=source_lines or [layer.original_text.strip()],
+            resize_source_box=source_box,
             source_word_styles=source_word_styles,
             translated_style_spans=spans,
             render_strategy="resize_compositor_redraw",
@@ -16765,7 +16884,8 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
             if is_v5:
                 box = expand_v5_single_line_render_box(draw, block, box, canvas.size)
                 box = expand_v5_render_box_for_line_fit(draw, block, box, canvas.size)
-                clear_v5_source_background_lines(canvas, block)
+                if block.render_strategy != "resize_compositor_redraw":
+                    clear_v5_source_background_lines(canvas, block)
             
             # KURAL: Sadece X ekseninde (yatayda) kesi?en bloklar birbirini Y ekseninde a?a?? iter
             start_y = box[1]

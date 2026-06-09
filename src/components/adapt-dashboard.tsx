@@ -781,7 +781,12 @@ function InstagramLogo({ compact = false }: { compact?: boolean }) {
       </span>
     );
   }
-  return <span className="font-serif text-[28px] font-black tracking-normal text-[#111]">Instagram</span>;
+  return (
+    <span className="inline-flex items-center gap-2 text-[18px] font-black tracking-normal text-[#111]">
+      <InstagramLogo compact />
+      <span>Instagram</span>
+    </span>
+  );
 }
 
 function LinkedInLogo({ compact = true }: { compact?: boolean }) {
@@ -1513,6 +1518,8 @@ export function AdaptDashboard() {
           : "user_selected";
       return {
         ...base,
+        brandName: "ADAPTIF-AI",
+        username: "ADAPTIF-AI",
         carouselAssets: carouselPreviewAssets,
         carouselAssetsProvided: carouselPreviewAssets.length > 1,
         activeSlideIndex: creativeMode === "carousel" && activeResizeOutput
@@ -2190,7 +2197,7 @@ export function AdaptDashboard() {
               {resizeResultView === "asset" ? (
                 <ResizeAssetPreview output={activeResizeOutput} />
               ) : mode === "resize" ? (
-                <div className="flex items-start justify-center overflow-auto px-4 py-8">
+                <div className="flex min-h-[720px] items-start justify-center overflow-x-auto overflow-y-visible bg-[#f3f0e8] px-4 py-10">
                 <Preview placement={activePlacement} mode={mode} device={previewDevice} copy={copy} x={0} y={0} opacity={opacity} scale={100} fit={fit} imageUrl={activeResizeOutput?.download_url} metadata={previewMetadata} previewTemplateId={activePreviewVariant.templateId} />
                 </div>
               ) : (
