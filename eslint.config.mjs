@@ -14,6 +14,9 @@ const eslintConfig = defineConfig([
     "out/**",
     "output/**",
     "build/**",
+    "backend/tmp/**",
+    "ADAPTIFAI TEST IMAGES/**",
+    ".claude/**",
     "next-env.d.ts",
   ]),
 ]);

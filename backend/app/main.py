@@ -13168,24 +13168,6 @@ def build_outpaint_seed_and_mask(source: Image.Image, width: int, height: int, p
     }
 
 
-def build_openai_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
-    product_notes = ", ".join(layer.id for layer in analysis.product_layers[:3]) or "main product"
-    text_notes = ", ".join(layer.original_text for layer in analysis.marketing_text_layers[:2]) or "existing ad text"
-    theme_notes = "; ".join(
-        f"{layer.id}:{layer.notes or layer.role.value}"
-        for layer in analysis.other_layers[:4]
-    ) or analysis.saliency_summary or "existing campaign theme"
-    return (
-        "Extend this finished advertising creative to the transparent canvas area only. "
-        "Preserve the pasted original creative exactly: do not alter, translate, move, crop, blur, or redraw any existing text, logo, product label, product, person, or foreground object. "
-        "Fill only the transparent/masked area with a natural continuation of the existing background, matching lighting, blur, grain, color, texture, perspective, and campaign theme. "
-        "If the new aspect ratio is narrower/taller, keep the protected subject fully visible and let secondary decorative/theme elements appear resized, shifted, or partially visible only in the newly generated area. "
-        f"Placement: {plan.placement_id}. Bucket: {plan.logic_bucket.value}. Important protected subjects: {product_notes}. Existing marketing text to preserve: {text_notes}. "
-        f"Theme/secondary elements to respect: {theme_notes}. "
-        "No new text, no new logo, no watermark, no extra objects, no duplicated product."
-    )
-
-
 def build_compositor_background_outpaint_prompt(plan: Any, analysis: VisualAnalysis) -> str:
     theme_notes = "; ".join(
         f"{layer.id}:{layer.notes or layer.role.value}"
@@ -13204,53 +13186,6 @@ def build_compositor_background_outpaint_prompt(plan: Any, analysis: VisualAnaly
         f"Theme reference: {theme_notes}. "
         "Return a clean completed creative canvas with no new text and no new objects."
     )
-
-
-def render_openai_outpaint_reframe(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required for OpenAI outpaint resize.")
-
-    model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
-    quality = os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium"
-    if quality not in {"low", "medium", "high", "auto"}:
-        quality = "medium"
-
-    seed, mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
-    image_file = io.BytesIO()
-    seed.save(image_file, format="PNG")
-    image_file.seek(0)
-    mask_file = io.BytesIO()
-    mask.save(mask_file, format="PNG")
-    mask_file.seek(0)
-
-    client = OpenAI(api_key=api_key)
-    response, api_variant = create_openai_image_edit_with_fallback(
-        client,
-        {
-            "model": model,
-            "image": ("smart-reframe-seed.png", image_file, "image/png"),
-            "mask": ("smart-reframe-mask.png", mask_file, "image/png"),
-            "prompt": build_openai_outpaint_prompt(plan, analysis),
-            "quality": quality,
-        },
-        [image_file, mask_file],
-        output_format="png",
-        size="auto",
-        width=width,
-        height=height,
-    )
-    rendered = decode_openai_image_response(response)
-    if rendered.size != (width, height):
-        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
-    return rendered, {
-        "provider": "openai",
-        "model": model,
-        "quality": quality,
-        "strategy": "openai_outpaint",
-        "apiVariant": api_variant,
-        **seed_meta,
-    }
 
 
 def render_openai_compositor_background_outpaint(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
@@ -13335,79 +13270,6 @@ def build_vertex_outpaint_base_and_mask(seed: Image.Image, seed_meta: dict[str, 
             fill=0,
         )
     return base, mask.convert("RGB")
-
-
-def render_vertex_outpaint_reframe(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
-    if not vertex_available():
-        raise RuntimeError("Vertex service account is not configured.")
-    seed, _openai_mask, seed_meta = build_outpaint_seed_and_mask(source, width, height, plan)
-    base_image, mask_image = build_vertex_outpaint_base_and_mask(seed, seed_meta)
-    project_id = vertex_project_id()
-    location = vertex_location()
-    model = vertex_imagen_edit_model()
-    endpoint = (
-        f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
-        f"locations/{location}/publishers/google/models/{model}:predict"
-    )
-    prompt = build_openai_outpaint_prompt(plan, analysis)
-    response = vertex_authorized_session().post(
-        endpoint,
-        json={
-            "instances": [
-                {
-                    "prompt": prompt,
-                    "referenceImages": [
-                        {
-                            "referenceType": "REFERENCE_TYPE_RAW",
-                            "referenceId": 1,
-                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(base_image)},
-                        },
-                        {
-                            "referenceType": "REFERENCE_TYPE_MASK",
-                            "referenceId": 2,
-                            "referenceImage": {"bytesBase64Encoded": image_to_base64_png(mask_image)},
-                            "maskImageConfig": {
-                                "maskMode": "MASK_MODE_USER_PROVIDED",
-                                "dilation": float(os.getenv("VERTEX_IMAGEN_MASK_DILATION", "0.03")),
-                            },
-                        },
-                    ],
-                }
-            ],
-            "parameters": {
-                "sampleCount": 1,
-                "editMode": "EDIT_MODE_OUTPAINT",
-                "editConfig": {
-                    "baseSteps": int(os.getenv("VERTEX_IMAGEN_EDIT_STEPS", "35")),
-                    "outpaintingConfig": {
-                        "blendingMode": os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_MODE", "alpha-blending"),
-                        "blendingFactor": float(os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_FACTOR", "0.01")),
-                    },
-                },
-                "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
-                "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
-            },
-        },
-        timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "35")),
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as exc:
-        raise RuntimeError(f"Vertex Imagen outpaint failed with HTTP {response.status_code}: {response.text[:1200]}") from exc
-    payload = response.json()
-    predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
-    if not predictions:
-        raise ValueError("Vertex Imagen outpaint returned no predictions.")
-    rendered = decode_vertex_imagen_prediction(predictions[0])
-    if rendered.size != (width, height):
-        rendered = rendered.resize((width, height), Image.Resampling.LANCZOS)
-    return rendered, {
-        "provider": "vertex",
-        "model": model,
-        "location": location,
-        "strategy": "vertex_outpaint",
-        **seed_meta,
-    }
 
 
 def render_vertex_compositor_background_outpaint(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
@@ -13757,89 +13619,18 @@ def render_clean_base_outpaint_for_compositor(source: Image.Image, width: int, h
 
 
 def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
-    if env_flag("ADAPTIFAI_ENABLE_DETERMINISTIC_COMPOSITOR", "1"):
-        text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
-        return render_deterministic_compositor(
-            source,
-            width,
-            height,
-            plan,
-            analysis,
-            text_blocks=text_blocks,
-            draw_text=draw_fitted_localize_v2_text,
-            outpaint_renderer=render_clean_base_outpaint_for_compositor,
-            fallback_renderer=render_nonblur_contain_placeholder,
-        )
-    if not env_flag("ADAPTIFAI_ALLOW_LEGACY_FULL_IMAGE_RESIZE_OUTPAINT", "0"):
-        text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
-        rendered, meta = render_deterministic_compositor(
-            source,
-            width,
-            height,
-            plan,
-            analysis,
-            text_blocks=text_blocks,
-            draw_text=draw_fitted_localize_v2_text,
-            outpaint_renderer=render_clean_base_outpaint_for_compositor,
-            fallback_renderer=render_nonblur_contain_placeholder,
-        )
-        return rendered, {
-            **meta,
-            "legacyFullImageOutpaintBlocked": True,
-            "legacyFullImageOutpaintReason": "resize must not let image models redraw typography or brand marks",
-        }
-    if plan.logic_bucket == LogicBucket.NARROW_BANNER:
-        return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
-    openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}
-    vertex_outpaint_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_OUTPAINT", "1")
-    should_try_outpaint = should_outpaint_uncertain_full_subject(analysis) or plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT
-    if should_try_outpaint and openai_outpaint_enabled:
-        try:
-            rendered, meta = render_openai_outpaint_reframe(source, width, height, plan, analysis)
-            strategy = "openai_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "openai_outpaint"
-            return rendered, {**meta, "strategy": strategy}
-        except Exception as exc:
-            blocked_by_safety = "moderation" in str(exc).lower() or "safety" in str(exc).lower()
-            if vertex_outpaint_enabled and vertex_available():
-                try:
-                    rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
-                    return rendered, {
-                        **meta,
-                        "strategy": "vertex_outpaint_after_openai_failed",
-                        "openaiFallbackReason": str(exc),
-                    }
-                except Exception as vertex_exc:
-                    fallback = render_nonblur_contain_placeholder(source, width, height)
-                    return fallback, {
-                        "provider": "local",
-                        "strategy": "nonblur_contain_placeholder_vertex_outpaint_failed",
-                        "productionReady": False,
-                        "fallbackReason": str(vertex_exc),
-                        "openaiFallbackReason": str(exc),
-                    }
-            fallback = render_nonblur_contain_placeholder(source, width, height)
-            return fallback, {
-                "provider": "local",
-                "strategy": "nonblur_edge_extend_moderation_fallback" if blocked_by_safety else "nonblur_contain_placeholder_openai_outpaint_failed",
-                "productionReady": True if blocked_by_safety else False,
-                "fallbackReason": str(exc),
-            }
-    if should_try_outpaint and vertex_outpaint_enabled and vertex_available():
-        try:
-            rendered, meta = render_vertex_outpaint_reframe(source, width, height, plan, analysis)
-            strategy = "vertex_outpaint_uncertain_full_subject" if should_outpaint_uncertain_full_subject(analysis) else "vertex_outpaint"
-            return rendered, {**meta, "strategy": strategy}
-        except Exception as exc:
-            fallback = render_nonblur_contain_placeholder(source, width, height)
-            return fallback, {
-                "provider": "local",
-                "strategy": "nonblur_contain_placeholder_vertex_outpaint_failed",
-                "productionReady": False,
-                "fallbackReason": str(exc),
-            }
-    if plan.logic_bucket == LogicBucket.LARGE_RECTANGLE and height / max(1, width) >= 1.5:
-        return render_large_rectangle_relayout(source, width, height, analysis)
-    return render_nonblur_contain_placeholder(source, width, height), {"provider": "local", "strategy": f"{plan.expansion.strategy.value}_nonblur_contain_placeholder", "productionReady": False}
+    text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
+    return render_deterministic_compositor(
+        source,
+        width,
+        height,
+        plan,
+        analysis,
+        text_blocks=text_blocks,
+        draw_text=draw_fitted_localize_v2_text,
+        outpaint_renderer=render_clean_base_outpaint_for_compositor,
+        fallback_renderer=render_nonblur_contain_placeholder,
+    )
 
 
 def crop_to_ratio(image: Image.Image, focus_bbox: tuple[int, int, int, int], target_ratio: float, offset_x: int = 0, offset_y: int = 0) -> Image.Image:
@@ -17054,7 +16845,25 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
         y += line_height
 
 
-def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
+def draw_v5_numeric_bypass_fallback(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
+    box = tuple(int(value) for value in block.bbox)
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return
+    text = (block.text or block.translated_text or "").strip()
+    if not text:
+        return
+    font_size = max(8, min(220, int(block.font_size_estimate or (box[3] - box[1]) * 0.86)))
+    font = get_font(font_size, bold=block.font_weight >= 700)
+    fill = block.color or "#111111"
+    text_box = draw.textbbox((0, 0), text, font=font)
+    text_width_px = text_box[2] - text_box[0]
+    text_height_px = text_box[3] - text_box[1]
+    x = box[0] if block.align == "left" else box[0] + max(0, (box[2] - box[0] - text_width_px) // 2)
+    y = box[1] + max(0, (box[3] - box[1] - text_height_px) // 2) - text_box[1]
+    draw.text((x, y), text, fill=fill, font=font)
+
+
+def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock], *, numeric_bypass_restored: bool = False) -> Image.Image:
     canvas = base.convert("RGBA")
     draw = ImageDraw.Draw(canvas)
     normalize_v5_peer_row_font_sizes(blocks)
@@ -17064,6 +16873,8 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
     
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
+            if not numeric_bypass_restored:
+                draw_v5_numeric_bypass_fallback(draw, block)
             continue
         if block.render_strategy == "resize_display_copy_stack":
             draw_resize_display_copy_stack(draw, block)
@@ -17215,7 +17026,7 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
                     clear_v5_source_background_lines(render_base, block)
             restore_source_thin_horizontal_rules(render_base, source_image)
             restore_v5_numeric_bypass_from_source(render_base, source_image, blocks)
-            rendered = draw_fitted_localize_v2_text(render_base.convert("RGB"), blocks)
+            rendered = draw_fitted_localize_v2_text(render_base.convert("RGB"), blocks, numeric_bypass_restored=True)
             filename = localize_filename(image_path, language, output_format)
             output_path = job_dir / filename
             save_image_output(rendered, output_path, normalize_output_format(output_format, image_path))

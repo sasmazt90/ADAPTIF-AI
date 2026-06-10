@@ -43,10 +43,7 @@ def _clip_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[
     return left, top, right, bottom
 
 
-def _complete_truncated_foreground_edges(crop: Image.Image) -> Image.Image:
-    # Do not synthesize missing product edges with mirrored pixels. Product
-    # completion must come from a real provider completion layer; otherwise the
-    # layout engine must fit the available foreground without inventing geometry.
+def _prepare_foreground_rgba_crop(crop: Image.Image) -> Image.Image:
     return crop.convert("RGBA")
 
 
@@ -521,74 +518,6 @@ def _collect_visual_element_boxes(
     if len(merged) == 1 and _box_area(merged[0]) / source_area > 0.72:
         return [visual_box]
     return merged or [visual_box]
-
-
-def _collect_hero_cluster_boxes(
-    source: Image.Image,
-    analysis: VisualAnalysis,
-    visual_box: tuple[int, int, int, int],
-    visual_elements: list[tuple[int, int, int, int]],
-) -> list[tuple[int, int, int, int]]:
-    """Keep product and dependent side elements together as one hero cluster.
-
-    A resize should not separate guide lines, material swatches, splashes, hands,
-    or other visual support elements that are physically close to the product.
-    """
-    w, h = source.size
-    source_area = max(1, w * h)
-    cluster = list(visual_elements or [visual_box])
-    cluster_union = _union_boxes(cluster) or visual_box
-    max_gap_x = max(12, int(w * 0.055))
-    max_gap_y = max(10, int(h * 0.075))
-    text_boxes = [_layer_box(layer, source) for layer in analysis.marketing_text_layers]
-    brand_boxes = [_layer_box(layer, source) for layer in analysis.logo_layers]
-    forbidden = text_boxes + brand_boxes
-
-    def gap_to_cluster(box: tuple[int, int, int, int]) -> tuple[int, int]:
-        x_gap = max(0, cluster_union[0] - box[2], box[0] - cluster_union[2])
-        y_gap = max(0, cluster_union[1] - box[3], box[1] - cluster_union[3])
-        return x_gap, y_gap
-
-    for layer in analysis.other_layers:
-        box = _layer_box(layer, source)
-        if _box_area(box) <= 0:
-            continue
-        area_ratio = _box_area(box) / source_area
-        if not (0.002 <= area_ratio <= 0.38):
-            continue
-        if any(_box_overlap(box, blocked) / max(1, _box_area(box)) > 0.22 for blocked in forbidden):
-            continue
-        notes = str(getattr(layer, "notes", "") or "").lower()
-        role = str(getattr(layer, "role", "") or "").lower()
-        dependent_note = any(
-            token in f"{role} {notes}"
-            for token in (
-                "guide",
-                "line",
-                "callout",
-                "arrow",
-                "material",
-                "swatch",
-                "splash",
-                "texture",
-                "hand",
-                "prop",
-                "theme_element:true",
-                "side_component",
-                "support",
-            )
-        )
-        x_gap, y_gap = gap_to_cluster(box)
-        touches_or_near = x_gap <= max_gap_x and y_gap <= max_gap_y
-        if dependent_note or touches_or_near:
-            cluster.append(_pad_box(box, w, h, pad_x=max(3, w // 180), pad_y=max(3, h // 180)))
-            cluster_union = _union_boxes(cluster) or cluster_union
-
-    merged = _merge_overlapping_boxes(cluster, pad=max(6, min(w, h) // 80))
-    union = _union_boxes(merged)
-    if union and _box_area(union) / source_area <= 0.72:
-        return [union]
-    return visual_elements or [visual_box]
 
 
 def _foreground_component_visual_boxes(source: Image.Image) -> list[tuple[int, int, int, int]]:
@@ -1118,7 +1047,7 @@ def _apply_foreground_alpha(crop: Image.Image) -> Image.Image:
             alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
             alpha_ratio = float(np.count_nonzero(alpha > 8)) / max(1, alpha.size)
             if 0.045 <= alpha_ratio <= 0.88:
-                return _complete_truncated_foreground_edges(extracted)
+                return _prepare_foreground_rgba_crop(extracted)
         except Exception:
             pass
     try:
@@ -1203,7 +1132,7 @@ def _apply_foreground_alpha(crop: Image.Image) -> Image.Image:
             keep = mask
         keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=1.2, sigmaY=1.2)
         rgba.putalpha(Image.fromarray(keep, "L"))
-        return _complete_truncated_foreground_edges(rgba)
+        return _prepare_foreground_rgba_crop(rgba)
     except Exception:
         return crop.convert("RGBA")
 
@@ -1422,7 +1351,7 @@ def _source_crop_with_global_foreground_alpha(source: Image.Image, source_box: t
         alpha_crop = _remove_text_like_alpha_components(crop, alpha_crop)
         if np.count_nonzero(np.array(alpha_crop, dtype=np.uint8) > 16) >= max(64, crop.width * crop.height * 0.04):
             crop.putalpha(alpha_crop)
-            return _complete_truncated_foreground_edges(crop)
+            return _prepare_foreground_rgba_crop(crop)
     except Exception:
         pass
     return _apply_foreground_alpha(crop)
@@ -4250,7 +4179,6 @@ def render_deterministic_compositor(
         fallback_background_source = background_source
         provider_background_meta: dict[str, Any] = {}
         provider_ready = False
-        provider_visual_completion_source: Image.Image | None = None
         source_ratio = source.width / max(1, source.height)
         target_ratio = width / max(1, height)
         if (
@@ -4290,18 +4218,12 @@ def render_deterministic_compositor(
                         background_source = fallback_background_source
                         provider_background_meta["providerRejected"] = "edge_color_drift"
                         provider_background_meta["productionReady"] = False
-                        if os.getenv("ADAPTIFAI_RESIZE_USE_REJECTED_PROVIDER_AS_VISUAL_COMPLETION", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                            provider_visual_completion_source = provider_rgb
                         provider_ready = False
                     else:
-                        if os.getenv("ADAPTIFAI_RESIZE_ACCEPT_LAYOUT_SEED_PROVIDER_BACKGROUND", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                            background_source = provider_rgb
-                            provider_ready = True
-                        else:
-                            background_source = fallback_background_source
-                            provider_background_meta["providerRejected"] = "layout_seed_background_can_hallucinate_product_or_text"
-                            provider_background_meta["productionReady"] = False
-                            provider_ready = False
+                        background_source = fallback_background_source
+                        provider_background_meta["providerRejected"] = "layout_seed_background_can_hallucinate_product_or_text"
+                        provider_background_meta["productionReady"] = False
+                        provider_ready = False
                 else:
                     background_source = provider_rgb
                     provider_ready = True
@@ -4338,7 +4260,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
-                visual_completion_source=provider_visual_completion_source,
+                visual_completion_source=None,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
@@ -4379,9 +4301,9 @@ def render_deterministic_compositor(
             "provider": provider_background_meta.get("provider", "local"),
             "strategy": strategy,
             "pipeline": pipeline,
-            # Provider success is not enough for production readiness: the final
-            # composite still has to pass visual QA for text, subject, and empty-band checks.
-            "productionReady": False if should_seed_outpaint_with_foreground else not provider_ready,
+            # A provider result is production-ready only when the compositor
+            # safety gate accepted it into the final background.
+            "productionReady": provider_ready if should_seed_outpaint_with_foreground else True,
         }
     if landscape_anchor:
         background = build_deterministic_background_canvas(foreground_source, width, height)
@@ -4398,15 +4320,12 @@ def render_deterministic_compositor(
                 provider_background, provider_role_meta = outpaint_renderer(background_seed, width, height, plan, analysis)
                 if provider_background.size != (width, height):
                     provider_background = provider_background.resize((width, height), Image.Resampling.LANCZOS)
-                if os.getenv("ADAPTIFAI_RESIZE_ACCEPT_ROLE_PROVIDER_BACKGROUND", "0").strip().lower() in {"1", "true", "yes", "on"}:
-                    background = provider_background.convert("RGB")
-                else:
-                    background = build_deterministic_background_canvas(background_seed, width, height)
-                    provider_role_meta = {
-                        **provider_role_meta,
-                        "providerRejected": "role_provider_background_can_hallucinate_text_or_products",
-                        "productionReady": False,
-                    }
+                background = build_deterministic_background_canvas(background_seed, width, height)
+                provider_role_meta = {
+                    **provider_role_meta,
+                    "providerRejected": "role_provider_background_can_hallucinate_text_or_products",
+                    "productionReady": False,
+                }
             except Exception as exc:
                 background = build_deterministic_background_canvas(background_seed, width, height)
                 provider_role_meta = {
