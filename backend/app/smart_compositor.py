@@ -1623,8 +1623,49 @@ def _build_display_copy_stack_blocks(
 
     copy_w = max(1, copy_zone[2] - copy_zone[0])
     copy_h = max(1, copy_zone[3] - copy_zone[1])
-    line_count = max(1, len(ordered))
-    stack_font_size = max(8, min(22, int(copy_h / line_count * 0.68), int(copy_w * 0.108)))
+    pad_x = max(4, int(round(copy_w * 0.10)))
+    stack_zone = (
+        min(copy_zone[2] - 1, copy_zone[0] + pad_x),
+        copy_zone[1],
+        max(copy_zone[0] + pad_x + 1, copy_zone[2] - pad_x),
+        copy_zone[3],
+    )
+    stack_w = max(1, stack_zone[2] - stack_zone[0])
+    stack_h = max(1, stack_zone[3] - stack_zone[1])
+    source_texts = [
+        str(getattr(block, "translated_text", None) or getattr(block, "text", "") or "").strip()
+        for block in ordered
+    ]
+    source_texts = [text for text in source_texts if text]
+
+    def wrapped_line_count(text: str, font: ImageFont.ImageFont) -> int:
+        words = [word for word in text.split() if word]
+        if not words:
+            return 0
+        line_count = 1
+        current = ""
+        for word in words:
+            candidate = word if not current else f"{current} {word}"
+            try:
+                width_px = font.getlength(candidate)
+            except Exception:
+                width_px = len(candidate) * max(1, getattr(font, "size", 10)) * 0.58
+            if current and width_px > stack_w:
+                line_count += 1
+                current = word
+            else:
+                current = candidate
+        return line_count
+
+    max_font = max(8, min(34, int(stack_h * 0.42), int(stack_w * 0.24)))
+    stack_font_size = 8
+    for candidate_size in range(max_font, 7, -1):
+        font = _load_cta_font(candidate_size)
+        total_lines = sum(wrapped_line_count(text, font) for text in source_texts)
+        line_height = max(candidate_size + 2, int(round(candidate_size * 1.22)))
+        if total_lines * line_height <= stack_h:
+            stack_font_size = candidate_size
+            break
     stack_line_height = max(stack_font_size + 2, int(round(stack_font_size * 1.22)))
 
     spans: list[dict[str, Any]] = []
@@ -1668,10 +1709,10 @@ def _build_display_copy_stack_blocks(
                 cloned_style["fontSize"] = stack_font_size
                 cloned_style["peerRowFontSize"] = stack_font_size
                 cloned_style["bbox"] = [
-                    copy_zone[0],
-                    copy_zone[1] + block_index * stack_line_height,
-                    copy_zone[2],
-                    copy_zone[1] + (block_index + 1) * stack_line_height,
+                    stack_zone[0],
+                    stack_zone[1] + block_index * stack_line_height,
+                    stack_zone[2],
+                    stack_zone[1] + (block_index + 1) * stack_line_height,
                 ]
                 cloned_style["lineIndex"] = block_index
                 updated_source_styles.append(cloned_style)
@@ -1685,15 +1726,16 @@ def _build_display_copy_stack_blocks(
         return ordered
     base.text = "\n".join(texts)
     base.translated_text = base.text
-    base.bbox = copy_zone
-    base.clean_box = copy_zone
-    base.line_boxes = [copy_zone]
+    base.bbox = stack_zone
+    base.clean_box = stack_zone
+    base.line_boxes = [stack_zone]
     base.line_texts = texts
     base.font_size_estimate = stack_font_size
     base.line_height_estimate = stack_line_height
     base.align = "left"
     base.source_word_styles = source_word_styles
     base.translated_style_spans = spans
+    base.render_strategy = "resize_display_copy_stack"
     return [base]
 
 

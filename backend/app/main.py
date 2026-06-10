@@ -16876,10 +16876,105 @@ def normalize_v5_peer_row_font_sizes(blocks: list[TextBlock]) -> None:
                 if isinstance(style, dict):
                     style["fontSize"] = row_font_size
                     style["lineHeight"] = row_line_height
-                for source_style in span.get("sourceWordStyles") or []:
-                    if isinstance(source_style, dict):
-                        source_style["fontSize"] = row_font_size
-                        source_style["lineHeight"] = row_line_height
+                    for source_style in span.get("sourceWordStyles") or []:
+                        if isinstance(source_style, dict):
+                            source_style["fontSize"] = row_font_size
+                            source_style["lineHeight"] = row_line_height
+
+
+def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
+    box = tuple(int(value) for value in block.bbox)
+    max_width = max(1, box[2] - box[0])
+    max_height = max(1, box[3] - box[1])
+    spans = [span for span in (block.translated_style_spans or []) if isinstance(span, dict)]
+    if not spans:
+        return
+
+    def build_lines(font_size: int) -> tuple[list[list[dict[str, Any]]], int]:
+        lines: list[list[dict[str, Any]]] = []
+        current: list[dict[str, Any]] = []
+        current_width = 0.0
+        line_height = max(font_size + 2, int(round(font_size * 1.22)))
+
+        for span in spans:
+            text = str(span.get("translatedText") or span.get("sourceText") or "").strip()
+            if not text:
+                continue
+            style = dict(span.get("style") or {})
+            style["fontSize"] = font_size
+            font_weight = int(style.get("fontWeight") or 700)
+            font = get_font(
+                font_size,
+                bold=font_weight >= 700,
+                category=str(style.get("fontCategory") or "sans-serif"),
+                weight=font_weight,
+            )
+            fill = style.get("color") or "#111111"
+            bg = style.get("backgroundColor") if style.get("hasTextBackground") else None
+            for word in [part for part in text.split() if part]:
+                try:
+                    word_width = draw.textlength(word, font=font)
+                    space_width = draw.textlength(" ", font=font)
+                except AttributeError:
+                    word_width = text_width(draw, word, font)
+                    space_width = text_width(draw, " ", font)
+                addition = word_width if not current else word_width + space_width
+                if current and current_width + addition > max_width:
+                    lines.append(current)
+                    current = []
+                    current_width = 0.0
+                    addition = word_width
+                current.append(
+                    {
+                        "text": word,
+                        "font": font,
+                        "fill": fill,
+                        "background": bg,
+                        "width": word_width,
+                        "space": space_width,
+                        "fontSize": font_size,
+                    }
+                )
+                current_width += addition
+            if span.get("forceBreakAfter") and current:
+                lines.append(current)
+                current = []
+                current_width = 0.0
+        if current:
+            lines.append(current)
+        return lines, line_height
+
+    preferred_size = max(8, int(block.font_size_estimate or 16))
+    font_size = preferred_size
+    lines: list[list[dict[str, Any]]] = []
+    line_height = max(font_size + 2, int(round(font_size * 1.22)))
+    for candidate in range(min(42, max(8, preferred_size)), 7, -1):
+        candidate_lines, candidate_line_height = build_lines(candidate)
+        if candidate_lines and len(candidate_lines) * candidate_line_height <= max_height:
+            font_size = candidate
+            lines = candidate_lines
+            line_height = candidate_line_height
+            break
+    if not lines:
+        lines, line_height = build_lines(font_size)
+
+    y = box[1]
+    for line in lines:
+        x = box[0]
+        for token_index, token in enumerate(line):
+            if token_index > 0:
+                x += int(round(float(token["space"])))
+            text = str(token["text"])
+            font = token["font"]
+            left, top, right, bottom = draw.textbbox((x, y), text, font=font)
+            background = token.get("background")
+            if background:
+                pad_x = max(1, int(round(font_size * 0.10)))
+                pad_y = max(1, int(round(font_size * 0.08)))
+                draw.rectangle((left - pad_x, top - pad_y, right + pad_x, bottom + pad_y), fill=background)
+            draw.text((x, y), text, fill=token["fill"], font=font)
+            x += int(round(float(token["width"])))
+        y += line_height
 
 
 def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> Image.Image:
@@ -16892,6 +16987,9 @@ def draw_fitted_localize_v2_text(base: Image.Image, blocks: list[TextBlock]) -> 
     
     for block in blocks:
         if block.render_strategy == "v5_numeric_bypass":
+            continue
+        if block.render_strategy == "resize_display_copy_stack":
+            draw_resize_display_copy_stack(draw, block)
             continue
             
         text = block.translated_text or block.text
