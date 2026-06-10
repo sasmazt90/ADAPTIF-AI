@@ -17022,11 +17022,13 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
             pad_y = max(1, int(round(font_size * 0.10)))
             ribbon_top = y + max(0, int(round(line_height * 0.10)))
             ribbon_bottom = min(box[3], y + line_height - max(0, int(round(line_height * 0.08))))
+            ribbon_left = box[0]
+            ribbon_right = box[2]
             draw.rectangle(
                 (
-                    max(0, x - pad_x),
+                    max(0, ribbon_left),
                     max(0, ribbon_top - pad_y),
-                    min(box[2], x + line_width + pad_x),
+                    min(box[2], ribbon_right),
                     max(ribbon_top + 1, ribbon_bottom + pad_y),
                 ),
                 fill=ribbon_background,

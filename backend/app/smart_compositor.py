@@ -53,10 +53,10 @@ def _complete_truncated_foreground_edges(crop: Image.Image) -> Image.Image:
     if not bbox:
         return rgba
     left, top, right, bottom = bbox
+    add_top = top <= 2
     add_bottom = bottom >= rgba.height - 2
-    if not add_bottom:
+    if not add_top and not add_bottom:
         return rgba
-    pad = max(10, min(int(rgba.height * 0.18), 110))
     alpha_body = alpha > 16
     body_pixels = rgb[alpha_body]
     if body_pixels.size == 0:
@@ -67,24 +67,44 @@ def _complete_truncated_foreground_edges(crop: Image.Image) -> Image.Image:
         & (body_pixels[:, 2] > 145)
     ]
     fill_color = np.median(bright if bright.size else body_pixels, axis=0).astype(np.uint8)
-    bottom_rows = alpha[max(0, rgba.height - max(6, rgba.height // 18)) :, :]
-    bottom_profile = np.max(bottom_rows, axis=0)
-    if np.count_nonzero(bottom_profile > 24) < max(4, rgba.width // 22):
-        return rgba
-    band_arr = np.zeros((pad, rgba.width, 4), dtype=np.uint8)
-    for y in range(pad):
-        shrink = int(round((y / max(1, pad - 1)) * max(1, rgba.width * 0.035)))
-        profile = bottom_profile.copy()
-        if shrink > 0:
-            profile[:shrink] = 0
-            profile[-shrink:] = 0
-        opacity = max(0.0, 1.0 - (y / max(1, pad - 1)) * 0.45)
-        band_arr[y, :, :3] = fill_color
-        band_arr[y, :, 3] = np.clip(profile.astype(np.float32) * opacity, 0, 255).astype(np.uint8)
-    band = Image.fromarray(band_arr, "RGBA").filter(ImageFilter.GaussianBlur(radius=1.0))
-    completed = Image.new("RGBA", (rgba.width, rgba.height + pad), (0, 0, 0, 0))
-    completed.alpha_composite(rgba, (0, 0))
-    completed.alpha_composite(band, (0, rgba.height))
+
+    def make_band(profile: np.ndarray, pad: int, *, invert: bool = False) -> Image.Image | None:
+        if pad <= 0 or np.count_nonzero(profile > 24) < max(4, rgba.width // 22):
+            return None
+        band_arr = np.zeros((pad, rgba.width, 4), dtype=np.uint8)
+        for y in range(pad):
+            t = y / max(1, pad - 1)
+            shrink = int(round(t * max(1, rgba.width * 0.035)))
+            row_profile = profile.copy()
+            if shrink > 0:
+                row_profile[:shrink] = 0
+                row_profile[-shrink:] = 0
+            opacity = max(0.0, 1.0 - t * 0.48)
+            target_y = pad - 1 - y if invert else y
+            band_arr[target_y, :, :3] = fill_color
+            band_arr[target_y, :, 3] = np.clip(row_profile.astype(np.float32) * opacity, 0, 255).astype(np.uint8)
+        return Image.fromarray(band_arr, "RGBA").filter(ImageFilter.GaussianBlur(radius=1.0))
+
+    top_pad = max(8, min(int(rgba.height * 0.14), 90)) if add_top else 0
+    bottom_pad = max(10, min(int(rgba.height * 0.18), 110)) if add_bottom else 0
+    top_band = None
+    bottom_band = None
+    if add_top:
+        top_rows = alpha[: max(1, max(6, rgba.height // 18)), :]
+        top_band = make_band(np.max(top_rows, axis=0), top_pad, invert=True)
+        if top_band is None:
+            top_pad = 0
+    if add_bottom:
+        bottom_rows = alpha[max(0, rgba.height - max(6, rgba.height // 18)) :, :]
+        bottom_band = make_band(np.max(bottom_rows, axis=0), bottom_pad)
+        if bottom_band is None:
+            bottom_pad = 0
+    completed = Image.new("RGBA", (rgba.width, rgba.height + top_pad + bottom_pad), (0, 0, 0, 0))
+    if top_band:
+        completed.alpha_composite(top_band, (0, 0))
+    completed.alpha_composite(rgba, (0, top_pad))
+    if bottom_band:
+        completed.alpha_composite(bottom_band, (0, top_pad + rgba.height))
     return completed
 
 
@@ -206,6 +226,10 @@ def build_resize_provider_safe_seed(
         *parts["primary"],
         *parts["secondary"],
         *parts.get("trust_badge", []),
+        *[
+            _expand_text_box_line_region(source, layer.bbox.to_pixel_box(source.width, source.height))
+            for layer in analysis.marketing_text_layers
+        ],
     ]
     if _resize_provider_must_not_see_brand_layers(placement_id):
         removal_boxes.extend(parts["brand"])
@@ -292,7 +316,15 @@ def build_deterministic_background_canvas(clean_source: Image.Image, width: int,
         color = top_color * (1 - t) + bottom_color * t
         gradient[y, :, :] = np.clip(color, 0, 255)
     canvas = Image.fromarray(gradient, "RGB")
-    return canvas.filter(ImageFilter.GaussianBlur(radius=0.35))
+    cover_scale = max(width / max(1, source.width), height / max(1, source.height))
+    cover_w = max(1, int(round(source.width * cover_scale)))
+    cover_h = max(1, int(round(source.height * cover_scale)))
+    cover = source.resize((cover_w, cover_h), Image.Resampling.LANCZOS)
+    left = max(0, (cover_w - width) // 2)
+    top = max(0, (cover_h - height) // 2)
+    texture = cover.crop((left, top, left + width, top + height)).filter(ImageFilter.GaussianBlur(radius=1.25))
+    # Keep the source's cream/wave texture instead of collapsing to a flat edge color.
+    return Image.blend(texture, canvas.filter(ImageFilter.GaussianBlur(radius=0.35)), 0.28)
 
 
 def _edge_median_rgb(image: Image.Image) -> np.ndarray:
@@ -1337,7 +1369,10 @@ def _paste_crop_fit(
         crop = _trim_rgba_to_alpha(crop)
         alpha = np.array(crop.getchannel("A"), dtype=np.uint8)
         visible_alpha_ratio = float(np.count_nonzero(alpha > 16)) / max(1, crop.width * crop.height)
-        if visible_alpha_ratio < 0.08 or crop.width < max(8, original_crop.width * 0.22) or crop.height < max(8, original_crop.height * 0.22):
+        if (
+            not alpha_cut_source_boxes
+            and (visible_alpha_ratio < 0.08 or crop.width < max(8, original_crop.width * 0.22) or crop.height < max(8, original_crop.height * 0.22))
+        ):
             crop = original_crop
     target_w = max(1, target_box[2] - target_box[0])
     target_h = max(1, target_box[3] - target_box[1])
@@ -1408,6 +1443,10 @@ def _cut_source_boxes_from_alpha(
         y2 = min(rgba.height, local_y2)
         if x2 <= x1 or y2 <= y1:
             continue
+        cut_area_ratio = ((x2 - x1) * (y2 - y1)) / max(1, rgba.width * rgba.height)
+        if cut_area_ratio <= 0.22:
+            alpha_np[y1:y2, x1:x2] = 0
+            continue
         try:
             import cv2
 
@@ -1438,7 +1477,7 @@ def _source_crop_with_global_foreground_alpha(source: Image.Image, source_box: t
         alpha_crop = _remove_text_like_alpha_components(crop, alpha_crop)
         if np.count_nonzero(np.array(alpha_crop, dtype=np.uint8) > 16) >= max(64, crop.width * crop.height * 0.04):
             crop.putalpha(alpha_crop)
-            return crop
+            return _complete_truncated_foreground_edges(crop)
     except Exception:
         pass
     return _apply_foreground_alpha(crop)
@@ -1507,6 +1546,31 @@ def _trim_visual_box_away_from_text_edges(
             top = max(top, ty2 + 2)
         elif tcy > vcy and ty2 >= bottom - max(10, int((bottom - top) * 0.22)) and min(bottom, ty1 - 2) - top >= min_h:
             bottom = min(bottom, ty1 - 2)
+    return _clip_box((left, top, right, bottom), source_width, source_height)
+
+
+def _trim_visual_box_to_product_label_side(
+    visual_box: tuple[int, int, int, int],
+    product_label_union: tuple[int, int, int, int] | None,
+    floating_copy_union: tuple[int, int, int, int] | None,
+    source_width: int,
+    source_height: int,
+) -> tuple[int, int, int, int]:
+    if not product_label_union or not floating_copy_union or _box_overlap(visual_box, floating_copy_union) <= 0:
+        return visual_box
+    left, top, right, bottom = visual_box
+    label_left, _label_top, label_right, _label_bottom = product_label_union
+    copy_left, _copy_top, copy_right, _copy_bottom = floating_copy_union
+    pad = max(4, int((label_right - label_left) * 0.08))
+    min_w = max(32, int((label_right - label_left) * 1.18))
+    if copy_left >= label_right and copy_left < right:
+        candidate_right = max(label_right + pad, copy_left - pad)
+        if candidate_right - left >= min_w:
+            right = min(right, candidate_right)
+    if copy_right <= label_left and copy_right > left:
+        candidate_left = min(label_left - pad, copy_right + pad)
+        if right - candidate_left >= min_w:
+            left = max(left, candidate_left)
     return _clip_box((left, top, right, bottom), source_width, source_height)
 
 
@@ -2277,8 +2341,8 @@ def _role_aware_layout_zones(
             return {
                 "brand": (margin_x, margin_y, int(width * 0.56), int(height * 0.22)),
                 "badge": (int(width * 0.66), margin_y, width - margin_x, int(height * 0.23)),
-                "copy": (margin_x, int(height * 0.24), int(width * 0.59), height - margin_y),
-                "cta": (margin_x, int(height * 0.74), int(width * 0.62), height - margin_y),
+                "copy": (margin_x, int(height * 0.24), int(width * 0.59), int(height * 0.68)),
+                "cta": (margin_x, int(height * 0.70), int(width * 0.62), height - margin_y),
                 "visual": (int(width * 0.57), int(height * 0.12), width - margin_x, height - margin_y),
                 "secondary": (int(width * 0.68), int(height * 0.58), width - margin_x, height - margin_y),
             }
@@ -2384,6 +2448,15 @@ def _draw_display_cta_button(
     }
 
 
+def _localized_display_cta_label(analysis: VisualAnalysis) -> str:
+    text = " ".join(str(getattr(layer, "original_text", "") or "") for layer in analysis.marketing_text_layers)
+    upper = text.upper()
+    turkish_signals = ("İ", "Ş", "Ğ", "Ü", "Ö", "Ç", " DAHIL", " CILT", " GUNES", " KORUMA", " HIZLI", " SIVILCE")
+    if any(signal in upper for signal in turkish_signals):
+        return "İncele"
+    return "Learn More"
+
+
 def _draw_programmatic_rtb_guides(
     output: Image.Image,
     product_box: tuple[int, int, int, int] | None,
@@ -2451,6 +2524,13 @@ def composite_priority_layer_resize(
         compact_target=compact_target,
     )
     if product_label_focus:
+        product_label_focus = _trim_visual_box_to_product_label_side(
+            product_label_focus,
+            _union_boxes(parts["product_label"]),
+            _union_boxes(parts["secondary"]),
+            source.width,
+            source.height,
+        )
         meaningful_visuals = [product_label_focus]
 
     text_remove_boxes = [
@@ -2494,7 +2574,8 @@ def composite_priority_layer_resize(
                     preserve_source_position=True,
                 )
             )
-    badge_scale = max(0.24, min(1.20, (width * height / max(1, source.width * source.height)) ** 0.5))
+    badge_floor = 0.34 if preserve_brand_layers else 0.52
+    badge_scale = max(badge_floor, min(1.32, (width * height / max(1, source.width * source.height)) ** 0.5))
     for index, box in enumerate(parts.get("trust_badge", [])[:3]):
         if not _fit_box_has_room(zones["badge"], min_w=max(12, width // 16), min_h=max(8, height // 42)):
             break
@@ -2516,7 +2597,7 @@ def composite_priority_layer_resize(
     redraw_blocks: list[Any] = []
     # Very narrow canvases need programmatic redraw for legibility. Provider
     # outpaint still never sees text, and redraw order is locked to source Y/X.
-    use_redraw_for_small_text = target_smaller and (target_ratio < 0.45 or width <= 200)
+    use_redraw_for_small_text = bool(text_blocks and draw_text) and target_smaller
     if target_smaller and not use_redraw_for_small_text:
         text_artwork_source = _remove_foreground_visuals_for_background(source, meaningful_visuals)
         primary_union = _union_boxes(parts["primary"])
@@ -2602,7 +2683,12 @@ def composite_priority_layer_resize(
             if product_label_overlap >= 0.42:
                 continue
             if secondary_union and _box_overlap(source_box, secondary_union) / max(1, _box_area(source_box)) >= 0.35:
-                if target_ratio < 1.25 or not _fit_box_has_room(zones["secondary"], min_w=max(60, width // 6), min_h=max(18, height // 16)):
+                if (
+                    (width <= 360 and height <= 280)
+                    or
+                    (not preserve_brand_layers and target_ratio < 1.25)
+                    or not _fit_box_has_room(zones["secondary"], min_w=max(42, width // 7), min_h=max(16, height // 18))
+                ):
                     continue
                 target_box = _map_box_between_unions(source_box, secondary_union, zones["secondary"], width, height)
             elif text_copy_union:
@@ -2625,6 +2711,8 @@ def composite_priority_layer_resize(
                 font_size = max(7, int(available_h * 0.92))
             if target_smaller:
                 font_size = max(6, min(font_size, int(max(7, min(width, height) * 0.044))))
+            if not preserve_brand_layers:
+                font_size = max(font_size, int(max(14, min(width, height) * (0.036 if target_ratio >= 0.78 else 0.040))))
             cloned.font_size_estimate = font_size
             cloned.line_height_estimate = int(round(font_size * 1.18))
             for style in getattr(cloned, "source_word_styles", []) or []:
@@ -2712,21 +2800,20 @@ def composite_priority_layer_resize(
                 "blockCount": len(redraw_blocks),
             }
         )
-        if target_ratio >= 1.10:
-            secondary_layer_boxes = [
-                tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))
-                for block in redraw_blocks
-                if _union_boxes(parts["secondary"])
-                and _box_overlap(
-                    layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)),
-                    _union_boxes(parts["secondary"]),
-                )
-                / max(1, _box_area(layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)))) >= 0.35
-            ]
-            guide = _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_layer_boxes))
-            if guide:
-                composited.append(guide)
-    display_cta_layer = _draw_display_cta_button(output, display_cta_zone) if display_cta_zone else None
+        secondary_layer_boxes = [
+            tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))
+            for block in redraw_blocks
+            if _union_boxes(parts["secondary"])
+            and _box_overlap(
+                layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)),
+                _union_boxes(parts["secondary"]),
+            )
+            / max(1, _box_area(layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)))) >= 0.35
+        ]
+        guide = _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_layer_boxes))
+        if guide:
+            composited.append(guide)
+    display_cta_layer = _draw_display_cta_button(output, display_cta_zone, label=_localized_display_cta_label(analysis)) if display_cta_zone else None
     if display_cta_layer:
         composited.append(display_cta_layer)
 
@@ -2886,6 +2973,13 @@ def build_wide_to_portrait_outpaint_layout_seed(
         compact_target=width <= 420 or target_ratio < 0.78,
     )
     if product_focus:
+        product_focus = _trim_visual_box_to_product_label_side(
+            product_focus,
+            _union_boxes(product_label_boxes),
+            _union_boxes(parts["secondary"]),
+            source.width,
+            source.height,
+        )
         meaningful_visuals = [product_focus]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
     visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = [
@@ -2902,7 +2996,7 @@ def build_wide_to_portrait_outpaint_layout_seed(
             default=0.0,
         )
         raw_cx, raw_cy = _box_center(raw_box)
-        if not (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]):
+        if overlap_with_product_label < 0.45:
             visual_alpha_cut_boxes.append(_pad_box(raw_box, source.width, source.height, pad_x=4, pad_y=3))
         if overlap_with_product_label < 0.45:
             floating_text_boxes.append(box)
@@ -3050,9 +3144,21 @@ def composite_wide_creative_director_relayout(
         compact_target=width <= 420 or target_ratio < 0.78,
     )
     if product_focus:
+        product_focus = _trim_visual_box_to_product_label_side(
+            product_focus,
+            _union_boxes(product_label_boxes),
+            _union_boxes(parts["secondary"]),
+            source.width,
+            source.height,
+        )
         meaningful_visuals = [product_focus]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
-    visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = []
+    visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = [
+        *parts["brand"],
+        *parts.get("trust_badge", []),
+        *parts["primary"],
+        *parts["secondary"],
+    ]
     for layer in analysis.marketing_text_layers:
         raw_box = _layer_box(layer, source)
         box = _expand_text_box_line_region(source, raw_box)
@@ -3061,7 +3167,7 @@ def composite_wide_creative_director_relayout(
             default=0.0,
         )
         raw_cx, raw_cy = _box_center(raw_box)
-        if not (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]):
+        if overlap_with_product_label < 0.45:
             visual_alpha_cut_boxes.append(_pad_box(raw_box, source.width, source.height, pad_x=4, pad_y=3))
         if overlap_with_product_label < 0.45:
             floating_text_boxes.append(box)
@@ -3085,8 +3191,8 @@ def composite_wide_creative_director_relayout(
     )
 
     target_area_smaller = width * height < source.width * source.height
-    margin_x = int(width * 0.055)
-    margin_y = int(height * 0.045)
+    margin_x = int(width * (0.09 if not display_placement else 0.055))
+    margin_y = int(height * (0.075 if not display_placement else 0.045))
     if target_ratio < 0.78:
         brand_bounds = (margin_x, margin_y, width - margin_x, int(height * 0.16))
         copy_bounds = (margin_x, int(height * 0.15), width - margin_x, int(height * 0.35))
@@ -3102,7 +3208,7 @@ def composite_wide_creative_director_relayout(
         brand_bounds = (margin_x, margin_y, int(width * 0.44), int(height * 0.18))
         copy_bounds = (margin_x, int(height * 0.22), int(width * 0.43), int(height * 0.92))
         cta_bounds = (margin_x, int(height * 0.78), int(width * 0.44), int(height * 0.94))
-        visual_bounds = (int(width * 0.56), int(height * 0.08), width - margin_x, int(height * 0.96))
+        visual_bounds = (int(width * 0.52), int(height * 0.18), width - margin_x, int(height * 0.90))
     elif source_ratio > 1.25 and target_ratio <= 1.25:
         brand_bounds = (margin_x, margin_y, int(width * 0.42), int(height * 0.17))
         copy_bounds = (margin_x, int(height * 0.30), int(width * 0.43), int(height * 0.67))
@@ -3140,6 +3246,10 @@ def composite_wide_creative_director_relayout(
             _inpaint_rectangular_overlays(
                 source,
                 [
+                    *[
+                        _expand_text_box_line_region(source, layer.bbox.to_pixel_box(source.width, source.height))
+                        for layer in analysis.marketing_text_layers
+                    ],
                     *floating_text_boxes,
                     *parts["brand"],
                     *parts.get("trust_badge", []),
@@ -3183,8 +3293,16 @@ def composite_wide_creative_director_relayout(
                     preserve_source_position=True,
                 )
             )
-    badge_bounds = (int(width * 0.66), margin_y, width - margin_x, max(margin_y + 10, int(height * 0.20)))
+    badge_bounds = (
+        int(width * (0.58 if not display_placement else 0.66)),
+        margin_y,
+        width - margin_x,
+        max(margin_y + 10, int(height * (0.24 if not display_placement else 0.20))),
+    )
     for index, box in enumerate(parts.get("trust_badge", [])[:3]):
+        badge_scale = brand_scale
+        if not display_placement:
+            badge_scale = max(brand_scale, min(1.30, max(width, height) / max(1, max(source.width, source.height)) * 1.12))
         composited.append(
             _paste_layer_relative(
                 output,
@@ -3193,7 +3311,7 @@ def composite_wide_creative_director_relayout(
                 target_bounds=badge_bounds,
                 layer_id=f"trust-badge-{index}",
                 role="trust_badge_preserved",
-                scale=brand_scale,
+                scale=badge_scale,
                 preserve_source_position=True,
             )
         )
@@ -3201,10 +3319,8 @@ def composite_wide_creative_director_relayout(
     redraw_blocks: list[Any] = []
     # Resize is not localization: preserve existing marketing typography as artwork
     # whenever possible. Redraw remains available as an explicit fallback/env override.
-    redraw_default = "0"
+    redraw_default = "1"
     redraw_enabled = os.getenv("ADAPTIFAI_RESIZE_ENABLE_TEXT_REDRAW", redraw_default).strip().lower() in {"1", "true", "yes", "on"}
-    if target_area_smaller:
-        redraw_enabled = False
     if redraw_enabled and text_blocks and draw_text:
         layer_boxes = {layer.id: _layer_box(layer, source) for layer in analysis.marketing_text_layers}
         primary_union = _union_boxes(parts["primary"])
@@ -3249,8 +3365,6 @@ def composite_wide_creative_director_relayout(
             if target_ratio < 0.78 and product_label_overlap < 0.45:
                 if is_top_brand_like:
                     continue
-                if secondary_overlap_global >= 0.35:
-                    continue
                 if portrait_redraw_union:
                     target_box = _map_portrait_text_box_to_safe_copy_zone(
                         source_box,
@@ -3271,12 +3385,16 @@ def composite_wide_creative_director_relayout(
                 target_box = _map_box_between_unions(source_box, primary_union, copy_bounds, width, height)
             elif (
                 not target_area_smaller
-                and display_placement
                 and secondary_union
                 and target_ratio >= 0.78
                 and _box_overlap(source_box, secondary_union) / max(1, _box_area(source_box)) > 0.35
             ):
-                secondary_bounds = (int(width * 0.58), int(height * 0.54), width - margin_x, int(height * 0.88))
+                secondary_bounds = (
+                    int(width * (0.55 if display_placement else 0.58)),
+                    int(height * 0.54),
+                    width - margin_x,
+                    int(height * 0.88),
+                )
                 target_box = _map_box_between_unions(source_box, secondary_union, secondary_bounds, width, height)
             else:
                 continue
@@ -3289,8 +3407,16 @@ def composite_wide_creative_director_relayout(
             cloned.clean_box = target_box
             cloned.line_boxes = [target_box]
             cloned.font_size_estimate = max(7, min(int(getattr(cloned, "font_size_estimate", 16) or 16), int((target_box[3] - target_box[1]) * 0.92)))
+            if not display_placement:
+                social_min = int(width * (0.044 if target_ratio < 0.78 else 0.034))
+                cloned.font_size_estimate = max(cloned.font_size_estimate, max(16, social_min))
+                max_social_size = int(max(18, (target_box[3] - target_box[1]) * 0.80))
+                cloned.font_size_estimate = min(cloned.font_size_estimate, max_social_size)
             if target_area_smaller:
-                cloned.font_size_estimate = max(7, min(cloned.font_size_estimate, int(max(8, width * 0.038))))
+                if display_placement:
+                    cloned.font_size_estimate = max(7, min(cloned.font_size_estimate, int(max(8, width * 0.038))))
+                else:
+                    cloned.font_size_estimate = max(cloned.font_size_estimate, int(max(14, min(width, height) * 0.032)))
             cloned.line_height_estimate = int(round(cloned.font_size_estimate * 1.18))
             for style in getattr(cloned, "source_word_styles", []) or []:
                 style["fontSize"] = cloned.font_size_estimate
@@ -3414,7 +3540,7 @@ def composite_wide_creative_director_relayout(
                 layer_id="visual-main-provider-completion-foreground",
                 role="provider_visual_completion_foreground_only",
                 mode="contain",
-                foreground_alpha=not target_area_smaller,
+                foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
             )
         )
@@ -3427,7 +3553,7 @@ def composite_wide_creative_director_relayout(
                 layer_id="visual-main-exact-label-overlay",
                 role="original_visual_label_readability_overlay",
                 mode="contain",
-                foreground_alpha=not target_area_smaller,
+                foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
             )
         )
@@ -3441,7 +3567,7 @@ def composite_wide_creative_director_relayout(
                 layer_id="visual-main-exact-foreground",
                 role="primary_visual_exact_readable_preserve",
                 mode="contain",
-                foreground_alpha=not target_area_smaller,
+                foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
             )
         )
@@ -3461,7 +3587,7 @@ def composite_wide_creative_director_relayout(
         visual_kwargs: dict[str, Any] = (
             {"max_scale": 3.65}
             if paste_visual is _paste_crop_contain_limited
-            else {}
+            else {"alpha_cut_source_boxes": visual_label_cut_boxes}
         )
         composited.append(
             paste_visual(
@@ -3472,7 +3598,7 @@ def composite_wide_creative_director_relayout(
                 layer_id="visual-main",
                 role="primary_visual_readable",
                 anchor=(0.5, 0.52 if target_area_smaller else (0.68 if visual_edge_sides else 0.74)),
-                foreground_alpha=not target_area_smaller,
+                foreground_alpha=True,
                 **visual_kwargs,
             )
         )
@@ -3496,7 +3622,7 @@ def composite_wide_creative_director_relayout(
                     role="visual_element_preserved",
                     mode="contain",
                     feather=max(6, min(width, height) // 85),
-                    foreground_alpha=not target_area_smaller,
+                    foreground_alpha=True,
                     alpha_cut_source_boxes=visual_label_cut_boxes,
                 )
             )
@@ -3518,7 +3644,7 @@ def composite_wide_creative_director_relayout(
             }
         )
 
-    display_cta_layer = _draw_display_cta_button(output, cta_bounds) if preserve_brand_layers else None
+    display_cta_layer = _draw_display_cta_button(output, cta_bounds, label=_localized_display_cta_label(analysis)) if preserve_brand_layers else None
     if display_cta_layer:
         composited.append(display_cta_layer)
 
@@ -4020,7 +4146,7 @@ def render_deterministic_compositor(
         source,
         analysis,
         placement_id=placement_id,
-        remove_products=False,
+        remove_products=True,
     )
     landscape_anchor = should_use_landscape_width_anchor(source, width, height)
     role_aware_candidate = should_use_role_aware_relayout(source, width, height, analysis)
