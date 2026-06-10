@@ -205,6 +205,7 @@ def build_resize_provider_safe_seed(
     removal_boxes: list[tuple[int, int, int, int]] = [
         *parts["primary"],
         *parts["secondary"],
+        *parts.get("trust_badge", []),
     ]
     if _resize_provider_must_not_see_brand_layers(placement_id):
         removal_boxes.extend(parts["brand"])
@@ -221,6 +222,7 @@ def build_resize_provider_safe_seed(
         "resizeProviderSeedRemovedLayerCount": len(removal_boxes),
         "resizeProviderSeedRemovedBrandLayers": 0 if not _resize_provider_must_not_see_brand_layers(placement_id) else len(parts["brand"]),
         "resizeProviderSeedRemovedMarketingLayers": len(parts["primary"]) + len(parts["secondary"]),
+        "resizeProviderSeedRemovedTrustBadges": len(parts.get("trust_badge", [])),
     }
 
 
@@ -872,10 +874,23 @@ def _partition_resize_layers(
 ) -> dict[str, list[tuple[int, int, int, int]]]:
     w, h = source.size
     brand: list[tuple[int, int, int, int]] = []
+    trust_badge: list[tuple[int, int, int, int]] = []
     primary: list[tuple[int, int, int, int]] = []
     secondary: list[tuple[int, int, int, int]] = []
     product_label: list[tuple[int, int, int, int]] = []
     visual_area = max(1, _box_area(visual_box))
+
+    def is_trust_badge_candidate(box: tuple[int, int, int, int], *, text: str = "", notes: str = "", role: str = "") -> bool:
+        cx, cy = _box_center(box)
+        box_w = max(1, box[2] - box[0])
+        box_h = max(1, box[3] - box[1])
+        area_ratio = _box_area(box) / max(1, w * h)
+        descriptor = f"{text} {notes} {role}".lower()
+        explicit_trust = any(token in descriptor for token in ("badge", "seal", "award", "trust", "tavsiye", "recommended", "dermatolog"))
+        top_right_free_asset = cy <= h * 0.26 and cx >= w * 0.58 and box_w <= w * 0.34 and box_h <= h * 0.24
+        not_product_overlap = _box_overlap(box, visual_box) / max(1, _box_area(box)) < 0.18
+        return not_product_overlap and 0.001 <= area_ratio <= 0.08 and (explicit_trust or top_right_free_asset)
+
     for layer in analysis.marketing_text_layers:
         raw_box = _layer_box(layer, source)
         # Use the real text-pixel box for layer relocation. The expanded same-line
@@ -889,6 +904,9 @@ def _partition_resize_layers(
         near_edge = cx <= w * 0.32 or cx >= w * 0.68
         original_text = str(getattr(layer, "original_text", "") or "")
         has_alpha = any(ch.isalpha() for ch in original_text)
+        if is_trust_badge_candidate(raw_box, text=original_text, role=str(getattr(layer, "role", ""))):
+            trust_badge.append(box)
+            continue
         if near_top and near_edge and has_alpha:
             brand.append(box)
             continue
@@ -912,6 +930,9 @@ def _partition_resize_layers(
         if overlap_visual > 0.36 or box_h > h * 0.24 or box_w > w * 0.42:
             product_label.append(box)
             continue
+        if is_trust_badge_candidate(box, notes=str(getattr(layer, "notes", "")), role=str(getattr(layer, "role", ""))):
+            trust_badge.append(box)
+            continue
         brand.append(box)
     for layer in analysis.other_layers:
         box = _layer_box(layer, source)
@@ -919,10 +940,22 @@ def _partition_resize_layers(
         notes = str(getattr(layer, "notes", "") or "").lower()
         role = str(getattr(layer, "role", "") or "").lower()
         is_explicit_brand_mark = any(token in f"{role} {notes}" for token in ("logo", "brand", "badge", "seal", "award", "mark"))
+        if is_trust_badge_candidate(box, notes=notes, role=role):
+            trust_badge.append(box)
+            continue
         if is_explicit_brand_mark and cy <= h * 0.25 and (cx <= w * 0.35 or cx >= w * 0.65) and _box_overlap(box, visual_box) / visual_area < 0.12:
-            brand.append(box)
+            if is_trust_badge_candidate(box, notes=notes, role=role):
+                trust_badge.append(box)
+            else:
+                brand.append(box)
+    deduped_trust_badge: list[tuple[int, int, int, int]] = []
+    for box in sorted(trust_badge, key=_box_area, reverse=True):
+        if any(_box_overlap(box, existing) / max(1, min(_box_area(box), _box_area(existing))) > 0.60 for existing in deduped_trust_badge):
+            continue
+        deduped_trust_badge.append(box)
     return {
         "brand": brand,
+        "trust_badge": deduped_trust_badge,
         "primary": primary,
         "secondary": secondary,
         "product_label": product_label,
@@ -2224,14 +2257,16 @@ def _role_aware_layout_zones(
     if target_ratio < 0.78:
         if width <= 420 or target_ratio < 0.45:
             return {
-                "brand": (margin_x, margin_y, width - margin_x, int(height * 0.12)),
-                "copy": (margin_x, int(height * 0.13), width - margin_x, int(height * 0.35)),
-                "cta": (margin_x, int(height * 0.36), width - margin_x, int(height * 0.46)),
+                "brand": (margin_x, margin_y, width - margin_x, int(height * 0.085)),
+                "badge": (margin_x, int(height * 0.087), width - margin_x, int(height * 0.148)),
+                "copy": (margin_x, int(height * 0.16), width - margin_x, int(height * 0.37)),
+                "cta": (margin_x, int(height * 0.38), width - margin_x, int(height * 0.48)),
                 "visual": (margin_x, int(height * 0.48), width - margin_x, height - margin_y),
                 "secondary": (margin_x, int(height * 0.78), width - margin_x, height - margin_y),
             }
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.145)),
+            "badge": (margin_x, margin_y, width - margin_x, int(height * 0.145)),
             "copy": (margin_x, int(height * 0.10), width - margin_x, int(height * 0.30)),
             "cta": (margin_x, int(height * 0.30), width - margin_x, int(height * 0.38)),
             "visual": (int(width * 0.035), int(height * 0.32), width - int(width * 0.035), int(height * 0.975)),
@@ -2241,6 +2276,7 @@ def _role_aware_layout_zones(
         if width <= 360 or height <= 280:
             return {
                 "brand": (margin_x, margin_y, int(width * 0.56), int(height * 0.22)),
+                "badge": (int(width * 0.66), margin_y, width - margin_x, int(height * 0.23)),
                 "copy": (margin_x, int(height * 0.24), int(width * 0.59), height - margin_y),
                 "cta": (margin_x, int(height * 0.74), int(width * 0.62), height - margin_y),
                 "visual": (int(width * 0.57), int(height * 0.12), width - margin_x, height - margin_y),
@@ -2248,6 +2284,7 @@ def _role_aware_layout_zones(
             }
         return {
             "brand": (margin_x, margin_y, int(width * 0.46), int(height * 0.20)),
+            "badge": (int(width * 0.66), margin_y, width - margin_x, int(height * 0.22)),
             "copy": (margin_x, int(height * 0.22), int(width * 0.48), height - margin_y),
             "cta": (margin_x, int(height * 0.76), int(width * 0.50), height - margin_y),
             "visual": (int(width * 0.47), int(height * 0.12), width - margin_x, height - margin_y),
@@ -2256,6 +2293,7 @@ def _role_aware_layout_zones(
     if target_ratio <= 1.25:
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.16)),
+            "badge": (int(width * 0.64), margin_y, width - margin_x, int(height * 0.18)),
             "copy": (margin_x, int(height * 0.16), width - margin_x, int(height * 0.38)),
             "cta": (margin_x, int(height * 0.40), int(width * 0.58), int(height * 0.53)),
             "visual": (int(width * 0.16), int(height * 0.38), width - int(width * 0.16), height - margin_y),
@@ -2264,6 +2302,7 @@ def _role_aware_layout_zones(
     if source_ratio > 1.25:
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.17)),
+            "badge": (int(width * 0.68), margin_y, width - margin_x, int(height * 0.19)),
             "copy": (margin_x, int(height * 0.18), int(width * (0.50 if not target_smaller else 0.48)), int(height * 0.86)),
             "cta": (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.92)),
             "visual": (int(width * (0.47 if not target_smaller else 0.50)), int(height * 0.10), width - margin_x, int(height * 0.93)),
@@ -2271,6 +2310,7 @@ def _role_aware_layout_zones(
         }
     return {
         "brand": (margin_x, margin_y, width - margin_x, int(height * 0.16)),
+        "badge": (int(width * 0.68), margin_y, width - margin_x, int(height * 0.18)),
         "copy": (margin_x, int(height * 0.16), int(width * 0.50), int(height * 0.88)),
         "cta": (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.92)),
         "visual": (int(width * 0.45), int(height * 0.12), width - margin_x, int(height * 0.90)),
@@ -2344,6 +2384,44 @@ def _draw_display_cta_button(
     }
 
 
+def _draw_programmatic_rtb_guides(
+    output: Image.Image,
+    product_box: tuple[int, int, int, int] | None,
+    rtb_box: tuple[int, int, int, int] | None,
+    *,
+    color: tuple[int, int, int] = (20, 86, 128),
+) -> dict[str, Any] | None:
+    if not product_box or not rtb_box:
+        return None
+    product_box = _clip_box(product_box, output.width, output.height)
+    rtb_box = _clip_box(rtb_box, output.width, output.height)
+    if product_box[2] <= product_box[0] or product_box[3] <= product_box[1] or rtb_box[2] <= rtb_box[0] or rtb_box[3] <= rtb_box[1]:
+        return None
+    product_cx, product_cy = _box_center(product_box)
+    rtb_cx, rtb_cy = _box_center(rtb_box)
+    if rtb_cx >= product_cx:
+        start = (product_box[2], int(product_cy))
+        end = (rtb_box[0], int(rtb_cy))
+    else:
+        start = (product_box[0], int(product_cy))
+        end = (rtb_box[2], int(rtb_cy))
+    if abs(end[0] - start[0]) < max(10, int(output.width * 0.025)):
+        return None
+    draw = ImageDraw.Draw(output)
+    line_width = max(1, int(round(min(output.width, output.height) * 0.006)))
+    mid_x = int(round((start[0] + end[0]) / 2))
+    draw.line([start, (mid_x, start[1]), (mid_x, end[1]), end], fill=color + (210,), width=line_width)
+    return {
+        "layerId": "programmatic-rtb-guide",
+        "role": "programmatic_rtb_connector",
+        "sourceBox": [],
+        "targetBox": list(rtb_box),
+        "pasteBox": [min(start[0], end[0]), min(start[1], end[1]), max(start[0], end[0]), max(start[1], end[1])],
+        "scale": None,
+        "fitMode": "vector_line",
+    }
+
+
 def composite_priority_layer_resize(
     background_source: Image.Image,
     source: Image.Image,
@@ -2365,7 +2443,6 @@ def composite_priority_layer_resize(
     meaningful_visuals = [
         box for box in visual_elements if _box_area(box) / max(1, source.width * source.height) >= 0.014
     ] or [visual_box]
-    meaningful_visuals = _collect_hero_cluster_boxes(source, analysis, visual_box, meaningful_visuals)
     compact_target = target_smaller and (width <= 360 or height <= 280)
     product_label_focus = _visual_focus_from_product_label_union(
         source,
@@ -2378,6 +2455,7 @@ def composite_priority_layer_resize(
 
     text_remove_boxes = [
         *parts["brand"],
+        *parts.get("trust_badge", []),
         *parts["primary"],
         *parts["secondary"],
     ]
@@ -2416,6 +2494,22 @@ def composite_priority_layer_resize(
                     preserve_source_position=True,
                 )
             )
+    badge_scale = max(0.24, min(1.20, (width * height / max(1, source.width * source.height)) ** 0.5))
+    for index, box in enumerate(parts.get("trust_badge", [])[:3]):
+        if not _fit_box_has_room(zones["badge"], min_w=max(12, width // 16), min_h=max(8, height // 42)):
+            break
+        composited.append(
+            _paste_layer_relative(
+                output,
+                source,
+                box,
+                target_bounds=zones["badge"],
+                layer_id=f"trust-badge-{index}",
+                role="trust_badge_preserved",
+                scale=badge_scale,
+                preserve_source_position=True,
+            )
+        )
 
     display_cta_zone = zones["cta"] if preserve_brand_layers else None
 
@@ -2479,6 +2573,7 @@ def composite_priority_layer_resize(
         secondary_union = _union_boxes(parts["secondary"])
         product_label_union = _union_boxes(parts["product_label"])
         brand_union = _union_boxes(parts["brand"])
+        trust_badge_union = _union_boxes(parts.get("trust_badge", []))
         text_copy_union = primary_union or _union_boxes([box for box in layer_boxes.values() if product_label_union is None or _box_overlap(box, product_label_union) / max(1, _box_area(box)) < 0.42])
         for block in text_blocks:
             layer_id = str(getattr(block, "id", "")).replace("v5-resize-", "")
@@ -2491,6 +2586,13 @@ def composite_priority_layer_resize(
                 else 0.0
             )
             if brand_overlap >= 0.35:
+                continue
+            trust_badge_overlap = (
+                _box_overlap(source_box, trust_badge_union) / max(1, _box_area(source_box))
+                if trust_badge_union
+                else 0.0
+            )
+            if trust_badge_overlap >= 0.35:
                 continue
             product_label_overlap = (
                 _box_overlap(source_box, product_label_union) / max(1, _box_area(source_box))
@@ -2543,13 +2645,13 @@ def composite_priority_layer_resize(
             redraw_blocks.append(cloned)
 
     visual_bounds = zones["visual"]
-    visual_alpha_cut_boxes = [*parts["brand"], *parts["primary"], *parts["secondary"]]
+    visual_alpha_cut_boxes = [*parts["brand"], *parts.get("trust_badge", []), *parts["primary"], *parts["secondary"]]
     if target_ratio < 0.45 and len(meaningful_visuals) > 1:
         meaningful_visuals = sorted(meaningful_visuals, key=_box_area, reverse=True)[:1]
 
+    visual_paste_box: tuple[int, int, int, int] | None = None
     if len(meaningful_visuals) == 1:
-        composited.append(
-            _paste_crop_fit(
+        visual_layer = _paste_crop_fit(
                 output,
                 source,
                 meaningful_visuals[0],
@@ -2561,7 +2663,9 @@ def composite_priority_layer_resize(
                 foreground_alpha=True,
                 alpha_cut_source_boxes=visual_alpha_cut_boxes,
             )
-        )
+        composited.append(visual_layer)
+        if visual_layer.get("pasteBox"):
+            visual_paste_box = tuple(int(value) for value in visual_layer["pasteBox"])
     else:
         visual_count = min(3, len(meaningful_visuals))
         gap = max(6, int(width * 0.025))
@@ -2608,6 +2712,20 @@ def composite_priority_layer_resize(
                 "blockCount": len(redraw_blocks),
             }
         )
+        if target_ratio >= 1.10:
+            secondary_layer_boxes = [
+                tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))
+                for block in redraw_blocks
+                if _union_boxes(parts["secondary"])
+                and _box_overlap(
+                    layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)),
+                    _union_boxes(parts["secondary"]),
+                )
+                / max(1, _box_area(layer_boxes.get(str(getattr(block, "id", "")).replace("v5-resize-", ""), (0, 0, 0, 0)))) >= 0.35
+            ]
+            guide = _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_layer_boxes))
+            if guide:
+                composited.append(guide)
     display_cta_layer = _draw_display_cta_button(output, display_cta_zone) if display_cta_zone else None
     if display_cta_layer:
         composited.append(display_cta_layer)
@@ -2737,6 +2855,7 @@ def build_wide_to_portrait_outpaint_layout_seed(
     analysis: VisualAnalysis,
 ) -> tuple[Image.Image, dict[str, Any]]:
     visual_box, visual_meta = _detect_role_aware_visual_box(source, analysis)
+    target_ratio = width / max(1, height)
     visual_elements = _collect_visual_element_boxes(source, analysis, visual_box)
     meaningful_visuals = [
         box
@@ -2760,8 +2879,21 @@ def build_wide_to_portrait_outpaint_layout_seed(
             strict_product_label_boxes.append(raw_box)
     if strict_product_label_boxes:
         product_label_boxes = strict_product_label_boxes
+    product_focus = _visual_focus_from_product_label_union(
+        source,
+        _union_boxes(product_label_boxes),
+        visual_box,
+        compact_target=width <= 420 or target_ratio < 0.78,
+    )
+    if product_focus:
+        meaningful_visuals = [product_focus]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
-    visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = []
+    visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = [
+        *parts["brand"],
+        *parts.get("trust_badge", []),
+        *parts["primary"],
+        *parts["secondary"],
+    ]
     for layer in analysis.marketing_text_layers:
         raw_box = _layer_box(layer, source)
         box = _expand_text_box_line_region(source, raw_box)
@@ -2791,11 +2923,12 @@ def build_wide_to_portrait_outpaint_layout_seed(
     background_scene_source = _remove_foreground_visuals_for_background(
         _inpaint_rectangular_overlays(
             source,
-            [
-                *floating_text_boxes,
-                *parts["brand"],
-            ],
-        ),
+                [
+                    *floating_text_boxes,
+                    *parts["brand"],
+                    *parts.get("trust_badge", []),
+                ],
+            ),
         meaningful_visuals,
     )
     seed = _build_focus_cover_scene(
@@ -2855,6 +2988,7 @@ def composite_wide_creative_director_relayout(
     visual_completion_source: Image.Image | None = None,
     preserve_brand_layers: bool = True,
 ) -> tuple[Image.Image, dict[str, Any]]:
+    display_placement = preserve_brand_layers
     visual_box, visual_meta = _detect_role_aware_visual_box(source, analysis)
     provider_background_is_target = background_source.size == (width, height)
 
@@ -2878,7 +3012,6 @@ def composite_wide_creative_director_relayout(
         )
         for box in meaningful_visuals
     ]
-    meaningful_visuals = _collect_hero_cluster_boxes(source, analysis, visual_box, meaningful_visuals)
     if target_ratio < 0.78 and source_ratio > 1.25 and len(meaningful_visuals) > 1 and analysis.product_layers:
         product_union = _union_boxes([_layer_box(layer, source) for layer in analysis.product_layers])
         if product_union:
@@ -2910,6 +3043,14 @@ def composite_wide_creative_director_relayout(
             strict_product_label_boxes.append(raw_box)
     if strict_product_label_boxes:
         product_label_boxes = strict_product_label_boxes
+    product_focus = _visual_focus_from_product_label_union(
+        source,
+        _union_boxes(product_label_boxes),
+        visual_box,
+        compact_target=width <= 420 or target_ratio < 0.78,
+    )
+    if product_focus:
+        meaningful_visuals = [product_focus]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
     visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = []
     for layer in analysis.marketing_text_layers:
@@ -3001,6 +3142,7 @@ def composite_wide_creative_director_relayout(
                 [
                     *floating_text_boxes,
                     *parts["brand"],
+                    *parts.get("trust_badge", []),
                 ],
             ),
             meaningful_visuals,
@@ -3041,6 +3183,20 @@ def composite_wide_creative_director_relayout(
                     preserve_source_position=True,
                 )
             )
+    badge_bounds = (int(width * 0.66), margin_y, width - margin_x, max(margin_y + 10, int(height * 0.20)))
+    for index, box in enumerate(parts.get("trust_badge", [])[:3]):
+        composited.append(
+            _paste_layer_relative(
+                output,
+                source,
+                box,
+                target_bounds=badge_bounds,
+                layer_id=f"trust-badge-{index}",
+                role="trust_badge_preserved",
+                scale=brand_scale,
+                preserve_source_position=True,
+            )
+        )
 
     redraw_blocks: list[Any] = []
     # Resize is not localization: preserve existing marketing typography as artwork
@@ -3087,11 +3243,13 @@ def composite_wide_creative_director_relayout(
                 (_box_overlap(source_box, label_box) / max(1, min(_box_area(source_box), _box_area(label_box))) for label_box in product_label_boxes),
                 default=0.0,
             )
+            secondary_overlap_global = _box_overlap(source_box, secondary_union) / max(1, _box_area(source_box)) if secondary_union else 0.0
+            if not display_placement and secondary_overlap_global >= 0.35:
+                continue
             if target_ratio < 0.78 and product_label_overlap < 0.45:
                 if is_top_brand_like:
                     continue
-                secondary_overlap = _box_overlap(source_box, secondary_union) / max(1, _box_area(source_box)) if secondary_union else 0.0
-                if secondary_overlap >= 0.35:
+                if secondary_overlap_global >= 0.35:
                     continue
                 if portrait_redraw_union:
                     target_box = _map_portrait_text_box_to_safe_copy_zone(
@@ -3113,6 +3271,7 @@ def composite_wide_creative_director_relayout(
                 target_box = _map_box_between_unions(source_box, primary_union, copy_bounds, width, height)
             elif (
                 not target_area_smaller
+                and display_placement
                 and secondary_union
                 and target_ratio >= 0.78
                 and _box_overlap(source_box, secondary_union) / max(1, _box_area(source_box)) > 0.35
@@ -3238,7 +3397,7 @@ def composite_wide_creative_director_relayout(
     )
     if max_visual_text_overlap > 0.005:
         visual_source = visual_source_clean
-    visual_label_cut_boxes = [] if target_area_smaller else visual_alpha_cut_boxes
+    visual_label_cut_boxes = visual_alpha_cut_boxes
     def source_for_visual_element(box: tuple[int, int, int, int]) -> Image.Image:
         # Product/person visual elements must preserve their original pixels.
         # Text cleanup on these crops can create visible patches on skin, packaging,
@@ -3874,7 +4033,7 @@ def render_deterministic_compositor(
         parts = _partition_resize_layers(source, analysis, visual_box)
         # Provider outpaint must never see floating marketing copy or social brand marks.
         # Otherwise it hallucinates corrupted typography in the generated area.
-        role_removal_boxes = [*parts["primary"], *parts["secondary"]]
+        role_removal_boxes = [*parts["primary"], *parts["secondary"], *parts.get("trust_badge", [])]
         if _resize_provider_must_not_see_brand_layers(placement_id):
             role_removal_boxes.extend(parts["brand"])
         background_seed = _inpaint_rectangular_overlays(source, role_removal_boxes)
@@ -3882,6 +4041,7 @@ def render_deterministic_compositor(
             "roleAwareOutpaintSeed": "product_label_preserving_text_and_social_brand_removed",
             "roleAwareOutpaintSeedRemovedLayerCount": len(role_removal_boxes),
             "roleAwareOutpaintSeedRemovedBrandLayers": 0 if not _resize_provider_must_not_see_brand_layers(placement_id) else len(parts["brand"]),
+            "roleAwareOutpaintSeedRemovedTrustBadges": len(parts.get("trust_badge", [])),
             **{f"seed_{key}": value for key, value in visual_meta.items()},
         }
     if preserve_complex_visual:

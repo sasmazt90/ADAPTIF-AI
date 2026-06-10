@@ -13532,6 +13532,60 @@ def sample_resize_text_background_color(source: Image.Image, source_box: tuple[i
         return False, None
 
 
+_RESIZE_TURKISH_OCR_TOKEN_FIXES = {
+    "TUM": "TÜM",
+    "CILT": "CİLT",
+    "CILTLER": "CİLTLER",
+    "TIPLERI": "TİPLERİ",
+    "TIPLERINE": "TİPLERİNE",
+    "ICIN": "İÇİN",
+    "COK": "ÇOK",
+    "YUKSEK": "YÜKSEK",
+    "GUNES": "GÜNEŞ",
+    "KORUMASI": "KORUMASI",
+    "DAHIL": "DAHİL",
+    "HASSAS": "HASSAS",
+    "AKISKAN": "AKIŞKAN",
+    "HIZLI": "HIZLI",
+    "EMILEN": "EMİLEN",
+    "DOKU": "DOKU",
+    "SIVILCE": "SİVİLCE",
+    "YAPMAYAN": "YAPMAYAN",
+    "FORMUL": "FORMÜL",
+    "FORMOL": "FORMÜL",
+    "FORMU": "FORMÜL",
+    "GUNEŞ": "GÜNEŞ",
+    "YUKSEK": "YÜKSEK",
+    "KORUMA": "KORUMA",
+    "DERMATOLOGLARIN": "DERMATOLOGLARIN",
+    "TAVSIYE": "TAVSİYE",
+    "ETTIGI": "ETTİĞİ",
+    "MARKA": "MARKA",
+}
+
+
+def normalize_resize_ocr_copy(text: str) -> str:
+    """Repair conservative OCR casing/diacritic loss before deterministic resize redraw."""
+    if not text:
+        return text
+
+    def fix_token(match: re.Match[str]) -> str:
+        token = match.group(0)
+        normalized = unicodedata.normalize("NFKD", token).encode("ascii", "ignore").decode("ascii")
+        key = re.sub(r"[^A-Za-z0-9]+", "", normalized).upper()
+        fixed = _RESIZE_TURKISH_OCR_TOKEN_FIXES.get(key)
+        if not fixed:
+            return token
+        return fixed if token.upper() == token or any(char.isupper() for char in token) else fixed.lower()
+
+    fixed_lines = []
+    for line in text.splitlines():
+        repaired = re.sub(r"[A-Za-zÇĞİÖŞÜçğıöşü]+", fix_token, line)
+        repaired = re.sub(r"\s+", " ", repaired).strip()
+        fixed_lines.append(repaired)
+    return "\n".join(line for line in fixed_lines if line)
+
+
 def build_resize_compositor_text_blocks(
     source: Image.Image,
     width: int,
@@ -13563,7 +13617,7 @@ def build_resize_compositor_text_blocks(
         layer = layers_by_id.get(placement.layer_id)
         if layer is None or not layer.original_text.strip():
             continue
-        resize_text = repair_mojibake(layer.original_text).strip()
+        resize_text = normalize_resize_ocr_copy(repair_mojibake(layer.original_text).strip())
         source_box = layer.bbox.to_pixel_box(source.width, source.height)
         placement_box = placement.target_bbox.to_pixel_box(width, height)
         union_w = max(1, text_source_union[2] - text_source_union[0])
@@ -16961,17 +17015,28 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
     y = box[1]
     for line in lines:
         x = box[0]
+        line_width = int(round(sum(float(token["width"]) for token in line) + sum(float(token["space"]) for token in line[:-1])))
+        ribbon_background = next((token.get("background") for token in line if token.get("background")), None)
+        if ribbon_background:
+            pad_x = max(1, int(round(font_size * 0.16)))
+            pad_y = max(1, int(round(font_size * 0.10)))
+            ribbon_top = y + max(0, int(round(line_height * 0.10)))
+            ribbon_bottom = min(box[3], y + line_height - max(0, int(round(line_height * 0.08))))
+            draw.rectangle(
+                (
+                    max(0, x - pad_x),
+                    max(0, ribbon_top - pad_y),
+                    min(box[2], x + line_width + pad_x),
+                    max(ribbon_top + 1, ribbon_bottom + pad_y),
+                ),
+                fill=ribbon_background,
+            )
         for token_index, token in enumerate(line):
             if token_index > 0:
                 x += int(round(float(token["space"])))
             text = str(token["text"])
             font = token["font"]
             left, top, right, bottom = draw.textbbox((x, y), text, font=font)
-            background = token.get("background")
-            if background:
-                pad_x = max(1, int(round(font_size * 0.10)))
-                pad_y = max(1, int(round(font_size * 0.08)))
-                draw.rectangle((left - pad_x, top - pad_y, right + pad_x, bottom + pad_y), fill=background)
             draw.text((x, y), text, fill=token["fill"], font=font)
             x += int(round(float(token["width"])))
         y += line_height
