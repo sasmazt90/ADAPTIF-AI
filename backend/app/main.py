@@ -17018,12 +17018,22 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
         line_width = int(round(sum(float(token["width"]) for token in line) + sum(float(token["space"]) for token in line[:-1])))
         ribbon_background = next((token.get("background") for token in line if token.get("background")), None)
         if ribbon_background:
-            pad_x = max(1, int(round(font_size * 0.16)))
-            pad_y = max(1, int(round(font_size * 0.10)))
-            ribbon_top = y + max(0, int(round(line_height * 0.10)))
-            ribbon_bottom = min(box[3], y + line_height - max(0, int(round(line_height * 0.08))))
+            text_boxes = []
+            probe_x = box[0]
+            for token_index, token in enumerate(line):
+                if token_index > 0:
+                    probe_x += int(round(float(token["space"])))
+                text_boxes.append(draw.textbbox((probe_x, y), str(token["text"]), font=token["font"]))
+                probe_x += int(round(float(token["width"])))
+            if text_boxes:
+                ribbon_top = min(item[1] for item in text_boxes)
+                ribbon_bottom = max(item[3] for item in text_boxes)
+            else:
+                ribbon_top = y
+                ribbon_bottom = y + line_height
+            pad_y = max(1, min(4, int(round(font_size * 0.12))))
             ribbon_left = box[0]
-            ribbon_right = box[2]
+            ribbon_right = min(box[2], box[0] + line_width)
             draw.rectangle(
                 (
                     max(0, ribbon_left),
