@@ -13563,6 +13563,7 @@ def build_resize_compositor_text_blocks(
         layer = layers_by_id.get(placement.layer_id)
         if layer is None or not layer.original_text.strip():
             continue
+        resize_text = repair_mojibake(layer.original_text).strip()
         source_box = layer.bbox.to_pixel_box(source.width, source.height)
         placement_box = placement.target_bbox.to_pixel_box(width, height)
         union_w = max(1, text_source_union[2] - text_source_union[0])
@@ -13586,7 +13587,7 @@ def build_resize_compositor_text_blocks(
             target_box = (target_box[0], target_box[1], min(placement_box[2], target_box[0] + max(40, int((source_box[2] - source_box[0]) * area_scale * 0.55))), target_box[3])
         style = layer.text_style
         source_height = max(1, source_box[3] - source_box[1])
-        source_lines = [line.strip() for line in layer.original_text.splitlines() if line.strip()]
+        source_lines = [line.strip() for line in resize_text.splitlines() if line.strip()]
         line_count = max(1, len(source_lines))
         source_font_size = int(style.estimated_font_size) if style and style.estimated_font_size else max(8, int(source_height / line_count * 0.72))
         target_line_capacity = max(8, int(max(1, target_box[3] - target_box[1]) / line_count * 0.76))
@@ -13615,7 +13616,7 @@ def build_resize_compositor_text_blocks(
         font_weight = 700 if style is None or style.is_bold else 400
         align = style.alignment if style and style.alignment != "unknown" else "center"
         font_category = (style.font_type if style and style.font_type != "unknown" else "sans-serif").replace("script", "handwriting")
-        words = [word for word in layer.original_text.replace("\n", " ").split() if word]
+        words = [word for word in resize_text.replace("\n", " ").split() if word]
         source_word_styles = [
             {
                 "id": f"{layer.id}-w{index}",
@@ -13634,8 +13635,8 @@ def build_resize_compositor_text_blocks(
         ]
         spans = [
             {
-                "translatedText": layer.translated_text.strip() or layer.original_text.strip(),
-                "sourceText": layer.original_text.strip(),
+                "translatedText": resize_text,
+                "sourceText": resize_text,
                 "semanticRole": layer.role.value,
                 "matchedSourceRole": layer.role.value,
                 "sourceWordStyles": source_word_styles,
@@ -13660,8 +13661,8 @@ def build_resize_compositor_text_blocks(
         ]
         block = TextBlock(
             id=f"v5-resize-{layer.id}",
-            text=layer.original_text.strip(),
-            translated_text=layer.translated_text.strip() or layer.original_text.strip(),
+            text=resize_text,
+            translated_text=resize_text,
             role=layer.role.value,
             translate=True,
             bbox=target_box,
@@ -13673,7 +13674,7 @@ def build_resize_compositor_text_blocks(
             align=align,
             surface="overlay",
             line_boxes=[target_box],
-            line_texts=source_lines or [layer.original_text.strip()],
+            line_texts=source_lines or [resize_text],
             resize_source_box=source_box,
             source_word_styles=source_word_styles,
             translated_style_spans=spans,

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageChops, ImageDraw, ImageFilter
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont
 
 try:
     from app.smart_reframe import ExpansionStrategy, LayerRole, ReframePlan, VisualAnalysis, VisualLayer
@@ -23,6 +23,10 @@ def _placement_preserves_creative_brand_layers(placement_id: str | None) -> bool
     """Keep original creative logos only for formats where the ad unit has no native account chrome."""
     pid = (placement_id or "").strip().lower()
     return pid.startswith("gdn-") or pid.startswith("google-responsive") or pid == "custom-display"
+
+
+def _placement_is_display_ad(placement_id: str | None) -> bool:
+    return _placement_preserves_creative_brand_layers(placement_id)
 
 
 def _resize_provider_must_not_see_brand_layers(placement_id: str | None) -> bool:
@@ -538,6 +542,74 @@ def _collect_visual_element_boxes(
     if len(merged) == 1 and _box_area(merged[0]) / source_area > 0.72:
         return [visual_box]
     return merged or [visual_box]
+
+
+def _collect_hero_cluster_boxes(
+    source: Image.Image,
+    analysis: VisualAnalysis,
+    visual_box: tuple[int, int, int, int],
+    visual_elements: list[tuple[int, int, int, int]],
+) -> list[tuple[int, int, int, int]]:
+    """Keep product and dependent side elements together as one hero cluster.
+
+    A resize should not separate guide lines, material swatches, splashes, hands,
+    or other visual support elements that are physically close to the product.
+    """
+    w, h = source.size
+    source_area = max(1, w * h)
+    cluster = list(visual_elements or [visual_box])
+    cluster_union = _union_boxes(cluster) or visual_box
+    max_gap_x = max(12, int(w * 0.055))
+    max_gap_y = max(10, int(h * 0.075))
+    text_boxes = [_layer_box(layer, source) for layer in analysis.marketing_text_layers]
+    brand_boxes = [_layer_box(layer, source) for layer in analysis.logo_layers]
+    forbidden = text_boxes + brand_boxes
+
+    def gap_to_cluster(box: tuple[int, int, int, int]) -> tuple[int, int]:
+        x_gap = max(0, cluster_union[0] - box[2], box[0] - cluster_union[2])
+        y_gap = max(0, cluster_union[1] - box[3], box[1] - cluster_union[3])
+        return x_gap, y_gap
+
+    for layer in analysis.other_layers:
+        box = _layer_box(layer, source)
+        if _box_area(box) <= 0:
+            continue
+        area_ratio = _box_area(box) / source_area
+        if not (0.002 <= area_ratio <= 0.38):
+            continue
+        if any(_box_overlap(box, blocked) / max(1, _box_area(box)) > 0.22 for blocked in forbidden):
+            continue
+        notes = str(getattr(layer, "notes", "") or "").lower()
+        role = str(getattr(layer, "role", "") or "").lower()
+        dependent_note = any(
+            token in f"{role} {notes}"
+            for token in (
+                "guide",
+                "line",
+                "callout",
+                "arrow",
+                "material",
+                "swatch",
+                "splash",
+                "texture",
+                "hand",
+                "prop",
+                "theme_element:true",
+                "side_component",
+                "support",
+            )
+        )
+        x_gap, y_gap = gap_to_cluster(box)
+        touches_or_near = x_gap <= max_gap_x and y_gap <= max_gap_y
+        if dependent_note or touches_or_near:
+            cluster.append(_pad_box(box, w, h, pad_x=max(3, w // 180), pad_y=max(3, h // 180)))
+            cluster_union = _union_boxes(cluster) or cluster_union
+
+    merged = _merge_overlapping_boxes(cluster, pad=max(6, min(w, h) // 80))
+    union = _union_boxes(merged)
+    if union and _box_area(union) / source_area <= 0.72:
+        return [union]
+    return visual_elements or [visual_box]
 
 
 def _foreground_component_visual_boxes(source: Image.Image) -> list[tuple[int, int, int, int]]:
@@ -1468,7 +1540,11 @@ def _merge_redraw_blocks_by_inline_rows(blocks: list[Any], canvas_width: int) ->
             box_h = max(1, box[3] - box[1])
             row_gap_union = _union_boxes([source_order_box(item) for item in row]) or row_anchor_box
             gap = max(0, box[0] - row_gap_union[2], row_gap_union[0] - box[2])
-            if abs(cy - row_cy) <= max(row_h, box_h) * 0.75 and gap <= max(int(canvas_width * 0.055), max(row_h, box_h) * 4):
+            vertical_overlap = max(0, min(box[3], row_gap_union[3]) - max(box[1], row_gap_union[1]))
+            vertical_overlap_ratio = vertical_overlap / max(1, min(box_h, row_h))
+            same_baseline = abs(cy - row_cy) <= max(row_h, box_h) * 0.35
+            same_text_row = vertical_overlap_ratio >= 0.58 or same_baseline
+            if same_text_row and gap <= max(int(canvas_width * 0.055), max(row_h, box_h) * 4):
                 row.append(block)
                 placed = True
                 break
@@ -1515,7 +1591,110 @@ def _merge_redraw_blocks_by_inline_rows(blocks: list[Any], canvas_width: int) ->
         if translated_style_spans:
             base.translated_style_spans = translated_style_spans
         merged.append(base)
-    return sorted(merged, key=lambda item: (getattr(item, "bbox", (0, 0, 0, 0))[1], getattr(item, "bbox", (0, 0, 0, 0))[0]))
+    return sorted(merged, key=lambda item: (source_order_box(item)[1], source_order_box(item)[0]))
+
+
+def _sort_redraw_blocks_by_source_yx(blocks: list[Any]) -> list[Any]:
+    def source_order_box(item: Any) -> tuple[int, int, int, int]:
+        box = getattr(item, "resize_source_box", None) or getattr(item, "bbox", (0, 0, 0, 0))
+        try:
+            if len(box) == 4:
+                return tuple(int(value) for value in box)  # type: ignore[arg-type]
+        except Exception:
+            pass
+        return (0, 0, 0, 0)
+
+    return sorted(blocks, key=lambda item: (source_order_box(item)[1], source_order_box(item)[0]))
+
+
+def _build_display_copy_stack_blocks(
+    blocks: list[Any],
+    copy_zone: tuple[int, int, int, int],
+) -> list[Any]:
+    ordered = _sort_redraw_blocks_by_source_yx(
+        _merge_redraw_blocks_by_inline_rows(blocks, max(1, copy_zone[2] - copy_zone[0]))
+    )
+    if not ordered:
+        return []
+    try:
+        base = ordered[0].model_copy(deep=True)
+    except Exception:
+        base = ordered[0]
+
+    copy_w = max(1, copy_zone[2] - copy_zone[0])
+    copy_h = max(1, copy_zone[3] - copy_zone[1])
+    line_count = max(1, len(ordered))
+    stack_font_size = max(8, min(22, int(copy_h / line_count * 0.68), int(copy_w * 0.108)))
+    stack_line_height = max(stack_font_size + 2, int(round(stack_font_size * 1.22)))
+
+    spans: list[dict[str, Any]] = []
+    source_word_styles: list[dict[str, Any]] = []
+    texts: list[str] = []
+    for block_index, block in enumerate(ordered):
+        block_text = str(getattr(block, "translated_text", None) or getattr(block, "text", "") or "").strip()
+        if not block_text:
+            continue
+        texts.append(block_text)
+        block_spans = [dict(span) for span in (getattr(block, "translated_style_spans", []) or []) if isinstance(span, dict)]
+        if not block_spans:
+            block_spans = [
+                {
+                    "translatedText": block_text,
+                    "sourceText": block_text,
+                    "style": {
+                        "fontSize": stack_font_size,
+                        "fontWeight": int(getattr(block, "font_weight", 700) or 700),
+                        "fontCategory": "sans-serif",
+                        "color": getattr(block, "color", None) or "#111111",
+                    },
+                }
+            ]
+        for span_index, span in enumerate(block_spans):
+            text = str(span.get("translatedText") or span.get("sourceText") or "").strip()
+            if not text:
+                continue
+            span["translatedText"] = text
+            span["sourceText"] = text
+            span["forceBreakAfter"] = span_index == len(block_spans) - 1
+            style = span.setdefault("style", {})
+            style["fontSize"] = stack_font_size
+            style["lineHeight"] = stack_line_height
+            style["alignment"] = "left"
+            updated_source_styles: list[dict[str, Any]] = []
+            for source_style in span.get("sourceWordStyles", []) or []:
+                if not isinstance(source_style, dict):
+                    continue
+                cloned_style = dict(source_style)
+                cloned_style["fontSize"] = stack_font_size
+                cloned_style["peerRowFontSize"] = stack_font_size
+                cloned_style["bbox"] = [
+                    copy_zone[0],
+                    copy_zone[1] + block_index * stack_line_height,
+                    copy_zone[2],
+                    copy_zone[1] + (block_index + 1) * stack_line_height,
+                ]
+                cloned_style["lineIndex"] = block_index
+                updated_source_styles.append(cloned_style)
+                source_word_styles.append(cloned_style)
+            if updated_source_styles:
+                span["sourceWordStyles"] = updated_source_styles
+                span["sourceWordIds"] = [str(item.get("id")) for item in updated_source_styles if item.get("id")]
+            spans.append(span)
+
+    if not spans:
+        return ordered
+    base.text = "\n".join(texts)
+    base.translated_text = base.text
+    base.bbox = copy_zone
+    base.clean_box = copy_zone
+    base.line_boxes = [copy_zone]
+    base.line_texts = texts
+    base.font_size_estimate = stack_font_size
+    base.line_height_estimate = stack_line_height
+    base.align = "left"
+    base.source_word_styles = source_word_styles
+    base.translated_style_spans = spans
+    return [base]
 
 
 def _paste_crop_exact(
@@ -2004,13 +2183,15 @@ def _role_aware_layout_zones(
         if width <= 420 or target_ratio < 0.45:
             return {
                 "brand": (margin_x, margin_y, width - margin_x, int(height * 0.12)),
-                "copy": (margin_x, int(height * 0.12), width - margin_x, int(height * 0.42)),
-                "visual": (margin_x, int(height * 0.44), width - margin_x, height - margin_y),
+                "copy": (margin_x, int(height * 0.13), width - margin_x, int(height * 0.35)),
+                "cta": (margin_x, int(height * 0.36), width - margin_x, int(height * 0.46)),
+                "visual": (margin_x, int(height * 0.48), width - margin_x, height - margin_y),
                 "secondary": (margin_x, int(height * 0.78), width - margin_x, height - margin_y),
             }
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.145)),
             "copy": (margin_x, int(height * 0.10), width - margin_x, int(height * 0.30)),
+            "cta": (margin_x, int(height * 0.30), width - margin_x, int(height * 0.38)),
             "visual": (int(width * 0.035), int(height * 0.32), width - int(width * 0.035), int(height * 0.975)),
             "secondary": (margin_x, int(height * 0.70), width - margin_x, int(height * 0.92)),
         }
@@ -2019,12 +2200,14 @@ def _role_aware_layout_zones(
             return {
                 "brand": (margin_x, margin_y, int(width * 0.56), int(height * 0.22)),
                 "copy": (margin_x, int(height * 0.24), int(width * 0.59), height - margin_y),
+                "cta": (margin_x, int(height * 0.74), int(width * 0.62), height - margin_y),
                 "visual": (int(width * 0.57), int(height * 0.12), width - margin_x, height - margin_y),
                 "secondary": (int(width * 0.68), int(height * 0.58), width - margin_x, height - margin_y),
             }
         return {
             "brand": (margin_x, margin_y, int(width * 0.46), int(height * 0.20)),
             "copy": (margin_x, int(height * 0.22), int(width * 0.48), height - margin_y),
+            "cta": (margin_x, int(height * 0.76), int(width * 0.50), height - margin_y),
             "visual": (int(width * 0.47), int(height * 0.12), width - margin_x, height - margin_y),
             "secondary": (int(width * 0.62), int(height * 0.52), width - margin_x, height - margin_y),
         }
@@ -2032,6 +2215,7 @@ def _role_aware_layout_zones(
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.16)),
             "copy": (margin_x, int(height * 0.16), width - margin_x, int(height * 0.38)),
+            "cta": (margin_x, int(height * 0.40), int(width * 0.58), int(height * 0.53)),
             "visual": (int(width * 0.16), int(height * 0.38), width - int(width * 0.16), height - margin_y),
             "secondary": (margin_x, int(height * 0.70), width - margin_x, height - margin_y),
         }
@@ -2039,12 +2223,14 @@ def _role_aware_layout_zones(
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.17)),
             "copy": (margin_x, int(height * 0.18), int(width * (0.50 if not target_smaller else 0.48)), int(height * 0.86)),
+            "cta": (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.92)),
             "visual": (int(width * (0.47 if not target_smaller else 0.50)), int(height * 0.10), width - margin_x, int(height * 0.93)),
             "secondary": (int(width * 0.58), int(height * 0.52), width - margin_x, int(height * 0.90)),
         }
     return {
         "brand": (margin_x, margin_y, width - margin_x, int(height * 0.16)),
         "copy": (margin_x, int(height * 0.16), int(width * 0.50), int(height * 0.88)),
+        "cta": (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.92)),
         "visual": (int(width * 0.45), int(height * 0.12), width - margin_x, int(height * 0.90)),
         "secondary": (int(width * 0.58), int(height * 0.56), width - margin_x, int(height * 0.90)),
     }
@@ -2052,6 +2238,68 @@ def _role_aware_layout_zones(
 
 def _fit_box_has_room(target: tuple[int, int, int, int], *, min_w: int, min_h: int) -> bool:
     return (target[2] - target[0]) >= min_w and (target[3] - target[1]) >= min_h
+
+
+def _load_cta_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        "arialbd.ttf",
+        "Arial Bold.ttf",
+        "DejaVuSans-Bold.ttf",
+        "DejaVuSans.ttf",
+    ]
+    for name in candidates:
+        try:
+            return ImageFont.truetype(name, size=max(6, int(size)))
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _draw_display_cta_button(
+    output: Image.Image,
+    zone: tuple[int, int, int, int],
+    *,
+    label: str = "Learn More",
+) -> dict[str, Any] | None:
+    zone = _clip_box(zone, output.width, output.height)
+    zone_w = max(1, zone[2] - zone[0])
+    zone_h = max(1, zone[3] - zone[1])
+    if zone_w < 54 or zone_h < 18:
+        return None
+    button_w = min(zone_w, max(58, int(zone_w * 0.88)))
+    button_h = min(zone_h, max(20, int(zone_h * 0.68)))
+    left = zone[0] + (zone_w - button_w) // 2
+    top = zone[1] + (zone_h - button_h) // 2
+    right = left + button_w
+    bottom = top + button_h
+    draw = ImageDraw.Draw(output)
+    radius = max(5, min(button_h // 2, 14))
+    draw.rounded_rectangle((left, top, right, bottom), radius=radius, fill=(0, 80, 145, 255))
+    stroke = max(1, button_h // 18)
+    draw.rounded_rectangle((left, top, right, bottom), radius=radius, outline=(255, 255, 255, 235), width=stroke)
+    font_size = max(7, min(int(button_h * 0.42), 18))
+    font = _load_cta_font(font_size)
+    text_box = draw.textbbox((0, 0), label, font=font)
+    text_w = text_box[2] - text_box[0]
+    text_h = text_box[3] - text_box[1]
+    while (text_w > button_w * 0.78 or text_h > button_h * 0.72) and font_size > 6:
+        font_size -= 1
+        font = _load_cta_font(font_size)
+        text_box = draw.textbbox((0, 0), label, font=font)
+        text_w = text_box[2] - text_box[0]
+        text_h = text_box[3] - text_box[1]
+    text_x = left + (button_w - text_w) // 2
+    text_y = top + (button_h - text_h) // 2 - text_box[1]
+    draw.text((text_x, text_y), label, fill=(255, 255, 255, 255), font=font)
+    return {
+        "layerId": "display-cta-button",
+        "role": "display_cta_button",
+        "sourceBox": [],
+        "targetBox": list(zone),
+        "pasteBox": [left, top, right, bottom],
+        "scale": None,
+        "fitMode": "deterministic_cta",
+    }
 
 
 def composite_priority_layer_resize(
@@ -2075,6 +2323,7 @@ def composite_priority_layer_resize(
     meaningful_visuals = [
         box for box in visual_elements if _box_area(box) / max(1, source.width * source.height) >= 0.014
     ] or [visual_box]
+    meaningful_visuals = _collect_hero_cluster_boxes(source, analysis, visual_box, meaningful_visuals)
     compact_target = target_smaller and (width <= 360 or height <= 280)
     product_label_focus = _visual_focus_from_product_label_union(
         source,
@@ -2126,7 +2375,11 @@ def composite_priority_layer_resize(
                 )
             )
 
+    display_cta_zone = zones["cta"] if preserve_brand_layers else None
+
     redraw_blocks: list[Any] = []
+    # Very narrow canvases need programmatic redraw for legibility. Provider
+    # outpaint still never sees text, and redraw order is locked to source Y/X.
     use_redraw_for_small_text = target_smaller and (target_ratio < 0.45 or width <= 200)
     if target_smaller and not use_redraw_for_small_text:
         text_artwork_source = _remove_foreground_visuals_for_background(source, meaningful_visuals)
@@ -2248,6 +2501,7 @@ def composite_priority_layer_resize(
             redraw_blocks.append(cloned)
 
     visual_bounds = zones["visual"]
+    visual_alpha_cut_boxes = [*parts["brand"], *parts["primary"], *parts["secondary"]]
     if target_ratio < 0.45 and len(meaningful_visuals) > 1:
         meaningful_visuals = sorted(meaningful_visuals, key=_box_area, reverse=True)[:1]
 
@@ -2263,6 +2517,7 @@ def composite_priority_layer_resize(
                 mode="contain",
                 anchor=(0.5, 0.5),
                 foreground_alpha=True,
+                alpha_cut_source_boxes=visual_alpha_cut_boxes,
             )
         )
     else:
@@ -2287,11 +2542,17 @@ def composite_priority_layer_resize(
                     mode="contain",
                     anchor=(0.5, 0.5),
                     foreground_alpha=True,
+                    alpha_cut_source_boxes=visual_alpha_cut_boxes,
                 )
             )
 
     if redraw_blocks and draw_text:
-        blocks_to_draw = _merge_redraw_blocks_by_inline_rows(redraw_blocks, width)
+        if use_redraw_for_small_text and preserve_brand_layers:
+            blocks_to_draw = _build_display_copy_stack_blocks(redraw_blocks, zones["copy"])
+        else:
+            blocks_to_draw = _sort_redraw_blocks_by_source_yx(
+                _merge_redraw_blocks_by_inline_rows(redraw_blocks, width)
+            )
         output = draw_text(output.convert("RGB"), blocks_to_draw).convert("RGBA")
         composited.append(
             {
@@ -2305,6 +2566,9 @@ def composite_priority_layer_resize(
                 "blockCount": len(redraw_blocks),
             }
         )
+    display_cta_layer = _draw_display_cta_button(output, display_cta_zone) if display_cta_zone else None
+    if display_cta_layer:
+        composited.append(display_cta_layer)
 
     return output.convert("RGB"), {
         "compositedLayers": composited,
@@ -2572,6 +2836,7 @@ def composite_wide_creative_director_relayout(
         )
         for box in meaningful_visuals
     ]
+    meaningful_visuals = _collect_hero_cluster_boxes(source, analysis, visual_box, meaningful_visuals)
     if target_ratio < 0.78 and source_ratio > 1.25 and len(meaningful_visuals) > 1 and analysis.product_layers:
         product_union = _union_boxes([_layer_box(layer, source) for layer in analysis.product_layers])
         if product_union:
@@ -2642,6 +2907,7 @@ def composite_wide_creative_director_relayout(
     if target_ratio < 0.78:
         brand_bounds = (margin_x, margin_y, width - margin_x, int(height * 0.16))
         copy_bounds = (margin_x, int(height * 0.15), width - margin_x, int(height * 0.35))
+        cta_bounds = (margin_x, int(height * 0.35), width - margin_x, int(height * 0.43))
         portrait_visual_margin_x = int(width * 0.09)
         visual_bounds = (
             portrait_visual_margin_x,
@@ -2652,14 +2918,17 @@ def composite_wide_creative_director_relayout(
     elif target_area_smaller:
         brand_bounds = (margin_x, margin_y, int(width * 0.44), int(height * 0.18))
         copy_bounds = (margin_x, int(height * 0.22), int(width * 0.43), int(height * 0.92))
+        cta_bounds = (margin_x, int(height * 0.78), int(width * 0.44), int(height * 0.94))
         visual_bounds = (int(width * 0.56), int(height * 0.08), width - margin_x, int(height * 0.96))
     elif source_ratio > 1.25 and target_ratio <= 1.25:
         brand_bounds = (margin_x, margin_y, int(width * 0.42), int(height * 0.17))
         copy_bounds = (margin_x, int(height * 0.30), int(width * 0.43), int(height * 0.67))
+        cta_bounds = (margin_x, int(height * 0.68), int(width * 0.43), int(height * 0.80))
         visual_bounds = (int(width * 0.49), int(height * 0.12), width - margin_x, int(height * 0.90))
     else:
         brand_bounds = (margin_x, margin_y, width - margin_x, int(height * 0.17))
         copy_bounds = (margin_x, int(height * 0.16), int(width * 0.52), int(height * 0.82))
+        cta_bounds = (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.91))
         visual_bounds = (int(width * 0.43), int(height * 0.12), width - margin_x, int(height * 0.88))
     visual_render_bounds = visual_bounds
     if target_ratio < 0.78 and visual_edge_sides:
@@ -3047,6 +3316,10 @@ def composite_wide_creative_director_relayout(
                 "blockCount": len(redraw_blocks),
             }
         )
+
+    display_cta_layer = _draw_display_cta_button(output, cta_bounds) if preserve_brand_layers else None
+    if display_cta_layer:
+        composited.append(display_cta_layer)
 
     return output.convert("RGB"), {
         "compositedLayers": composited,
@@ -3585,6 +3858,19 @@ def render_deterministic_compositor(
         ):
             background_source, layout_seed_meta = build_wide_to_portrait_outpaint_layout_seed(source, width, height, analysis)
             provider_background_meta.update(layout_seed_meta)
+        if should_seed_outpaint_with_foreground and outpaint_renderer is None:
+            # The layout seed contains protected foreground alpha and RGB context
+            # for an edit provider. It is not a final background. Without a
+            # provider, falling through with this seed clones the product behind
+            # the deterministic foreground layer.
+            background_source = fallback_background_source
+            provider_background_meta = {
+                **provider_background_meta,
+                "provider": "local",
+                "outpaintProviderFailure": "No outpaint provider is enabled for deterministic compositor.",
+                "layoutOutpaintSeedUsedAsFinalBackground": False,
+                "productionReady": False,
+            }
         if should_seed_outpaint_with_foreground and outpaint_renderer is not None:
             try:
                 provider_background, generated_provider_meta = outpaint_renderer(background_source, width, height, plan, analysis)
