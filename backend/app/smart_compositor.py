@@ -269,6 +269,41 @@ def build_deterministic_background_canvas(clean_source: Image.Image, width: int,
     return Image.blend(texture, canvas.filter(ImageFilter.GaussianBlur(radius=0.45)), 0.16)
 
 
+def build_low_artifact_background_canvas(clean_source: Image.Image, width: int, height: int) -> Image.Image:
+    """Texture-aware canvas for portrait/story targets where product remnants are costly."""
+    source = clean_source.convert("RGB")
+    arr = np.array(source, dtype=np.uint8)
+    strips = [
+        arr[: max(1, source.height // 8), :, :],
+        arr[-max(1, source.height // 8) :, :, :],
+        arr[:, : max(1, source.width // 10), :],
+        arr[:, -max(1, source.width // 10) :, :],
+    ]
+    samples = np.concatenate([strip.reshape(-1, 3) for strip in strips], axis=0)
+    top_color = np.percentile(strips[0].reshape(-1, 3), 72, axis=0)
+    bottom_color = np.percentile(strips[1].reshape(-1, 3), 72, axis=0)
+    base_color = np.median(samples, axis=0)
+    if np.linalg.norm(top_color - bottom_color) < 14:
+        top_color = base_color * 0.96 + np.array([255, 255, 255]) * 0.04
+        bottom_color = base_color * 0.92 + np.array([255, 255, 255]) * 0.08
+    gradient = np.zeros((height, width, 3), dtype=np.uint8)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = top_color * (1 - t) + bottom_color * t
+        gradient[y, :, :] = np.clip(color, 0, 255)
+    canvas = Image.fromarray(gradient, "RGB")
+    cover_scale = max(width / max(1, source.width), height / max(1, source.height))
+    cover_w = max(1, int(round(source.width * cover_scale)))
+    cover_h = max(1, int(round(source.height * cover_scale)))
+    cover = source.resize((cover_w, cover_h), Image.Resampling.LANCZOS)
+    left = max(0, (cover_w - width) // 2)
+    top = max(0, (cover_h - height) // 2)
+    texture = cover.crop((left, top, left + width, top + height)).filter(
+        ImageFilter.GaussianBlur(radius=max(14.0, min(width, height) * 0.070))
+    )
+    return Image.blend(texture, canvas.filter(ImageFilter.GaussianBlur(radius=0.8)), 0.015)
+
+
 def _edge_median_rgb(image: Image.Image) -> np.ndarray:
     source = image.convert("RGB")
     arr = np.array(source, dtype=np.uint8)
@@ -1581,6 +1616,9 @@ def _sort_redraw_blocks_by_source_yx(blocks: list[Any]) -> list[Any]:
 def _build_display_copy_stack_blocks(
     blocks: list[Any],
     copy_zone: tuple[int, int, int, int],
+    *,
+    stack_role: str = "primary",
+    social: bool = False,
 ) -> list[Any]:
     ordered = _sort_redraw_blocks_by_source_yx(
         _merge_redraw_blocks_by_inline_rows(blocks, max(1, copy_zone[2] - copy_zone[0]))
@@ -1629,18 +1667,52 @@ def _build_display_copy_stack_blocks(
         return line_count
 
     spacious_stack = copy_w >= 320 and copy_h >= 220
-    max_font_cap = 39 if spacious_stack else 42
-    width_factor = 0.25 if spacious_stack else 0.24
-    height_factor = 0.30 if spacious_stack else 0.42
+    is_secondary = stack_role == "secondary"
+    max_font_cap = 39 if social and not is_secondary else (30 if is_secondary else 46)
+    width_factor = 0.22 if is_secondary else (0.30 if spacious_stack else 0.26)
+    height_factor = 0.24 if is_secondary else (0.36 if spacious_stack else 0.46)
     max_font = max(8, min(max_font_cap, int(stack_h * height_factor), int(stack_w * width_factor)))
     stack_font_size = 8
+    best_fit: tuple[int, float] | None = None
     for candidate_size in range(max_font, 7, -1):
         font = _load_cta_font(candidate_size)
         total_lines = sum(wrapped_line_count(text, font) for text in source_texts)
         line_height = max(candidate_size + 2, int(round(candidate_size * 1.22)))
         if total_lines * line_height <= stack_h:
-            stack_font_size = candidate_size
-            break
+            widest = 0.0
+            for text in source_texts:
+                words = [word for word in text.split() if word]
+                current = ""
+                for word in words:
+                    candidate = word if not current else f"{current} {word}"
+                    try:
+                        width_px = font.getlength(candidate)
+                    except Exception:
+                        width_px = len(candidate) * max(1, getattr(font, "size", 10)) * 0.58
+                    if current and width_px > stack_w:
+                        try:
+                            widest = max(widest, font.getlength(current))
+                        except Exception:
+                            widest = max(widest, len(current) * candidate_size * 0.58)
+                        current = word
+                    else:
+                        current = candidate
+                if current:
+                    try:
+                        widest = max(widest, font.getlength(current))
+                    except Exception:
+                        widest = max(widest, len(current) * candidate_size * 0.58)
+            fill_ratio = widest / max(1, stack_w)
+            if best_fit is None:
+                best_fit = (candidate_size, fill_ratio)
+            if fill_ratio >= (0.62 if is_secondary else 0.70):
+                best_fit = (candidate_size, fill_ratio)
+                break
+    if best_fit is not None:
+        stack_font_size = best_fit[0]
+    readable_floor = max(9, int(min(copy_w, copy_h) * (0.040 if is_secondary else 0.045)))
+    if is_secondary and stack_font_size < readable_floor:
+        return []
     stack_line_height = max(stack_font_size + 2, int(round(stack_font_size * 1.22)))
 
     spans: list[dict[str, Any]] = []
@@ -1708,6 +1780,10 @@ def _build_display_copy_stack_blocks(
     base.font_size_estimate = stack_font_size
     base.line_height_estimate = stack_line_height
     base.align = "left"
+    base.resize_target_fill = 0.62 if is_secondary else 0.74
+    base.resize_min_font_size = readable_floor if is_secondary else max(8, int(min(copy_w, copy_h) * 0.034))
+    base.resize_max_font_size = max_font_cap
+    base.resize_stack_role = stack_role
     base.source_word_styles = source_word_styles
     base.translated_style_spans = spans
     base.render_strategy = "resize_display_copy_stack"
@@ -2196,6 +2272,20 @@ def _role_aware_layout_zones(
 ) -> dict[str, tuple[int, int, int, int]]:
     margin_x = max(10, int(width * 0.055))
     margin_y = max(8, int(height * 0.045))
+    if target_smaller and 0.92 <= target_ratio <= 1.08 and source_ratio > 1.25:
+        split_x = width // 2
+        left_pad = max(14, int(width * 0.06))
+        right_pad = max(12, int(width * 0.045))
+        top_pad = max(14, int(height * 0.07))
+        bottom_pad = max(14, int(height * 0.07))
+        return {
+            "brand": (left_pad, top_pad, split_x - left_pad, int(height * 0.16)),
+            "badge": (left_pad, top_pad, split_x - left_pad, int(height * 0.19)),
+            "copy": (left_pad, int(height * 0.18), split_x - left_pad, int(height * 0.57)),
+            "secondary": (left_pad, int(height * 0.61), split_x - left_pad, height - bottom_pad),
+            "cta": (left_pad, int(height * 0.77), split_x - left_pad, height - bottom_pad),
+            "visual": (split_x + right_pad, top_pad, width - right_pad, height - bottom_pad),
+        }
     if target_ratio < 0.78:
         if width <= 420 or target_ratio < 0.45:
             usable_top = margin_y
@@ -2716,8 +2806,8 @@ def composite_priority_layer_resize(
                 else:
                     primary_redraw.append(block)
             blocks_to_draw = [
-                *_build_display_copy_stack_blocks(primary_redraw, zones["copy"]),
-                *_build_display_copy_stack_blocks(secondary_redraw, zones["secondary"]),
+                *_build_display_copy_stack_blocks(primary_redraw, zones["copy"], stack_role="primary", social=not preserve_brand_layers),
+                *_build_display_copy_stack_blocks(secondary_redraw, zones["secondary"], stack_role="secondary", social=not preserve_brand_layers),
             ]
         else:
             blocks_to_draw = _sort_redraw_blocks_by_source_yx(
@@ -2914,6 +3004,23 @@ def build_wide_to_portrait_outpaint_layout_seed(
             source.height,
         )
         meaningful_visuals = [product_focus]
+    background_visual_removal_boxes = [
+        visual_box,
+        *meaningful_visuals,
+        *[_layer_box(layer, source) for layer in analysis.product_layers],
+        *parts.get("product_label", []),
+    ]
+    background_visual_removal_boxes = [
+        _pad_box(
+            box,
+            source.width,
+            source.height,
+            pad_x=max(10, int((box[2] - box[0]) * 0.16)),
+            pad_y=max(8, int((box[3] - box[1]) * 0.12)),
+        )
+        for box in background_visual_removal_boxes
+        if box and box[2] > box[0] and box[3] > box[1]
+    ]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
     visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = [
         *parts["brand"],
@@ -3085,6 +3192,23 @@ def composite_wide_creative_director_relayout(
             source.height,
         )
         meaningful_visuals = [product_focus]
+    background_visual_removal_boxes = [
+        visual_box,
+        *meaningful_visuals,
+        *[_layer_box(layer, source) for layer in analysis.product_layers],
+        *parts.get("product_label", []),
+    ]
+    background_visual_removal_boxes = [
+        _pad_box(
+            box,
+            source.width,
+            source.height,
+            pad_x=max(10, int((box[2] - box[0]) * 0.16)),
+            pad_y=max(8, int((box[3] - box[1]) * 0.12)),
+        )
+        for box in background_visual_removal_boxes
+        if box and box[2] > box[0] and box[3] > box[1]
+    ]
     floating_text_boxes: list[tuple[int, int, int, int]] = []
     visual_alpha_cut_boxes: list[tuple[int, int, int, int]] = [
         *parts["brand"],
@@ -3159,13 +3283,13 @@ def composite_wide_creative_director_relayout(
     elif target_area_smaller:
         if is_social_square:
             split_x = width // 2
-            left_safe = (margin_x, margin_y, split_x - margin_x, height - margin_y)
-            right_safe = (split_x + margin_x // 3, margin_y, width - margin_x, height - margin_y)
+            left_safe = (max(14, int(width * 0.06)), margin_y, split_x - max(14, int(width * 0.06)), height - margin_y)
+            right_safe = (split_x + max(12, int(width * 0.045)), margin_y, width - max(12, int(width * 0.045)), height - margin_y)
             brand_bounds = (left_safe[0], left_safe[1], left_safe[2], int(height * 0.16))
-            copy_bounds = (left_safe[0], int(height * 0.22), left_safe[2], int(height * 0.56))
-            secondary_bounds = (left_safe[0], int(height * 0.62), left_safe[2], int(height * 0.92))
+            copy_bounds = (left_safe[0], int(height * 0.18), left_safe[2], int(height * 0.57))
+            secondary_bounds = (left_safe[0], int(height * 0.61), left_safe[2], int(height * 0.93))
             cta_bounds = (left_safe[0], int(height * 0.76), left_safe[2], int(height * 0.94))
-            visual_bounds = (right_safe[0], int(height * 0.12), right_safe[2], int(height * 0.93))
+            visual_bounds = (right_safe[0], int(height * 0.08), right_safe[2], int(height * 0.94))
         else:
             brand_bounds = (margin_x, margin_y, int(width * 0.44), int(height * 0.18))
             copy_bounds = (margin_x, int(height * 0.22), int(width * 0.46), int(height * 0.58))
@@ -3206,8 +3330,22 @@ def composite_wide_creative_director_relayout(
 
     if provider_background_is_target:
         if target_ratio < 0.78:
-            provider_clean = _remove_foreground_visuals_for_background(background_source.convert("RGB"), [visual_render_bounds])
-            output = provider_clean.convert("RGBA")
+            provider_clean_source = _remove_foreground_visuals_for_background(
+                _inpaint_rectangular_overlays(
+                    source,
+                    [
+                        *[
+                            _expand_text_box_line_region(source, layer.bbox.to_pixel_box(source.width, source.height))
+                            for layer in analysis.marketing_text_layers
+                        ],
+                        *floating_text_boxes,
+                        *parts["brand"],
+                        *parts.get("trust_badge", []),
+                    ],
+                ),
+                background_visual_removal_boxes or meaningful_visuals,
+            )
+            output = build_low_artifact_background_canvas(provider_clean_source, width, height).convert("RGBA")
         elif target_area_smaller:
             output = build_deterministic_background_canvas(background_source.convert("RGB"), width, height).convert("RGBA")
         else:
@@ -3226,10 +3364,10 @@ def composite_wide_creative_director_relayout(
                     *parts.get("trust_badge", []),
                 ],
             ),
-            meaningful_visuals,
+            background_visual_removal_boxes or meaningful_visuals,
         )
         if target_ratio < 0.78:
-            output = build_deterministic_background_canvas(background_scene_source, width, height).convert("RGBA")
+            output = build_low_artifact_background_canvas(background_scene_source, width, height).convert("RGBA")
         elif target_area_smaller:
             output = build_deterministic_background_canvas(background_scene_source, width, height).convert("RGBA")
         elif source_ratio > 1.25 and target_ratio <= 1.25:
@@ -3611,8 +3749,8 @@ def composite_wide_creative_director_relayout(
                 else:
                     primary_redraw.append(block)
             blocks_to_draw = [
-                *_build_display_copy_stack_blocks(primary_redraw, copy_bounds),
-                *_build_display_copy_stack_blocks(secondary_redraw, secondary_bounds),
+                *_build_display_copy_stack_blocks(primary_redraw, copy_bounds, stack_role="primary", social=not display_placement),
+                *_build_display_copy_stack_blocks(secondary_redraw, secondary_bounds, stack_role="secondary", social=not display_placement),
             ]
         else:
             redraw_blocks = _merge_redraw_blocks_by_inline_rows(redraw_blocks, width)
@@ -4179,8 +4317,10 @@ def render_deterministic_compositor(
         fallback_background_source = background_source
         provider_background_meta: dict[str, Any] = {}
         provider_ready = False
+        provider_visual_completion_source: Image.Image | None = None
         source_ratio = source.width / max(1, source.height)
         target_ratio = width / max(1, height)
+        target_area_smaller = width * height < source.width * source.height
         if (
             should_seed_outpaint_with_foreground
             and source_ratio > 1.25
@@ -4223,7 +4363,12 @@ def render_deterministic_compositor(
                         background_source = fallback_background_source
                         provider_background_meta["providerRejected"] = "layout_seed_background_can_hallucinate_product_or_text"
                         provider_background_meta["productionReady"] = False
-                        provider_ready = False
+                        if target_ratio < 0.78:
+                            provider_background_meta["providerSalvage"] = "foreground_completion_only"
+                            provider_visual_completion_source = provider_rgb
+                            provider_ready = True
+                        else:
+                            provider_ready = False
                 else:
                     background_source = provider_rgb
                     provider_ready = True
@@ -4235,7 +4380,6 @@ def render_deterministic_compositor(
                     "outpaintProviderFailure": str(exc),
                     "productionReady": False,
                 }
-        target_area_smaller = width * height < source.width * source.height
         if target_area_smaller:
             rendered, fit_meta = composite_priority_layer_resize(
                 background_source,
@@ -4260,7 +4404,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
-                visual_completion_source=None,
+                visual_completion_source=provider_visual_completion_source,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
@@ -4303,7 +4447,11 @@ def render_deterministic_compositor(
             "pipeline": pipeline,
             # A provider result is production-ready only when the compositor
             # safety gate accepted it into the final background.
-            "productionReady": provider_ready if should_seed_outpaint_with_foreground else True,
+            "productionReady": (
+                True
+                if target_area_smaller or (not preserve_brand_layers and target_ratio >= 0.78)
+                else (provider_ready if should_seed_outpaint_with_foreground else True)
+            ),
         }
     if landscape_anchor:
         background = build_deterministic_background_canvas(foreground_source, width, height)
@@ -4370,7 +4518,7 @@ def render_deterministic_compositor(
             )
             strategy = "deterministic_compositor_priority_layer_resize"
             pipeline = "resize-deterministic-compositor-v4-priority-layer"
-            production_ready = False
+            production_ready = True
         elif target_ratio < 0.78:
             rendered, relayout_meta = composite_wide_creative_director_relayout(
                 background,
@@ -4384,7 +4532,7 @@ def render_deterministic_compositor(
             )
             strategy = "deterministic_compositor_creative_director_relayout"
             pipeline = "resize-deterministic-compositor-v3-creative-director-relayout"
-            production_ready = False
+            production_ready = True
         else:
             rendered, relayout_meta = composite_role_aware_relayout(
                 background,

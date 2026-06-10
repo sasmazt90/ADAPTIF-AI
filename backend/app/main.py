@@ -228,6 +228,10 @@ class TextBlock(BaseModel):
     translation_candidates: list[dict[str, str]] = Field(default_factory=list)
     target_language: str | None = None
     resize_source_box: tuple[int, int, int, int] | None = None
+    resize_target_fill: float = 0.72
+    resize_min_font_size: int = 8
+    resize_max_font_size: int = 42
+    resize_stack_role: str = "primary"
     cleanup_confidence: float = 1.0
     cleanup_strategy: str = "clean_replace"
     render_strategy: str = "clean_replace"
@@ -16735,6 +16739,56 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
     if not spans:
         return
 
+    orphan_tokens = {
+        "&",
+        "+",
+        "/",
+        "and",
+        "or",
+        "of",
+        "for",
+        "to",
+        "in",
+        "a",
+        "an",
+        "the",
+        "ve",
+        "veya",
+        "ile",
+        "için",
+        "icin",
+        "de",
+        "da",
+    }
+
+    def is_orphan_token(text: str) -> bool:
+        clean = text.strip().strip(".,;:!?()[]{}").lower()
+        return clean in orphan_tokens or len(clean) <= 1
+
+    def token_width(token: dict[str, Any]) -> float:
+        return float(token["width"])
+
+    def line_width(tokens: list[dict[str, Any]]) -> float:
+        if not tokens:
+            return 0.0
+        return sum(token_width(token) for token in tokens) + sum(float(token["space"]) for token in tokens[:-1])
+
+    def repair_orphan_lines(lines: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+        repaired = [list(line) for line in lines if line]
+        index = 1
+        while index < len(repaired):
+            while repaired[index] and is_orphan_token(str(repaired[index][0]["text"])) and repaired[index - 1]:
+                moved = repaired[index - 1].pop()
+                repaired[index].insert(0, moved)
+                if not repaired[index - 1]:
+                    repaired.pop(index - 1)
+                    index = max(1, index - 1)
+                    break
+                if line_width(repaired[index]) <= max_width:
+                    break
+            index += 1
+        return [line for line in repaired if line]
+
     def build_lines(font_size: int) -> tuple[list[list[dict[str, Any]]], int]:
         lines: list[list[dict[str, Any]]] = []
         current: list[dict[str, Any]] = []
@@ -16787,19 +16841,28 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
                 current_width = 0.0
         if current:
             lines.append(current)
-        return lines, line_height
+        return repair_orphan_lines(lines), line_height
 
     preferred_size = max(8, int(block.font_size_estimate or 16))
     font_size = preferred_size
     lines: list[list[dict[str, Any]]] = []
     line_height = max(font_size + 2, int(round(font_size * 1.22)))
-    for candidate in range(min(42, max(8, preferred_size)), 7, -1):
+    max_candidate = max(8, min(72, int(getattr(block, "resize_max_font_size", 42) or 42)))
+    min_candidate = max(6, int(getattr(block, "resize_min_font_size", 8) or 8))
+    target_fill = float(getattr(block, "resize_target_fill", 0.72) or 0.72)
+    best_fit: tuple[int, list[list[dict[str, Any]]], int, float] | None = None
+    for candidate in range(max_candidate, min_candidate - 1, -1):
         candidate_lines, candidate_line_height = build_lines(candidate)
         if candidate_lines and len(candidate_lines) * candidate_line_height <= max_height:
-            font_size = candidate
-            lines = candidate_lines
-            line_height = candidate_line_height
-            break
+            widest = max((line_width(line) for line in candidate_lines), default=0.0)
+            fill_ratio = widest / max(1, max_width)
+            if best_fit is None:
+                best_fit = (candidate, candidate_lines, candidate_line_height, fill_ratio)
+            if fill_ratio >= target_fill:
+                best_fit = (candidate, candidate_lines, candidate_line_height, fill_ratio)
+                break
+    if best_fit is not None:
+        font_size, lines, line_height, _ = best_fit
     if not lines:
         lines, line_height = build_lines(font_size)
 
@@ -16822,7 +16885,7 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
             else:
                 ribbon_top = y
                 ribbon_bottom = y + line_height
-            pad_y = max(1, min(4, int(round(font_size * 0.12))))
+            pad_y = max(1, min(8, int(round(font_size * 0.15))))
             ribbon_left = box[0]
             ribbon_right = min(box[2], box[0] + line_width)
             draw.rectangle(
