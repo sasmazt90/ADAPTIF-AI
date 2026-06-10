@@ -299,9 +299,14 @@ def build_low_artifact_background_canvas(clean_source: Image.Image, width: int, 
     left = max(0, (cover_w - width) // 2)
     top = max(0, (cover_h - height) // 2)
     texture = cover.crop((left, top, left + width, top + height)).filter(
-        ImageFilter.GaussianBlur(radius=max(14.0, min(width, height) * 0.070))
+        ImageFilter.GaussianBlur(radius=max(8.0, min(width, height) * 0.040))
     )
-    return Image.blend(texture, canvas.filter(ImageFilter.GaussianBlur(radius=0.8)), 0.015)
+    texture_arr = np.array(texture, dtype=np.float32)
+    gradient_arr = np.array(canvas.filter(ImageFilter.GaussianBlur(radius=0.8)), dtype=np.float32)
+    # Preserve the source's soft cream/degrade atmosphere without letting removed
+    # foreground remnants dominate the canvas.
+    mixed = np.clip((texture_arr * 0.34) + (gradient_arr * 0.66), 0, 255).astype(np.uint8)
+    return Image.fromarray(mixed, "RGB").filter(ImageFilter.GaussianBlur(radius=0.28))
 
 
 def _edge_median_rgb(image: Image.Image) -> np.ndarray:
@@ -1264,6 +1269,7 @@ def _paste_crop_fit(
     foreground_alpha: bool = False,
     artwork_alpha: bool = False,
     alpha_cut_source_boxes: list[tuple[int, int, int, int]] | None = None,
+    anchor_bottom_if_source_truncated: bool = False,
 ) -> dict[str, Any]:
     source_box = _clip_box(source_box, source.width, source.height)
     target_box = _clip_box(target_box, output.width, output.height)
@@ -1298,6 +1304,8 @@ def _paste_crop_fit(
     else:
         paste_left = target_box[0] + int(round((target_w - scaled_w) * anchor[0]))
         paste_top = target_box[1] + int(round((target_h - scaled_h) * anchor[1]))
+        if anchor_bottom_if_source_truncated and source_box[3] >= source.height - max(2, int(source.height * 0.012)):
+            paste_top = output.height - scaled_h
         patch = resized
         paste_box = [paste_left, paste_top, paste_left + scaled_w, paste_top + scaled_h]
     if feather > 0:
@@ -2428,6 +2436,57 @@ def _draw_display_cta_button(
     }
 
 
+def _resolve_display_cta_zone(
+    zone: tuple[int, int, int, int],
+    *,
+    drawn_text_boxes: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+    margin_x: int,
+    margin_y: int,
+) -> tuple[int, int, int, int] | None:
+    zone = _clip_box(zone, width, height)
+    zone_w = max(1, zone[2] - zone[0])
+    zone_h = max(1, zone[3] - zone[1])
+    if not drawn_text_boxes:
+        return zone
+    blocking_boxes = [
+        _clip_box(box, width, height)
+        for box in drawn_text_boxes
+        if box[2] > box[0] and box[3] > box[1]
+    ]
+    if not blocking_boxes:
+        return zone
+    safe_gap = max(6, int(round(height * 0.035)))
+
+    def has_collision(candidate: tuple[int, int, int, int]) -> bool:
+        expanded = (candidate[0], candidate[1] - safe_gap, candidate[2], candidate[3] + safe_gap)
+        return any(_box_overlap(expanded, box) > 0 for box in blocking_boxes)
+
+    if not has_collision(zone):
+        return zone
+
+    max_text_bottom = max(box[3] for box in blocking_boxes)
+    below_top = max(zone[1], max_text_bottom + safe_gap)
+    below = _clip_box((zone[0], below_top, zone[2], below_top + zone_h), width, height)
+    if below[3] <= height - margin_y and not has_collision(below):
+        return below
+
+    min_text_top = min(box[1] for box in blocking_boxes)
+    above_bottom = min(zone[3], min_text_top - safe_gap)
+    above = _clip_box((zone[0], above_bottom - zone_h, zone[2], above_bottom), width, height)
+    if above[1] >= margin_y and not has_collision(above):
+        return above
+
+    fallback_left = margin_x
+    fallback_right = min(width - margin_x, fallback_left + zone_w)
+    fallback_top = max_text_bottom + safe_gap
+    fallback = _clip_box((fallback_left, fallback_top, fallback_right, fallback_top + zone_h), width, height)
+    if fallback[3] <= height - margin_y and not has_collision(fallback):
+        return fallback
+    return None
+
+
 def _localized_display_cta_label(analysis: VisualAnalysis) -> str:
     text = " ".join(str(getattr(layer, "original_text", "") or "") for layer in analysis.marketing_text_layers)
     upper = text.upper()
@@ -2905,6 +2964,7 @@ def _paste_crop_contain_limited(
     anchor: tuple[float, float] = (0.5, 0.5),
     foreground_alpha: bool = False,
     artwork_alpha: bool = False,
+    anchor_bottom_if_source_truncated: bool = False,
 ) -> dict[str, Any]:
     source_box = _clip_box(source_box, source.width, source.height)
     target_box = _clip_box(target_box, output.width, output.height)
@@ -2932,6 +2992,8 @@ def _paste_crop_contain_limited(
     free_h = max(0, target_box[3] - target_box[1] - paste_h)
     paste_x = target_box[0] + int(round(free_w * anchor[0]))
     paste_y = target_box[1] + int(round(free_h * anchor[1]))
+    if anchor_bottom_if_source_truncated and source_box[3] >= source.height - max(2, int(source.height * 0.012)):
+        paste_y = output.height - paste_h
     paste_box = (paste_x, paste_y, paste_x + paste_w, paste_y + paste_h)
     if crop is not None:
         patch = crop.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
@@ -2955,6 +3017,7 @@ def _paste_crop_contain_limited(
         role=role,
         mode="contain",
         feather=feather,
+        anchor_bottom_if_source_truncated=anchor_bottom_if_source_truncated,
     )
 
 
@@ -3649,6 +3712,7 @@ def composite_wide_creative_director_relayout(
                 mode="contain",
                 foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
+                anchor_bottom_if_source_truncated=True,
             )
         )
         composited.append(
@@ -3662,6 +3726,7 @@ def composite_wide_creative_director_relayout(
                 mode="contain",
                 foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
+                anchor_bottom_if_source_truncated=True,
             )
         )
     elif visual_already_protected:
@@ -3676,6 +3741,7 @@ def composite_wide_creative_director_relayout(
                 mode="contain",
                 foreground_alpha=True,
                 alpha_cut_source_boxes=visual_label_cut_boxes,
+                anchor_bottom_if_source_truncated=True,
             )
         )
         composited.append(
@@ -3696,6 +3762,7 @@ def composite_wide_creative_director_relayout(
             if paste_visual is _paste_crop_contain_limited
             else {"alpha_cut_source_boxes": visual_label_cut_boxes}
         )
+        visual_kwargs["anchor_bottom_if_source_truncated"] = True
         visual_anchor = (1.0, 1.16) if is_social_square else (0.5, 0.52 if target_area_smaller else (0.68 if visual_edge_sides else 0.74))
         composited.append(
             paste_visual(
@@ -3732,9 +3799,11 @@ def composite_wide_creative_director_relayout(
                     feather=max(6, min(width, height) // 85),
                     foreground_alpha=True,
                     alpha_cut_source_boxes=visual_label_cut_boxes,
+                    anchor_bottom_if_source_truncated=True,
                 )
             )
 
+    drawn_redraw_zone_boxes: list[tuple[int, int, int, int]] = []
     if redraw_blocks and draw_text:
         if target_ratio < 0.78 or target_area_smaller or not display_placement:
             secondary_source_union = secondary_effective_union if "secondary_effective_union" in locals() else _union_boxes(parts["secondary"])
@@ -3755,6 +3824,14 @@ def composite_wide_creative_director_relayout(
         else:
             redraw_blocks = _merge_redraw_blocks_by_inline_rows(redraw_blocks, width)
             blocks_to_draw = redraw_blocks
+        drawn_redraw_zone_boxes = [
+            tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))
+            for block in blocks_to_draw
+            if tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[2]
+            > tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[0]
+            and tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[3]
+            > tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[1]
+        ]
         output = draw_text(output.convert("RGB"), blocks_to_draw).convert("RGBA")
         composited.append(
             {
@@ -3786,7 +3863,19 @@ def composite_wide_creative_director_relayout(
             if guide:
                 composited.append(guide)
 
-    display_cta_layer = _draw_display_cta_button(output, cta_bounds, label=_localized_display_cta_label(analysis)) if preserve_brand_layers else None
+    safe_cta_bounds = (
+        _resolve_display_cta_zone(
+            cta_bounds,
+            drawn_text_boxes=drawn_redraw_zone_boxes,
+            width=width,
+            height=height,
+            margin_x=margin_x,
+            margin_y=margin_y,
+        )
+        if preserve_brand_layers
+        else None
+    )
+    display_cta_layer = _draw_display_cta_button(output, safe_cta_bounds, label=_localized_display_cta_label(analysis)) if safe_cta_bounds else None
     if display_cta_layer:
         composited.append(display_cta_layer)
 
