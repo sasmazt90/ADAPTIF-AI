@@ -13715,6 +13715,24 @@ def render_smart_reframe_image(source: Image.Image, width: int, height: int, pla
             outpaint_renderer=render_clean_base_outpaint_for_compositor,
             fallback_renderer=render_nonblur_contain_placeholder,
         )
+    if not env_flag("ADAPTIFAI_ALLOW_LEGACY_FULL_IMAGE_RESIZE_OUTPAINT", "0"):
+        text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
+        rendered, meta = render_deterministic_compositor(
+            source,
+            width,
+            height,
+            plan,
+            analysis,
+            text_blocks=text_blocks,
+            draw_text=draw_fitted_localize_v2_text,
+            outpaint_renderer=render_clean_base_outpaint_for_compositor,
+            fallback_renderer=render_nonblur_contain_placeholder,
+        )
+        return rendered, {
+            **meta,
+            "legacyFullImageOutpaintBlocked": True,
+            "legacyFullImageOutpaintReason": "resize must not let image models redraw typography or brand marks",
+        }
     if plan.logic_bucket == LogicBucket.NARROW_BANNER:
         return render_hybrid_banner_relayout(source, width, height, analysis), {"provider": "local", "strategy": "hybrid_relayout"}
     openai_outpaint_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_OUTPAINT", "0").strip().lower() in {"1", "true", "yes", "on"}

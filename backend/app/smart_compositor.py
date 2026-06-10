@@ -25,6 +25,11 @@ def _placement_preserves_creative_brand_layers(placement_id: str | None) -> bool
     return pid.startswith("gdn-") or pid.startswith("google-responsive") or pid == "custom-display"
 
 
+def _resize_provider_must_not_see_brand_layers(placement_id: str | None) -> bool:
+    """AI background/outpaint providers should never rasterize brand marks for social placements."""
+    return not _placement_preserves_creative_brand_layers(placement_id)
+
+
 def _clip_box(box: tuple[int, int, int, int], width: int, height: int) -> tuple[int, int, int, int]:
     left, top, right, bottom = box
     left = max(0, min(width - 1, int(left)))
@@ -176,6 +181,43 @@ def clean_compositor_background_source(source: Image.Image, analysis: VisualAnal
             "backgroundCleanup": "failed_passthrough",
             "backgroundCleanupError": str(exc),
         }
+
+
+def build_resize_provider_safe_seed(
+    source: Image.Image,
+    analysis: VisualAnalysis,
+    *,
+    placement_id: str | None,
+    remove_products: bool = False,
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Return an image seed that is safe for generative background completion.
+
+    Resize output must never ask an image model to draw typography or brand marks.
+    The provider can complete scene/background pixels, while product, brand and
+    marketing layers are composited deterministically afterwards.
+    """
+    visual_box, _visual_meta = _detect_role_aware_visual_box(source, analysis)
+    parts = _partition_resize_layers(source, analysis, visual_box)
+    removal_boxes: list[tuple[int, int, int, int]] = [
+        *parts["primary"],
+        *parts["secondary"],
+    ]
+    if _resize_provider_must_not_see_brand_layers(placement_id):
+        removal_boxes.extend(parts["brand"])
+    if remove_products:
+        removal_boxes.extend(_collect_visual_element_boxes(source, analysis, visual_box))
+    if not removal_boxes:
+        return source.convert("RGB"), {
+            "resizeProviderSeed": "source_no_raster_text_or_brand_removal_needed",
+            "resizeProviderSeedRemovedLayerCount": 0,
+        }
+    seed = _inpaint_rectangular_overlays(source, removal_boxes)
+    return seed.convert("RGB"), {
+        "resizeProviderSeed": "text_and_social_brand_removed_before_ai_background",
+        "resizeProviderSeedRemovedLayerCount": len(removal_boxes),
+        "resizeProviderSeedRemovedBrandLayers": 0 if not _resize_provider_must_not_see_brand_layers(placement_id) else len(parts["brand"]),
+        "resizeProviderSeedRemovedMarketingLayers": len(parts["primary"]) + len(parts["secondary"]),
+    }
 
 
 def render_background(
@@ -1968,8 +2010,8 @@ def _role_aware_layout_zones(
             }
         return {
             "brand": (margin_x, margin_y, width - margin_x, int(height * 0.145)),
-            "copy": (margin_x, int(height * 0.15), width - margin_x, int(height * 0.38)),
-            "visual": (int(width * 0.08), int(height * 0.39), width - int(width * 0.08), int(height * 0.965)),
+            "copy": (margin_x, int(height * 0.10), width - margin_x, int(height * 0.30)),
+            "visual": (int(width * 0.035), int(height * 0.32), width - int(width * 0.035), int(height * 0.975)),
             "secondary": (margin_x, int(height * 0.70), width - margin_x, int(height * 0.92)),
         }
     if target_smaller and source_ratio > 1.25 and target_ratio >= 0.86:
@@ -2085,7 +2127,7 @@ def composite_priority_layer_resize(
             )
 
     redraw_blocks: list[Any] = []
-    use_redraw_for_small_text = False
+    use_redraw_for_small_text = target_smaller and (target_ratio < 0.45 or width <= 200)
     if target_smaller and not use_redraw_for_small_text:
         text_artwork_source = _remove_foreground_visuals_for_background(source, meaningful_visuals)
         primary_union = _union_boxes(parts["primary"])
@@ -2947,7 +2989,7 @@ def composite_wide_creative_director_relayout(
     elif len(meaningful_visuals) == 1:
         paste_visual = _paste_crop_contain_limited if target_ratio < 0.78 and visual_edge_sides else _paste_crop_fit
         visual_kwargs: dict[str, Any] = (
-            {"max_scale": 2.42}
+            {"max_scale": 3.65}
             if paste_visual is _paste_crop_contain_limited
             else {}
         )
@@ -3496,24 +3538,35 @@ def render_deterministic_compositor(
     outpaint_renderer: ImageRenderer | None,
     fallback_renderer: FallbackRenderer,
 ) -> tuple[Image.Image, dict[str, Any]]:
-    preserve_brand_layers = _placement_preserves_creative_brand_layers(getattr(plan, "placement_id", None))
+    placement_id = getattr(plan, "placement_id", None)
+    preserve_brand_layers = _placement_preserves_creative_brand_layers(placement_id)
     foreground_source, _foreground_text_mask, foreground_meta = clean_overlay_text_only(source, analysis)
     clean_source, text_mask, cleanup_meta = clean_compositor_background_source(source, analysis)
+    provider_safe_seed, provider_safe_seed_meta = build_resize_provider_safe_seed(
+        source,
+        analysis,
+        placement_id=placement_id,
+        remove_products=False,
+    )
     landscape_anchor = should_use_landscape_width_anchor(source, width, height)
     role_aware_candidate = should_use_role_aware_relayout(source, width, height, analysis)
     preserve_complex_visual = should_preserve_full_creative_for_complex_visuals(source, width, height, analysis)
     should_seed_outpaint_with_foreground = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
-    background_seed = foreground_source if should_seed_outpaint_with_foreground else clean_source
+    background_seed = provider_safe_seed if should_seed_outpaint_with_foreground else clean_source
     role_aware_seed_meta: dict[str, Any] = {}
     if role_aware_candidate and should_seed_outpaint_with_foreground:
         visual_box, visual_meta = _detect_role_aware_visual_box(source, analysis)
         parts = _partition_resize_layers(source, analysis, visual_box)
-        # Provider outpaint must see protected product/package labels but not floating marketing copy.
-        # Otherwise it hallucinates brand text or pseudo-labels in the generated area.
-        background_seed = _inpaint_rectangular_overlays(source, [*parts["brand"], *parts["primary"], *parts["secondary"]])
+        # Provider outpaint must never see floating marketing copy or social brand marks.
+        # Otherwise it hallucinates corrupted typography in the generated area.
+        role_removal_boxes = [*parts["primary"], *parts["secondary"]]
+        if _resize_provider_must_not_see_brand_layers(placement_id):
+            role_removal_boxes.extend(parts["brand"])
+        background_seed = _inpaint_rectangular_overlays(source, role_removal_boxes)
         role_aware_seed_meta = {
-            "roleAwareOutpaintSeed": "product_label_preserving_marketing_text_removed",
-            "roleAwareOutpaintSeedRemovedLayerCount": len(parts["brand"]) + len(parts["primary"]) + len(parts["secondary"]),
+            "roleAwareOutpaintSeed": "product_label_preserving_text_and_social_brand_removed",
+            "roleAwareOutpaintSeedRemovedLayerCount": len(role_removal_boxes),
+            "roleAwareOutpaintSeedRemovedBrandLayers": 0 if not _resize_provider_must_not_see_brand_layers(placement_id) else len(parts["brand"]),
             **{f"seed_{key}": value for key, value in visual_meta.items()},
         }
     if preserve_complex_visual:
@@ -3631,6 +3684,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **provider_background_meta,
             **fit_meta,
             "provider": provider_background_meta.get("provider", "local"),
@@ -3746,6 +3800,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **background_meta,
             **relayout_meta,
             "provider": background_meta.get("provider", "local"),
@@ -3768,6 +3823,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **background_meta,
             **landscape_meta,
             "provider": background_meta.get("provider", "local"),
@@ -3782,6 +3838,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **background_meta,
             **fit_meta,
             "provider": background_meta.get("provider", "local"),
@@ -3796,6 +3853,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **background_meta,
             **relayout_meta,
             "provider": background_meta.get("provider", "local"),
@@ -3810,6 +3868,7 @@ def render_deterministic_compositor(
             "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
             **cleanup_meta,
             **foreground_meta,
+            **provider_safe_seed_meta,
             **background_meta,
             **relayout_meta,
             "provider": background_meta.get("provider", "local"),
@@ -3824,6 +3883,7 @@ def render_deterministic_compositor(
         "textMaskNonZero": int(np.count_nonzero(np.array(text_mask, dtype=np.uint8))),
         **cleanup_meta,
         **foreground_meta,
+        **provider_safe_seed_meta,
         **background_meta,
         **relayout_meta,
         "provider": background_meta.get("provider", "local"),
