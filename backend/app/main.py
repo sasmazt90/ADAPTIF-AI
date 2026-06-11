@@ -231,6 +231,7 @@ class TextBlock(BaseModel):
     resize_target_fill: float = 0.72
     resize_min_font_size: int = 8
     resize_max_font_size: int = 42
+    resize_preferred_line_count: int = 0
     resize_stack_role: str = "primary"
     cleanup_confidence: float = 1.0
     cleanup_strategy: str = "clean_replace"
@@ -16850,8 +16851,42 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
     max_candidate = max(8, min(72, int(getattr(block, "resize_max_font_size", 42) or 42)))
     min_candidate = max(6, int(getattr(block, "resize_min_font_size", 8) or 8))
     target_fill = float(getattr(block, "resize_target_fill", 0.72) or 0.72)
+    preferred_line_count = max(
+        1,
+        int(getattr(block, "resize_preferred_line_count", 0) or 0),
+        len([line for line in (block.line_texts or []) if str(line).strip()]),
+    )
     best_fit: tuple[int, list[list[dict[str, Any]]], int, float] | None = None
+
+    # First priority: preserve the original line rhythm when the result remains readable.
     for candidate in range(max_candidate, min_candidate - 1, -1):
+        candidate_lines, candidate_line_height = build_lines(candidate)
+        if (
+            candidate_lines
+            and len(candidate_lines) == preferred_line_count
+            and len(candidate_lines) * candidate_line_height <= max_height
+        ):
+            widest = max((line_width(line) for line in candidate_lines), default=0.0)
+            best_fit = (candidate, candidate_lines, candidate_line_height, widest / max(1, max_width))
+            break
+
+    # Second priority: avoid adding extra line breaks if exact preservation is impossible.
+    if best_fit is None:
+        for candidate in range(max_candidate, min_candidate - 1, -1):
+            candidate_lines, candidate_line_height = build_lines(candidate)
+            if (
+                candidate_lines
+                and len(candidate_lines) <= preferred_line_count
+                and len(candidate_lines) * candidate_line_height <= max_height
+            ):
+                widest = max((line_width(line) for line in candidate_lines), default=0.0)
+                best_fit = (candidate, candidate_lines, candidate_line_height, widest / max(1, max_width))
+                break
+
+    # Final fallback: if preserving line count makes the copy unreadable, allow more lines.
+    for candidate in range(max_candidate, min_candidate - 1, -1):
+        if best_fit is not None:
+            break
         candidate_lines, candidate_line_height = build_lines(candidate)
         if candidate_lines and len(candidate_lines) * candidate_line_height <= max_height:
             widest = max((line_width(line) for line in candidate_lines), default=0.0)

@@ -309,6 +309,30 @@ def build_low_artifact_background_canvas(clean_source: Image.Image, width: int, 
     return Image.fromarray(mixed, "RGB").filter(ImageFilter.GaussianBlur(radius=0.28))
 
 
+def build_edge_gradient_background_canvas(clean_source: Image.Image, width: int, height: int) -> Image.Image:
+    """Low-risk extension canvas that never carries blurred product/text remnants."""
+    source = clean_source.convert("RGB")
+    arr = np.array(source, dtype=np.uint8)
+    top_strip = arr[: max(1, source.height // 10), :, :].reshape(-1, 3)
+    bottom_strip = arr[-max(1, source.height // 10) :, :, :].reshape(-1, 3)
+    side_samples = np.concatenate(
+        [
+            arr[:, : max(1, source.width // 12), :].reshape(-1, 3),
+            arr[:, -max(1, source.width // 12) :, :].reshape(-1, 3),
+        ],
+        axis=0,
+    )
+    neutral = np.median(side_samples, axis=0)
+    top_color = np.percentile(top_strip, 72, axis=0) * 0.70 + neutral * 0.30
+    bottom_color = np.percentile(bottom_strip, 72, axis=0) * 0.70 + neutral * 0.30
+    gradient = np.zeros((height, width, 3), dtype=np.uint8)
+    for y in range(height):
+        t = y / max(1, height - 1)
+        color = top_color * (1 - t) + bottom_color * t
+        gradient[y, :, :] = np.clip(color, 0, 255)
+    return Image.fromarray(gradient, "RGB").filter(ImageFilter.GaussianBlur(radius=0.35))
+
+
 def _edge_median_rgb(image: Image.Image) -> np.ndarray:
     source = image.convert("RGB")
     arr = np.array(source, dtype=np.uint8)
@@ -617,15 +641,20 @@ def _visual_focus_from_product_label_union(
     if _box_area(label_union) < max(16, source.width * source.height * 0.002):
         return None
 
-    pad_x_ratio = 0.28 if compact_target else 0.42
-    pad_x = max(int(round(label_w * pad_x_ratio)), source.width // (44 if compact_target else 32), 8)
-    pad_y = max(int(round(label_h * 0.55)), source.height // 18, 8)
+    pad_x_ratio = 0.34 if compact_target else 0.42
+    pad_x = max(int(round(label_w * pad_x_ratio)), source.width // (38 if compact_target else 32), 8)
+    if compact_target:
+        pad_top = max(int(round(label_h * 1.35)), int(round(source.height * 0.46)), 8)
+        pad_bottom = max(int(round(label_h * 1.10)), int(round(source.height * 0.34)), 8)
+    else:
+        pad_top = max(int(round(label_h * 0.85)), source.height // 15, 8)
+        pad_bottom = max(int(round(label_h * 0.75)), source.height // 16, 8)
     candidate = _clip_box(
         (
             label_union[0] - pad_x,
-            label_union[1] - pad_y,
+            label_union[1] - pad_top,
             label_union[2] + pad_x,
-            label_union[3] + pad_y,
+            label_union[3] + pad_bottom,
         ),
         source.width,
         source.height,
@@ -1814,6 +1843,7 @@ def _build_display_copy_stack_blocks(
     base.resize_target_fill = 0.62 if is_secondary else 0.74
     base.resize_min_font_size = readable_floor if is_secondary else max(8, int(min(copy_w, copy_h) * 0.034))
     base.resize_max_font_size = max_font_cap
+    base.resize_preferred_line_count = preferred_line_count
     base.resize_stack_role = stack_role
     base.source_word_styles = source_word_styles
     base.translated_style_spans = spans
@@ -2175,15 +2205,9 @@ def composite_landscape_width_anchor(
         resized = resized.crop((0, crop_top, paste_w, crop_top + height))
         paste_h = height
     elif paste_h < height:
-        seam = max(10, min(36, height // 24, paste_h // 5))
-        alpha = Image.new("L", resized.size, 255)
-        alpha_px = alpha.load()
-        for y in range(max(0, paste_h - seam), paste_h):
-            t = (y - (paste_h - seam)) / max(1, seam - 1)
-            value = int(round(255 * (1.0 - t)))
-            for x in range(paste_w):
-                alpha_px[x, y] = value
-        resized.putalpha(alpha)
+        # Keep the preserved creative opaque. Fading its bottom edge can leak
+        # cleaned underlay artifacts through ribbons or text near the seam.
+        resized.putalpha(Image.new("L", resized.size, 255))
     suppression_meta: dict[str, Any] = {}
     if preserve_canvas_fill and paste_h < height:
         output, suppression_meta = suppress_generated_foreground_below_anchor(output, source, paste_h, width, height)
@@ -3408,7 +3432,7 @@ def composite_wide_creative_director_relayout(
             copy_bounds = (left_safe[0], int(height * 0.18), left_safe[2], int(height * 0.57))
             secondary_bounds = (left_safe[0], int(height * 0.61), left_safe[2], int(height * 0.93))
             cta_bounds = (left_safe[0], int(height * 0.76), left_safe[2], int(height * 0.94))
-            visual_bounds = (right_safe[0], int(height * 0.08), right_safe[2], int(height * 0.94))
+            visual_bounds = (right_safe[0], int(height * 0.08), right_safe[2], height)
         else:
             brand_bounds = (margin_x, margin_y, int(width * 0.44), int(height * 0.18))
             copy_bounds = (margin_x, int(height * 0.22), int(width * 0.46), int(height * 0.58))
@@ -3428,6 +3452,10 @@ def composite_wide_creative_director_relayout(
         else:
             copy_bounds = (margin_x, int(height * 0.22), int(width * 0.46), int(height * 0.57))
             secondary_bounds = (margin_x, int(height * 0.62), int(width * 0.48), int(height * 0.92))
+            if is_social_square:
+                split_x = width // 2
+                right_safe = (split_x + max(12, int(width * 0.045)), margin_y, width - max(12, int(width * 0.045)), height)
+                visual_bounds = (right_safe[0], int(height * 0.08), right_safe[2], height)
     else:
         brand_bounds = (margin_x, margin_y, width - margin_x, int(height * 0.17))
         copy_bounds = (margin_x, int(height * 0.16), int(width * 0.52), int(height * 0.82))
@@ -4481,6 +4509,7 @@ def render_deterministic_compositor(
     role_aware_candidate = should_use_role_aware_relayout(source, width, height, analysis)
     preserve_complex_visual = should_preserve_full_creative_for_complex_visuals(source, width, height, analysis)
     should_seed_outpaint_with_foreground = plan.expansion.strategy == ExpansionStrategy.OPENAI_OUTPAINT or plan.expansion.requires_ai
+    provider_ready = False
     background_seed = provider_safe_seed if should_seed_outpaint_with_foreground else clean_source
     role_aware_seed_meta: dict[str, Any] = {}
     if role_aware_candidate and should_seed_outpaint_with_foreground:
@@ -4645,11 +4674,11 @@ def render_deterministic_compositor(
             ),
         }
     if landscape_anchor:
-        background = build_deterministic_background_canvas(foreground_source, width, height)
+        background = build_edge_gradient_background_canvas(clean_source, width, height)
         background_meta = {
             "provider": "local",
             "strategy": "deterministic_landscape_background_continuation",
-            "backgroundSource": "text_clean_source_background_continuation",
+            "backgroundSource": "clean_source_background_continuation",
             "productionReady": True,
         }
     elif role_aware_candidate:
@@ -4723,7 +4752,7 @@ def render_deterministic_compositor(
             )
             strategy = "deterministic_compositor_creative_director_relayout"
             pipeline = "resize-deterministic-compositor-v3-creative-director-relayout"
-            production_ready = True
+            production_ready = bool(background_meta.get("productionReady", not should_seed_outpaint_with_foreground))
         else:
             rendered, relayout_meta = composite_role_aware_relayout(
                 background,
@@ -4775,6 +4804,7 @@ def render_deterministic_compositor(
             **landscape_meta,
             "provider": background_meta.get("provider", "local"),
             "strategy": "deterministic_compositor_landscape_width_anchor",
+            "productionReady": False,
         }
     if should_use_source_fit(source, width, height, analysis):
         rendered, fit_meta = composite_source_fit(background, source, width, height)
