@@ -3575,6 +3575,7 @@ def _request_ai_creative_director_plan(
     parts: dict[str, list[tuple[int, int, int, int]]],
     visual_box: tuple[int, int, int, int],
     target_area_smaller: bool,
+    correction_feedback: str | None = None,
 ) -> dict[str, Any] | None:
     if os.getenv("ADAPTIFAI_RESIZE_AI_LAYOUT_PLANNER", "1").strip().lower() not in {"1", "true", "yes", "on"}:
         return None
@@ -3602,6 +3603,7 @@ def _request_ai_creative_director_plan(
                 "Display placements must include logo and localized CTA zones.",
                 "Copy, RTB, product/visual, badge and CTA zones must not collide.",
                 "If portrait/story, product label readability is more important than copying source coordinates.",
+                "If this is a correction attempt, fix only the reported validation errors and keep all boxes normalized JSON.",
             ],
         }
         client_kwargs: dict[str, Any] = {
@@ -3641,7 +3643,8 @@ def _request_ai_creative_director_plan(
                     "content": (
                         "Plan a collision-free responsive ad layout for this resize job.\n"
                         f"{summary}\n"
-                        "JSON schema: {\"pattern\":\"...\", \"boxes\":{\"copy\":[...],\"visual\":[...],"
+                        + (f"VALIDATION ERROR FROM PREVIOUS JSON: {correction_feedback}\n" if correction_feedback else "")
+                        + "JSON schema: {\"pattern\":\"...\", \"boxes\":{\"copy\":[...],\"visual\":[...],"
                         "\"rtb\":[...],\"badge\":[...],\"brand\":[...],\"cta\":[...]}, "
                         "\"visualFitMode\":\"contain|cover\", \"visualAnchor\":[0.0,1.0], "
                         "\"allowLogo\":bool, \"allowCta\":bool, \"allowGuides\":bool}"
@@ -3673,6 +3676,52 @@ def _request_ai_creative_director_plan(
         return {"source": "ai-creative-director-failed", "error": str(exc)[:240]}
 
 
+def _validate_creative_director_plan(
+    plan: dict[str, Any] | None,
+    fallback: dict[str, Any],
+    *,
+    width: int,
+    height: int,
+    display_placement: bool,
+) -> tuple[dict[str, Any], list[str]]:
+    if not plan or not all(key in plan for key in ("copy", "visual", "rtb", "badge", "brand", "cta")):
+        missing = [
+            key
+            for key in ("copy", "visual", "rtb", "badge", "brand", "cta")
+            if not isinstance(plan, dict) or key not in plan
+        ]
+        return dict(fallback), [f"missing_required_zones:{','.join(missing)}"]
+
+    validated = dict(plan)
+    validation_notes: list[str] = []
+    margin = max(6, int(round(min(width, height) * (0.035 if display_placement else 0.045))))
+    required = ("copy", "visual", "rtb")
+    for key in required:
+        try:
+            validated[key] = _clip_box(tuple(int(value) for value in validated[key]), width, height)
+        except Exception:
+            validation_notes.append(f"{key}_invalid")
+            validated[key] = fallback[key]
+    for key in ("brand", "badge", "cta"):
+        if key in validated:
+            try:
+                validated[key] = _clip_box(tuple(int(value) for value in validated[key]), width, height)
+            except Exception:
+                validation_notes.append(f"{key}_invalid")
+                validated[key] = fallback[key]
+
+    collision_pairs = [("copy", "visual"), ("rtb", "visual"), ("copy", "rtb")]
+    if display_placement:
+        collision_pairs.extend([("cta", "copy"), ("cta", "rtb"), ("cta", "visual")])
+    for left_key, right_key in collision_pairs:
+        if _resize_layout_intersects(validated[left_key], validated[right_key], gap=margin):
+            validation_notes.append(
+                f"collision_{left_key}_{right_key}:"
+                f"{left_key}={validated[left_key]} {right_key}={validated[right_key]} margin={margin}"
+            )
+    return validated, validation_notes
+
+
 def build_creative_director_resize_plan(
     *,
     source: Image.Image,
@@ -3693,30 +3742,42 @@ def build_creative_director_resize_plan(
         visual_box=visual_box,
         target_area_smaller=target_area_smaller,
     )
-    plan = ai_plan if ai_plan and all(key in ai_plan for key in ("copy", "visual", "rtb", "badge", "brand", "cta")) else fallback
-    validation_notes: list[str] = []
-    margin = max(6, int(round(min(width, height) * (0.035 if display_placement else 0.045))))
-    required = ("copy", "visual", "rtb")
-    for key in required:
-        try:
-            plan[key] = _clip_box(tuple(int(value) for value in plan[key]), width, height)
-        except Exception:
-            validation_notes.append(f"{key}_invalid")
-            plan[key] = fallback[key]
-    for key in ("brand", "badge", "cta"):
-        if key in plan:
-            try:
-                plan[key] = _clip_box(tuple(int(value) for value in plan[key]), width, height)
-            except Exception:
-                plan[key] = fallback[key]
+    plan, validation_notes = _validate_creative_director_plan(
+        ai_plan,
+        fallback,
+        width=width,
+        height=height,
+        display_placement=display_placement,
+    )
+    if validation_notes and isinstance(ai_plan, dict) and str(ai_plan.get("source", "")).startswith("ai-creative-director"):
+        retry_feedback = "; ".join(validation_notes[:8])
+        retry_plan = _request_ai_creative_director_plan(
+            width=width,
+            height=height,
+            source_size=source.size,
+            display_placement=display_placement,
+            parts=parts,
+            visual_box=visual_box,
+            target_area_smaller=target_area_smaller,
+            correction_feedback=retry_feedback,
+        )
+        retry_validated, retry_notes = _validate_creative_director_plan(
+            retry_plan,
+            fallback,
+            width=width,
+            height=height,
+            display_placement=display_placement,
+        )
+        if not retry_notes:
+            plan = retry_validated
+            validation_notes = [f"self_correction_retry_used:{retry_feedback}"]
+        else:
+            plan = retry_validated
+            validation_notes = [
+                *validation_notes,
+                f"self_correction_retry_failed:{'; '.join(retry_notes[:8])}",
+            ]
 
-    # Absolute safety gate: if AI zones collide, fallback to the deterministic zone plan.
-    collision_pairs = [("copy", "visual"), ("rtb", "visual"), ("copy", "rtb")]
-    if display_placement:
-        collision_pairs.extend([("cta", "copy"), ("cta", "rtb"), ("cta", "visual")])
-    for left_key, right_key in collision_pairs:
-        if _resize_layout_intersects(plan[left_key], plan[right_key], gap=margin):
-            validation_notes.append(f"collision_{left_key}_{right_key}")
     if validation_notes and str(plan.get("source", "")).startswith("ai-creative-director"):
         plan = fallback
         validation_notes.append("fallback_zone_plan_used")

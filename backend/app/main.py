@@ -12359,33 +12359,52 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
     if provider in {"heuristic", "local", "off", "disabled"}:
         return None
 
-    try:
-        _probe, encoded = _prepare_smart_reframe_probe(source)
-        client = OpenAI(timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")))
-        response = client.chat.completions.create(
-            model=os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL", os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o")),
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": _smart_reframe_analysis_prompt(target_language),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
-                    ],
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-        payload = json.loads(response.choices[0].message.content or "{}")
-        analysis = parse_visual_analysis_payload(payload)
-        return _finalize_smart_reframe_analysis(analysis, source, "openai")
-    except Exception as exc:
-        print(f"[smart_reframe_analysis] openai analysis failed: {exc}", flush=True)
-        return None
+    last_error = ""
+    for attempt in range(2):
+        try:
+            _probe, encoded = _prepare_smart_reframe_probe(source)
+            client = OpenAI(timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")))
+            feedback = (
+                "\nPREVIOUS JSON FAILED BACKEND VALIDATION. Fix exactly this issue before returning JSON: "
+                f"{last_error}\n"
+            ) if attempt and last_error else ""
+            response = client.chat.completions.create(
+                model=os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL", os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o")),
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": _smart_reframe_analysis_prompt(target_language),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"Original source image size is {source.width}x{source.height}. "
+                                    "Analyze product/person/logo/text/background layers for resizing. "
+                                    "Return strict JSON only with complete, non-fragment visual subject boxes."
+                                    f"{feedback}"
+                                ),
+                            },
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                        ],
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            payload = json.loads(response.choices[0].message.content or "{}")
+            analysis = parse_visual_analysis_payload(payload)
+            return _finalize_smart_reframe_analysis(analysis, source, "openai")
+        except Exception as exc:
+            last_error = str(exc)[:320]
+            if attempt == 0:
+                print(f"[smart_reframe_analysis] openai validation failed, retrying once: {last_error}", flush=True)
+                continue
+            print(f"[smart_reframe_analysis] openai analysis failed after retry: {last_error}", flush=True)
+            return None
+    return None
 
 
 def build_openrouter_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
@@ -12397,49 +12416,68 @@ def build_openrouter_smart_reframe_analysis(source: Image.Image, target_language
     if provider in {"heuristic", "local", "off", "disabled", "openai", "gemini", "google"}:
         return None
 
-    try:
-        _probe, encoded = _prepare_smart_reframe_probe(source)
-        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
-        model = (
-            os.getenv("ADAPTIFAI_OPENROUTER_SMART_REFRAME_MODEL")
-            or os.getenv("ADAPTIFAI_OPENROUTER_MODEL")
-            or os.getenv("OPENROUTER_MODEL")
-            or "google/gemini-2.5-flash"
-        ).strip()
-        headers = {
-            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://adaptifai.sasmaz.digital"),
-            "X-Title": os.getenv("OPENROUTER_APP_TITLE", "AdaptifAI"),
-        }
-        client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
-            default_headers={key: value for key, value in headers.items() if value},
-        )
-        response = client.chat.completions.create(
-            model=model,
-            temperature=0,
-            messages=[
-                {
-                    "role": "system",
-                    "content": _smart_reframe_analysis_prompt(target_language),
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing. Return JSON only."},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
-                    ],
-                },
-            ],
-            response_format={"type": "json_object"},
-        )
-        payload = json.loads(response.choices[0].message.content or "{}")
-        analysis = parse_visual_analysis_payload(payload)
-        return _finalize_smart_reframe_analysis(analysis, source, "openrouter")
-    except Exception as exc:
-        print(f"[smart_reframe_analysis] openrouter analysis failed: {exc}", flush=True)
-        return None
+    last_error = ""
+    for attempt in range(2):
+        try:
+            _probe, encoded = _prepare_smart_reframe_probe(source)
+            base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+            model = (
+                os.getenv("ADAPTIFAI_OPENROUTER_SMART_REFRAME_MODEL")
+                or os.getenv("ADAPTIFAI_OPENROUTER_MODEL")
+                or os.getenv("OPENROUTER_MODEL")
+                or "google/gemini-2.5-flash"
+            ).strip()
+            headers = {
+                "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://adaptifai.sasmaz.digital"),
+                "X-Title": os.getenv("OPENROUTER_APP_TITLE", "AdaptifAI"),
+            }
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
+                default_headers={key: value for key, value in headers.items() if value},
+            )
+            feedback = (
+                "\nPREVIOUS JSON FAILED BACKEND VALIDATION. Fix exactly this issue before returning JSON: "
+                f"{last_error}\n"
+            ) if attempt and last_error else ""
+            response = client.chat.completions.create(
+                model=model,
+                temperature=0,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": _smart_reframe_analysis_prompt(target_language),
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    f"Original source image size is {source.width}x{source.height}. "
+                                    "Analyze product/person/logo/text/background layers for resizing. "
+                                    "Return strict JSON only with complete, non-fragment visual subject boxes."
+                                    f"{feedback}"
+                                ),
+                            },
+                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                        ],
+                    },
+                ],
+                response_format={"type": "json_object"},
+            )
+            payload = json.loads(response.choices[0].message.content or "{}")
+            analysis = parse_visual_analysis_payload(payload)
+            return _finalize_smart_reframe_analysis(analysis, source, "openrouter")
+        except Exception as exc:
+            last_error = str(exc)[:320]
+            if attempt == 0:
+                print(f"[smart_reframe_analysis] openrouter validation failed, retrying once: {last_error}", flush=True)
+                continue
+            print(f"[smart_reframe_analysis] openrouter analysis failed after retry: {last_error}", flush=True)
+            return None
+    return None
 
 
 def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
@@ -12451,39 +12489,50 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
     if provider in {"heuristic", "local", "off", "disabled", "openai"}:
         return None
 
-    try:
-        _probe, encoded = _prepare_smart_reframe_probe(source)
-        model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
-        prompt = _smart_reframe_analysis_prompt(target_language) + " Return JSON only."
-        response = requests.post(
-            f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-            params={"key": api_key},
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {"text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing.\n\n{prompt}"},
-                            {"inline_data": {"mime_type": "image/png", "data": encoded}},
-                        ],
-                    }
-                ],
-                "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
-            },
-            timeout=int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
-        )
-        response.raise_for_status()
-        payload = response.json()
-        candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
-        parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
-        content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
-        parsed = extract_json_object(content)
-        analysis = parse_visual_analysis_payload(parsed)
-        return _finalize_smart_reframe_analysis(analysis, source, "gemini")
-    except Exception as exc:
-        print(f"[smart_reframe_analysis] gemini analysis failed: {exc}", flush=True)
-        return None
+    last_error = ""
+    for attempt in range(2):
+        try:
+            _probe, encoded = _prepare_smart_reframe_probe(source)
+            model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
+            feedback = (
+                "\nPREVIOUS JSON FAILED BACKEND VALIDATION. Fix exactly this issue before returning JSON: "
+                f"{last_error}\n"
+            ) if attempt and last_error else ""
+            prompt = _smart_reframe_analysis_prompt(target_language) + " Return strict JSON only with complete, non-fragment visual subject boxes." + feedback
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                params={"key": api_key},
+                headers={"Content-Type": "application/json"},
+                json={
+                    "contents": [
+                        {
+                            "role": "user",
+                            "parts": [
+                                {"text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing.\n\n{prompt}"},
+                                {"inline_data": {"mime_type": "image/png", "data": encoded}},
+                            ],
+                        }
+                    ],
+                    "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
+                },
+                timeout=int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
+            )
+            response.raise_for_status()
+            payload = response.json()
+            candidates = payload.get("candidates", []) if isinstance(payload, dict) else []
+            parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+            content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
+            parsed = extract_json_object(content)
+            analysis = parse_visual_analysis_payload(parsed)
+            return _finalize_smart_reframe_analysis(analysis, source, "gemini")
+        except Exception as exc:
+            last_error = str(exc)[:320]
+            if attempt == 0:
+                print(f"[smart_reframe_analysis] gemini validation failed, retrying once: {last_error}", flush=True)
+                continue
+            print(f"[smart_reframe_analysis] gemini analysis failed after retry: {last_error}", flush=True)
+            return None
+    return None
 
 
 def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, fallback_reason: str = "") -> VisualAnalysis:
