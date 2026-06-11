@@ -18319,6 +18319,16 @@ def health() -> dict[str, str]:
         "inpainting_backend": os.getenv("ADAPTIFAI_INPAINT_BACKEND", "stable-diffusion"),
         "inpainting": os.getenv("ADAPTIFAI_INPAINT_MODEL", "runwayml/stable-diffusion-inpainting"),
         "resize_fit": os.getenv("ADAPTIFAI_RESIZE_FIT", "cover"),
+        "smart_reframe_analysis_provider": os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto"),
+        "openrouter_configured": "true" if bool(os.getenv("OPENROUTER_API_KEY", "").strip()) else "false",
+        "openrouter_smart_reframe_model": (
+            os.getenv("ADAPTIFAI_OPENROUTER_SMART_REFRAME_MODEL")
+            or os.getenv("ADAPTIFAI_OPENROUTER_MODEL")
+            or os.getenv("OPENROUTER_MODEL")
+            or ""
+        ),
+        "resize_ai_layout_provider": os.getenv("ADAPTIFAI_RESIZE_AI_LAYOUT_PROVIDER", "auto"),
+        "resize_ai_layout_planner": os.getenv("ADAPTIFAI_RESIZE_AI_LAYOUT_PLANNER", "1"),
         "replicate_lama_configured": "true" if bool(os.getenv("REPLICATE_API_TOKEN", "").strip()) else "false",
         "replicate_lama_model": resolved_replicate_lama_model(),
     }
