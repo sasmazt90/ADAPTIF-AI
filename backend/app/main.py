@@ -12622,6 +12622,12 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
 
 def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int, int, int] | None = None, target_language: str = "EN") -> VisualAnalysis:
     provider = os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto").strip().lower()
+    openrouter_configured = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    if provider == "auto" and openrouter_configured:
+        analysis = build_openrouter_smart_reframe_analysis(source, target_language)
+        if analysis is not None:
+            return analysis
+        return build_heuristic_smart_reframe_analysis(source, focus_bbox, "openrouter_auto_strict_analysis_failed_fallback")
     if provider in {"auto", "openai"}:
         analysis = build_openai_smart_reframe_analysis(source, target_language)
         if analysis is not None:
