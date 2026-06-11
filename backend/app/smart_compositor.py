@@ -1305,7 +1305,7 @@ def _paste_crop_fit(
         paste_left = target_box[0] + int(round((target_w - scaled_w) * anchor[0]))
         paste_top = target_box[1] + int(round((target_h - scaled_h) * anchor[1]))
         if anchor_bottom_if_source_truncated and source_box[3] >= source.height - max(2, int(source.height * 0.012)):
-            paste_top = output.height - scaled_h
+            paste_top = target_box[3] - scaled_h
         patch = resized
         paste_box = [paste_left, paste_top, paste_left + scaled_w, paste_top + scaled_h]
     if feather > 0:
@@ -1680,9 +1680,33 @@ def _build_display_copy_stack_blocks(
     width_factor = 0.22 if is_secondary else (0.30 if spacious_stack else 0.26)
     height_factor = 0.24 if is_secondary else (0.36 if spacious_stack else 0.46)
     max_font = max(8, min(max_font_cap, int(stack_h * height_factor), int(stack_w * width_factor)))
+    readable_floor = max(9, int(min(copy_w, copy_h) * (0.040 if is_secondary else 0.045)))
+
+    def source_line_count(block: Any) -> int:
+        line_texts = [str(line).strip() for line in (getattr(block, "line_texts", []) or []) if str(line).strip()]
+        if line_texts:
+            return len(line_texts)
+        raw = str(getattr(block, "text", "") or "")
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        return max(1, len(lines))
+
+    preferred_line_count = max(1, sum(source_line_count(block) for block in ordered))
     stack_font_size = 8
     best_fit: tuple[int, float] | None = None
+
+    # First pass: preserve the source line rhythm when it remains readable.
+    # A resize should not add extra line breaks just to make text larger.
+    for candidate_size in range(max_font, readable_floor - 1, -1):
+        font = _load_cta_font(candidate_size)
+        total_lines = sum(wrapped_line_count(text, font) for text in source_texts)
+        line_height = max(candidate_size + 2, int(round(candidate_size * 1.22)))
+        if total_lines <= preferred_line_count and total_lines * line_height <= stack_h:
+            best_fit = (candidate_size, 1.0)
+            break
+
     for candidate_size in range(max_font, 7, -1):
+        if best_fit is not None and best_fit[0] >= readable_floor:
+            break
         font = _load_cta_font(candidate_size)
         total_lines = sum(wrapped_line_count(text, font) for text in source_texts)
         line_height = max(candidate_size + 2, int(round(candidate_size * 1.22)))
@@ -1718,7 +1742,6 @@ def _build_display_copy_stack_blocks(
                 break
     if best_fit is not None:
         stack_font_size = best_fit[0]
-    readable_floor = max(9, int(min(copy_w, copy_h) * (0.040 if is_secondary else 0.045)))
     if is_secondary and stack_font_size < readable_floor:
         return []
     stack_line_height = max(stack_font_size + 2, int(round(stack_font_size * 1.22)))
@@ -2301,13 +2324,13 @@ def _role_aware_layout_zones(
             gap = max(8, int(height * 0.018))
             brand_bottom = usable_top + max(20, int(height * 0.08))
             copy_top = brand_bottom + gap
-            copy_bottom = copy_top + max(70, int(height * 0.22))
+            copy_bottom = copy_top + max(70, int(height * 0.20))
             visual_top = copy_bottom + gap
-            visual_bottom = visual_top + max(120, int(height * 0.29))
+            visual_bottom = visual_top + max(140, int(height * 0.36))
             secondary_top = visual_bottom + gap
-            secondary_bottom = secondary_top + max(64, int(height * 0.16))
+            secondary_bottom = secondary_top + max(54, int(height * 0.13))
             cta_top = secondary_bottom + gap
-            cta_bottom = cta_top + max(36, int(height * 0.09))
+            cta_bottom = cta_top + max(36, int(height * 0.08))
             return {
                 "brand": (margin_x, usable_top, width - margin_x, min(brand_bottom, usable_bottom)),
                 "badge": (margin_x, usable_top, width - margin_x, min(brand_bottom, usable_bottom)),
@@ -2329,10 +2352,10 @@ def _role_aware_layout_zones(
             return {
                 "brand": (margin_x, margin_y, int(width * 0.56), int(height * 0.22)),
                 "badge": (int(width * 0.66), margin_y, width - margin_x, int(height * 0.23)),
-                "copy": (margin_x, int(height * 0.24), int(width * 0.59), int(height * 0.68)),
-                "cta": (margin_x, int(height * 0.70), int(width * 0.62), height - margin_y),
-                "visual": (int(width * 0.60), int(height * 0.16), width - margin_x, int(height * 0.62)),
-                "secondary": (int(width * 0.60), int(height * 0.64), width - margin_x, height - margin_y),
+                "copy": (margin_x, int(height * 0.24), int(width * 0.58), int(height * 0.66)),
+                "cta": (margin_x, int(height * 0.74), int(width * 0.58), height - margin_y),
+                "visual": (int(width * 0.58), int(height * 0.22), width - margin_x, int(height * 0.78)),
+                "secondary": (int(width * 0.60), int(height * 0.78), width - margin_x, height - margin_y),
             }
         return {
             "brand": (margin_x, margin_y, int(width * 0.46), int(height * 0.20)),
@@ -2622,7 +2645,11 @@ def composite_priority_layer_resize(
         _inpaint_rectangular_overlays(source, text_remove_boxes),
         meaningful_visuals,
     )
-    if background_source.size == (width, height):
+    if background_source.size == (width, height) and target_ratio < 0.78:
+        output = build_low_artifact_background_canvas(background_clean, width, height).convert("RGBA")
+    elif background_source.size == (width, height) and target_smaller:
+        output = build_deterministic_background_canvas(background_clean, width, height).convert("RGBA")
+    elif background_source.size == (width, height):
         output = background_source.convert("RGBA")
     else:
         output = build_deterministic_background_canvas(background_clean, width, height).convert("RGBA")
@@ -2822,6 +2849,7 @@ def composite_priority_layer_resize(
                 anchor=(0.5, 0.5),
                 foreground_alpha=True,
                 alpha_cut_source_boxes=visual_alpha_cut_boxes,
+                anchor_bottom_if_source_truncated=True,
             )
         composited.append(visual_layer)
         if visual_layer.get("pasteBox"):
@@ -2849,9 +2877,11 @@ def composite_priority_layer_resize(
                     anchor=(0.5, 0.5),
                     foreground_alpha=True,
                     alpha_cut_source_boxes=visual_alpha_cut_boxes,
+                    anchor_bottom_if_source_truncated=True,
                 )
             )
 
+    drawn_redraw_zone_boxes: list[tuple[int, int, int, int]] = []
     if redraw_blocks and draw_text:
         if use_redraw_for_small_text and preserve_brand_layers:
             secondary_source_union = _union_boxes(parts["secondary"])
@@ -2872,6 +2902,14 @@ def composite_priority_layer_resize(
             blocks_to_draw = _sort_redraw_blocks_by_source_yx(
                 _merge_redraw_blocks_by_inline_rows(redraw_blocks, width)
             )
+        drawn_redraw_zone_boxes = [
+            tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))
+            for block in blocks_to_draw
+            if tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[2]
+            > tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[0]
+            and tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[3]
+            > tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0)))[1]
+        ]
         output = draw_text(output.convert("RGB"), blocks_to_draw).convert("RGBA")
         composited.append(
             {
@@ -2892,10 +2930,28 @@ def composite_priority_layer_resize(
             and _box_overlap(tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0))), zones["secondary"])
             / max(1, _box_area(tuple(int(value) for value in getattr(block, "bbox", (0, 0, 0, 0))))) >= 0.55
         ]
-        guide = _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_layer_boxes))
+        guide = None if target_ratio < 0.78 else _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_layer_boxes))
         if guide:
             composited.append(guide)
-    display_cta_layer = _draw_display_cta_button(output, display_cta_zone, label=_localized_display_cta_label(analysis)) if display_cta_zone else None
+    if display_cta_zone and target_ratio < 0.78:
+        # Vertical display zones are already space-between partitions. The
+        # redraw block boxes can be much taller than the actual rendered text,
+        # so collision resolving here can falsely suppress the required CTA.
+        safe_cta_zone = display_cta_zone
+    else:
+        safe_cta_zone = (
+            _resolve_display_cta_zone(
+                display_cta_zone,
+                drawn_text_boxes=drawn_redraw_zone_boxes,
+                width=width,
+                height=height,
+                margin_x=max(1, zones["cta"][0]),
+                margin_y=max(1, int(height * 0.045)),
+            )
+            if display_cta_zone
+            else None
+        )
+    display_cta_layer = _draw_display_cta_button(output, safe_cta_zone, label=_localized_display_cta_label(analysis)) if safe_cta_zone else None
     if display_cta_layer:
         composited.append(display_cta_layer)
 
@@ -2993,7 +3049,7 @@ def _paste_crop_contain_limited(
     paste_x = target_box[0] + int(round(free_w * anchor[0]))
     paste_y = target_box[1] + int(round(free_h * anchor[1]))
     if anchor_bottom_if_source_truncated and source_box[3] >= source.height - max(2, int(source.height * 0.012)):
-        paste_y = output.height - paste_h
+        paste_y = target_box[3] - paste_h
     paste_box = (paste_x, paste_y, paste_x + paste_w, paste_y + paste_h)
     if crop is not None:
         patch = crop.resize((paste_w, paste_h), Image.Resampling.LANCZOS)
@@ -3316,33 +3372,33 @@ def composite_wide_creative_director_relayout(
     is_social_square = not display_placement and 0.92 <= target_ratio <= 1.08
     if target_ratio < 0.78:
         brand_bounds = (margin_x, margin_y, width - margin_x, int(height * 0.16))
-        copy_bounds = (margin_x, int(height * 0.15), width - margin_x, int(height * 0.35))
-        cta_bounds = (margin_x, int(height * 0.35), width - margin_x, int(height * 0.43))
-        portrait_visual_margin_x = int(width * 0.09)
+        copy_bounds = (margin_x, int(height * 0.12), width - margin_x, int(height * 0.30))
+        cta_bounds = (margin_x, int(height * 0.88), width - margin_x, int(height * 0.97))
+        portrait_visual_margin_x = int(width * 0.06)
         visual_bounds = (
             portrait_visual_margin_x,
-            int(height * 0.39),
+            int(height * 0.32),
             width - portrait_visual_margin_x,
-            int(height * 0.965),
+            int(height * 0.985),
         )
         if display_placement:
-            copy_bounds = (margin_x, int(height * 0.14), width - margin_x, int(height * 0.34))
-            cta_bounds = (margin_x, int(height * 0.34), width - margin_x, int(height * 0.42))
+            copy_bounds = (margin_x, int(height * 0.14), width - margin_x, int(height * 0.33))
+            cta_bounds = (margin_x, int(height * 0.875), width - margin_x, int(height * 0.965))
             visual_bounds = (
                 portrait_visual_margin_x,
-                int(height * 0.42),
+                int(height * 0.35),
                 width - portrait_visual_margin_x,
-                int(height * 0.71),
+                int(height * 0.69),
             )
-            secondary_bounds = (margin_x, int(height * 0.755), width - margin_x, height - margin_y)
+            secondary_bounds = (margin_x, int(height * 0.715), width - margin_x, int(height * 0.85))
         else:
             visual_bounds = (
                 portrait_visual_margin_x,
-                int(height * 0.40),
+                int(height * 0.43),
                 width - portrait_visual_margin_x,
-                int(height * 0.755),
+                int(height * 0.985),
             )
-            secondary_bounds = (margin_x, int(height * 0.775), width - margin_x, int(height * 0.94))
+            secondary_bounds = (margin_x, int(height * 0.315), width - margin_x, int(height * 0.405))
     elif target_area_smaller:
         if is_social_square:
             split_x = width // 2
@@ -3859,7 +3915,7 @@ def composite_wide_creative_director_relayout(
                 if str(layer.get("role", "")).startswith("primary_visual") and layer.get("pasteBox"):
                     visual_paste_box = tuple(int(value) for value in layer["pasteBox"])
                     break
-            guide = None if is_social_square else _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_draw_boxes))
+            guide = None if (is_social_square or target_ratio < 0.78) else _draw_programmatic_rtb_guides(output, visual_paste_box, _union_boxes(secondary_draw_boxes))
             if guide:
                 composited.append(guide)
 
@@ -3906,6 +3962,8 @@ def should_use_horizontal_band_relayout(source: Image.Image, width: int, height:
 def should_use_role_aware_relayout(source: Image.Image, width: int, height: int, analysis: VisualAnalysis) -> bool:
     target_ratio = width / max(1, height)
     source_ratio = source.width / max(1, source.height)
+    if target_ratio >= 1.35:
+        return False
     has_layers = bool(analysis.marketing_text_layers or analysis.product_layers or analysis.logo_layers or analysis.other_layers)
     if should_preserve_full_creative_for_complex_visuals(source, width, height, analysis):
         return False
@@ -4008,10 +4066,41 @@ def _map_box_between_unions(
 def _copy_text_block_to_box(block: Any, box: tuple[int, int, int, int]) -> Any:
     updates = {"bbox": box, "clean_box": box, "line_boxes": [box]}
     if hasattr(block, "model_copy"):
-        return block.model_copy(update=updates, deep=True)
-    copied = block.copy(deep=True)
-    for key, value in updates.items():
-        setattr(copied, key, value)
+        copied = block.model_copy(update=updates, deep=True)
+    else:
+        copied = block.copy(deep=True)
+        for key, value in updates.items():
+            setattr(copied, key, value)
+    box_w = max(1, box[2] - box[0])
+    box_h = max(1, box[3] - box[1])
+    source_box = tuple(int(v) for v in (getattr(block, "clean_box", None) or getattr(block, "bbox", box)))
+    source_w = max(1, source_box[2] - source_box[0])
+    source_h = max(1, source_box[3] - source_box[1])
+    source_font = int(getattr(block, "font_size_estimate", 0) or 0)
+    if source_font <= 0:
+        source_font = max(7, int(round(source_h * 0.70)))
+    geometry_scale = min(box_w / source_w, box_h / source_h)
+    # Text redraw must preserve the source hierarchy. Sizing from the target
+    # box height alone turns every OCR token into an oversized headline.
+    font_size = int(round(source_font * max(0.35, geometry_scale)))
+    font_size = max(7, min(font_size, max(7, int(round(box_h * 0.84))), 72))
+    setattr(copied, "font_size_estimate", font_size)
+    setattr(copied, "line_height_estimate", int(round(font_size * 1.18)))
+    for style in getattr(copied, "source_word_styles", []) or []:
+        if isinstance(style, dict):
+            style["fontSize"] = font_size
+            style["peerRowFontSize"] = font_size
+            style["bbox"] = [box[0], box[1], box[2], box[3]]
+    for span in getattr(copied, "translated_style_spans", []) or []:
+        if isinstance(span, dict):
+            span_style = span.setdefault("style", {})
+            span_style["fontSize"] = font_size
+            span_style["lineHeight"] = int(round(font_size * 1.18))
+            for source_style in span.get("sourceWordStyles", []) or []:
+                if isinstance(source_style, dict):
+                    source_style["fontSize"] = font_size
+                    source_style["peerRowFontSize"] = font_size
+                    source_style["bbox"] = [box[0], box[1], box[2], box[3]]
     return copied
 
 
@@ -4134,12 +4223,21 @@ def composite_role_aware_relayout(
 
     primary_union = _union_boxes(parts["primary"])
     source_boxes_by_id = {layer.id: _tighten_marketing_text_box(source, _layer_box(layer, source)) for layer in analysis.marketing_text_layers}
-    primary_ids = {layer_id for layer_id, box in source_boxes_by_id.items() if box in parts["primary"]}
-    secondary_ids = {layer_id for layer_id, box in source_boxes_by_id.items() if box in parts["secondary"]}
+    primary_ids = {
+        layer_id
+        for layer_id, box in source_boxes_by_id.items()
+        if primary_union and _box_overlap(box, primary_union) / max(1, _box_area(box)) >= 0.35
+    }
+    secondary_union_for_ids = _union_boxes(parts["secondary"])
+    secondary_ids = {
+        layer_id
+        for layer_id, box in source_boxes_by_id.items()
+        if secondary_union_for_ids and _box_overlap(box, secondary_union_for_ids) / max(1, _box_area(box)) >= 0.35
+    }
     primary_source_union = _union_boxes([source_boxes_by_id[layer_id] for layer_id in primary_ids])
     secondary_source_union = _union_boxes([source_boxes_by_id[layer_id] for layer_id in secondary_ids])
     selected_text_blocks: list[Any] = []
-    if os.getenv("ADAPTIFAI_RESIZE_ENABLE_TEXT_REDRAW", "0").strip().lower() in {"1", "true", "yes", "on"} and text_blocks and draw_text:
+    if text_blocks and draw_text:
         for block in text_blocks:
             block_id = str(getattr(block, "id", "") or "")
             source_id = block_id.replace("v5-resize-", "")
@@ -4452,7 +4550,7 @@ def render_deterministic_compositor(
                         background_source = fallback_background_source
                         provider_background_meta["providerRejected"] = "layout_seed_background_can_hallucinate_product_or_text"
                         provider_background_meta["productionReady"] = False
-                        if target_ratio < 0.78:
+                        if source_ratio > 1.25 and target_ratio < 0.78:
                             provider_background_meta["providerSalvage"] = "foreground_completion_only"
                             provider_visual_completion_source = provider_rgb
                             provider_ready = True
@@ -4537,9 +4635,13 @@ def render_deterministic_compositor(
             # A provider result is production-ready only when the compositor
             # safety gate accepted it into the final background.
             "productionReady": (
-                True
-                if target_area_smaller or (not preserve_brand_layers and target_ratio >= 0.78)
-                else (provider_ready if should_seed_outpaint_with_foreground else True)
+                False
+                if provider_background_meta.get("providerRejected")
+                else (
+                    True
+                    if target_area_smaller
+                    else (provider_ready if should_seed_outpaint_with_foreground else True)
+                )
             ),
         }
     if landscape_anchor:
@@ -4607,7 +4709,7 @@ def render_deterministic_compositor(
             )
             strategy = "deterministic_compositor_priority_layer_resize"
             pipeline = "resize-deterministic-compositor-v4-priority-layer"
-            production_ready = True
+            production_ready = provider_ready if should_seed_outpaint_with_foreground else True
         elif target_ratio < 0.78:
             rendered, relayout_meta = composite_wide_creative_director_relayout(
                 background,

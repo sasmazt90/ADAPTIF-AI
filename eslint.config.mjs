@@ -17,6 +17,7 @@ const eslintConfig = defineConfig([
     "backend/tmp/**",
     "ADAPTIFAI TEST IMAGES/**",
     ".claude/**",
+    ".playwright-cli/**",
     "next-env.d.ts",
   ]),
 ]);
