@@ -18445,14 +18445,18 @@ async def adapt(
             )
             extracted_blocks = outputs[0].extracted_blocks if outputs else []
         else:
-            outputs, manifest_assets = await build_resize_assets(
-                uploaded_images,
-                placement_ids,
-                output_format,
-                custom_width,
-                custom_height,
-                job_dir,
-                creative_modes=parsed_creative_modes,
+            outputs, manifest_assets = await run_in_threadpool(
+                lambda: asyncio.run(
+                    build_resize_assets(
+                        uploaded_images,
+                        placement_ids,
+                        output_format,
+                        custom_width,
+                        custom_height,
+                        job_dir,
+                        creative_modes=parsed_creative_modes,
+                    )
+                )
             )
             translations = {}
             extracted_blocks = []
