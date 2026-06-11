@@ -12310,6 +12310,47 @@ def extract_decorative_resize_layers(
     return layers
 
 
+def _smart_reframe_analysis_prompt(target_language: str) -> str:
+    return (
+        build_visual_analysis_prompt(target_language)
+        + " Return the dimensions of the original source image, not the resized analysis image. "
+        + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers. "
+        + "For resize, explicitly identify secondary visual theme elements in other_layers so the planner can recompose them around the protected product instead of cropping the source."
+    )
+
+
+def _prepare_smart_reframe_probe(source: Image.Image) -> tuple[Image.Image, str]:
+    probe = source.convert("RGB")
+    max_side = int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE", "1600"))
+    if max(probe.size) > max_side:
+        scale = max_side / max(probe.size)
+        probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
+    encoded_io = io.BytesIO()
+    probe.save(encoded_io, format="PNG")
+    encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
+    return probe, encoded
+
+
+def _finalize_smart_reframe_analysis(analysis: VisualAnalysis, source: Image.Image, provider_name: str) -> VisualAnalysis:
+    if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
+        raise ValueError(f"{provider_name} analysis returned no actionable visual layers")
+    source_ratio = source.width / max(1, source.height)
+    if source_ratio > 1.35 and analysis.product_layers:
+        usable_products = []
+        for layer in analysis.product_layers:
+            left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
+            height_ratio = (bottom - top) / max(1, source.height)
+            center_y = (top + bottom) / 2
+            if height_ratio >= 0.38 and center_y >= source.height * 0.24:
+                usable_products.append(layer)
+        if not usable_products:
+            raise ValueError(f"{provider_name} analysis product boxes are label/top fragments, not full visual subjects")
+    if analysis.source_width != source.width or analysis.source_height != source.height:
+        analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
+    warnings = [*analysis.quality_warnings, f"analysis_provider:{provider_name}"]
+    return analysis.model_copy(update={"quality_warnings": warnings})
+
+
 def build_openai_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
     if not os.getenv("OPENAI_API_KEY", "").strip():
         return None
@@ -12319,16 +12360,7 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         return None
 
     try:
-        probe = source.convert("RGB")
-        max_side = int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE", "1600"))
-        if max(probe.size) > max_side:
-            scale = max_side / max(probe.size)
-            probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
-
-        encoded_io = io.BytesIO()
-        probe.save(encoded_io, format="PNG")
-        encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
-
+        _probe, encoded = _prepare_smart_reframe_probe(source)
         client = OpenAI(timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")))
         response = client.chat.completions.create(
             model=os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MODEL", os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-4o")),
@@ -12336,12 +12368,7 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
             messages=[
                 {
                     "role": "system",
-                    "content": (
-                        build_visual_analysis_prompt(target_language)
-                        + " Return the dimensions of the original source image, not the resized analysis image. "
-                        + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers. "
-                        + "For resize, explicitly identify secondary visual theme elements in other_layers so the planner can recompose them around the protected product instead of cropping the source."
-                    ),
+                    "content": _smart_reframe_analysis_prompt(target_language),
                 },
                 {
                     "role": "user",
@@ -12355,25 +12382,63 @@ def build_openai_smart_reframe_analysis(source: Image.Image, target_language: st
         )
         payload = json.loads(response.choices[0].message.content or "{}")
         analysis = parse_visual_analysis_payload(payload)
-        if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
-            raise ValueError("openai analysis returned no actionable visual layers")
-        source_ratio = source.width / max(1, source.height)
-        if source_ratio > 1.35 and analysis.product_layers:
-            usable_products = []
-            for layer in analysis.product_layers:
-                left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
-                height_ratio = (bottom - top) / max(1, source.height)
-                center_y = (top + bottom) / 2
-                if height_ratio >= 0.38 and center_y >= source.height * 0.24:
-                    usable_products.append(layer)
-            if not usable_products:
-                raise ValueError("openai analysis product boxes are label/top fragments, not full visual subjects")
-        if analysis.source_width != source.width or analysis.source_height != source.height:
-            analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
-        warnings = [*analysis.quality_warnings, "analysis_provider:openai"]
-        return analysis.model_copy(update={"quality_warnings": warnings})
+        return _finalize_smart_reframe_analysis(analysis, source, "openai")
     except Exception as exc:
         print(f"[smart_reframe_analysis] openai analysis failed: {exc}", flush=True)
+        return None
+
+
+def build_openrouter_smart_reframe_analysis(source: Image.Image, target_language: str = "EN") -> VisualAnalysis | None:
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    if not api_key:
+        return None
+
+    provider = os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_PROVIDER", "auto").strip().lower()
+    if provider in {"heuristic", "local", "off", "disabled", "openai", "gemini", "google"}:
+        return None
+
+    try:
+        _probe, encoded = _prepare_smart_reframe_probe(source)
+        base_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
+        model = (
+            os.getenv("ADAPTIFAI_OPENROUTER_SMART_REFRAME_MODEL")
+            or os.getenv("ADAPTIFAI_OPENROUTER_MODEL")
+            or os.getenv("OPENROUTER_MODEL")
+            or "google/gemini-2.5-flash"
+        ).strip()
+        headers = {
+            "HTTP-Referer": os.getenv("OPENROUTER_SITE_URL", "https://adaptifai.sasmaz.digital"),
+            "X-Title": os.getenv("OPENROUTER_APP_TITLE", "AdaptifAI"),
+        }
+        client = OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            timeout=float(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_TIMEOUT", "12")),
+            default_headers={key: value for key, value in headers.items() if value},
+        )
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0,
+            messages=[
+                {
+                    "role": "system",
+                    "content": _smart_reframe_analysis_prompt(target_language),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"Original source image size is {source.width}x{source.height}. Analyze product/person/logo/text/background layers for resizing. Return JSON only."},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+                    ],
+                },
+            ],
+            response_format={"type": "json_object"},
+        )
+        payload = json.loads(response.choices[0].message.content or "{}")
+        analysis = parse_visual_analysis_payload(payload)
+        return _finalize_smart_reframe_analysis(analysis, source, "openrouter")
+    except Exception as exc:
+        print(f"[smart_reframe_analysis] openrouter analysis failed: {exc}", flush=True)
         return None
 
 
@@ -12387,22 +12452,9 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
         return None
 
     try:
-        probe = source.convert("RGB")
-        max_side = int(os.getenv("ADAPTIFAI_SMART_REFRAME_ANALYSIS_MAX_SIDE", "1600"))
-        if max(probe.size) > max_side:
-            scale = max_side / max(probe.size)
-            probe = probe.resize((max(1, int(probe.width * scale)), max(1, int(probe.height * scale))), Image.Resampling.LANCZOS)
-
-        encoded_io = io.BytesIO()
-        probe.save(encoded_io, format="PNG")
-        encoded = base64.b64encode(encoded_io.getvalue()).decode("utf-8")
+        _probe, encoded = _prepare_smart_reframe_probe(source)
         model = os.getenv("GEMINI_VISUAL_ANALYSIS_MODEL", os.getenv("ADAPTIFAI_GEMINI_VISUAL_ANALYSIS_MODEL", "gemini-2.5-pro")).strip() or "gemini-2.5-pro"
-        prompt = (
-            build_visual_analysis_prompt(target_language)
-            + " Return JSON only. Return the dimensions of the original source image, not the resized analysis image. "
-            + "Be conservative: only mark printed product labels/logos as non-translatable protected layers, and keep marketing overlay text separate from product layers. "
-            + "For resize, explicitly identify secondary visual theme elements in other_layers so the planner can recompose them around the protected product instead of cropping the source."
-        )
+        prompt = _smart_reframe_analysis_prompt(target_language) + " Return JSON only."
         response = requests.post(
             f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
             params={"key": api_key},
@@ -12428,23 +12480,7 @@ def build_gemini_smart_reframe_analysis(source: Image.Image, target_language: st
         content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict))
         parsed = extract_json_object(content)
         analysis = parse_visual_analysis_payload(parsed)
-        if not analysis.product_layers and not analysis.logo_layers and not analysis.other_layers:
-            raise ValueError("gemini analysis returned no actionable visual layers")
-        source_ratio = source.width / max(1, source.height)
-        if source_ratio > 1.35 and analysis.product_layers:
-            usable_products = []
-            for layer in analysis.product_layers:
-                left, top, right, bottom = layer.bbox.to_pixel_box(source.width, source.height)
-                height_ratio = (bottom - top) / max(1, source.height)
-                center_y = (top + bottom) / 2
-                if height_ratio >= 0.38 and center_y >= source.height * 0.24:
-                    usable_products.append(layer)
-            if not usable_products:
-                raise ValueError("gemini analysis product boxes are label/top fragments, not full visual subjects")
-        if analysis.source_width != source.width or analysis.source_height != source.height:
-            analysis = analysis.model_copy(update={"source_width": source.width, "source_height": source.height})
-        warnings = [*analysis.quality_warnings, "analysis_provider:gemini"]
-        return analysis.model_copy(update={"quality_warnings": warnings})
+        return _finalize_smart_reframe_analysis(analysis, source, "gemini")
     except Exception as exc:
         print(f"[smart_reframe_analysis] gemini analysis failed: {exc}", flush=True)
         return None
@@ -12543,6 +12579,12 @@ def build_smart_reframe_analysis(source: Image.Image, focus_bbox: tuple[int, int
             return analysis
         if provider == "openai":
             return build_heuristic_smart_reframe_analysis(source, focus_bbox, "openai_analysis_failed_fallback")
+    if provider in {"auto", "openrouter"}:
+        analysis = build_openrouter_smart_reframe_analysis(source, target_language)
+        if analysis is not None:
+            return analysis
+        if provider == "openrouter":
+            return build_heuristic_smart_reframe_analysis(source, focus_bbox, "openrouter_analysis_failed_fallback")
     if provider in {"auto", "gemini", "google"}:
         analysis = build_gemini_smart_reframe_analysis(source, target_language)
         if analysis is not None:
@@ -16237,6 +16279,7 @@ def fit_v62_geometric_typesetting(
     block_center_x = (box[0] + box[2]) / 2.0
     preferred_line_count = max(1, len([line for line in (block.line_texts or []) if str(line).strip()]) or 1)
     best_layout: dict[str, Any] | None = None
+    best_preferred_layout: dict[str, Any] | None = None
     has_text_background = any(isinstance(word, dict) and word.get("hasTextBackground") for word in (block.source_word_styles or []))
     min_scale = float(os.getenv("ADAPTIFAI_V5_BG_RENDER_MIN_SCALE", "0.28")) if has_text_background else float(os.getenv("ADAPTIFAI_V5_RENDER_MIN_SCALE", "0.45"))
     for scale_factor in np.linspace(1.0, max(0.38, min_scale), 20):
@@ -16298,7 +16341,7 @@ def fit_v62_geometric_typesetting(
             - overflow_x * 12.0
             - overflow_y * (18.0 if has_text_background else 5.0)
             - oversized_background_text * (24.0 if has_text_background else 0.0)
-            - line_delta * 28.0
+            - line_delta * 180.0
             - line_count_underflow * 180.0
             - max(0.0, 1.0 - float(scale_factor)) * (90.0 if has_text_background else 260.0)
         )
@@ -16315,12 +16358,13 @@ def fit_v62_geometric_typesetting(
             "typesetting": "v6.6-calibrated-rich-v5-fit",
             "score": score,
         }
-        if float(scale_factor) == 1.0 and overflow_x == 0 and overflow_y == 0:
-            return layout
+        if overflow_x == 0 and overflow_y == 0 and line_delta == 0:
+            if best_preferred_layout is None or float(scale_factor) > float(best_preferred_layout.get("scaleFactor", 0.0)):
+                best_preferred_layout = layout
         if best_layout is None or score > float(best_layout.get("score", -999999)):
             best_layout = layout
-        if overflow_x == 0 and overflow_y == 0 and line_delta == 0:
-            break
+    if best_preferred_layout is not None:
+        return best_preferred_layout
     return best_layout or {
         "scaleFactor": 1.0,
         "lines": [],
@@ -16856,10 +16900,24 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
         int(getattr(block, "resize_preferred_line_count", 0) or 0),
         len([line for line in (block.line_texts or []) if str(line).strip()]),
     )
+    readable_min = max(
+        min_candidate,
+        min(
+            max_candidate,
+            int(
+                getattr(
+                    block,
+                    "resize_min_readable_font_size",
+                    max(10, round(min(max_width, max_height) * 0.035)),
+                )
+                or 10
+            ),
+        ),
+    )
     best_fit: tuple[int, list[list[dict[str, Any]]], int, float] | None = None
 
-    # First priority: preserve the original line rhythm when the result remains readable.
-    for candidate in range(max_candidate, min_candidate - 1, -1):
+    # First priority: preserve the original line rhythm while the copy remains readable.
+    for candidate in range(max_candidate, readable_min - 1, -1):
         candidate_lines, candidate_line_height = build_lines(candidate)
         if (
             candidate_lines
@@ -16872,7 +16930,7 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
 
     # Second priority: avoid adding extra line breaks if exact preservation is impossible.
     if best_fit is None:
-        for candidate in range(max_candidate, min_candidate - 1, -1):
+        for candidate in range(max_candidate, readable_min - 1, -1):
             candidate_lines, candidate_line_height = build_lines(candidate)
             if (
                 candidate_lines
@@ -16883,7 +16941,8 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
                 best_fit = (candidate, candidate_lines, candidate_line_height, widest / max(1, max_width))
                 break
 
-    # Final fallback: if preserving line count makes the copy unreadable, allow more lines.
+    # Final fallback: if preserving line count makes the copy unreadable, allow more lines
+    # before shrinking below the readable threshold.
     for candidate in range(max_candidate, min_candidate - 1, -1):
         if best_fit is not None:
             break
