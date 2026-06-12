@@ -117,6 +117,123 @@ def _prepare_foreground_rgba_crop(crop: Image.Image) -> Image.Image:
     return crop.convert("RGBA")
 
 
+def _cv_foreground_alpha_crop(crop: Image.Image) -> Image.Image:
+    rgba = crop.convert("RGBA")
+    try:
+        import cv2
+
+        rgb = np.array(rgba.convert("RGB"), dtype=np.uint8)
+        h, w = rgb.shape[:2]
+        if h < 8 or w < 8:
+            return rgba
+        edge_samples = np.concatenate(
+            [
+                rgb[: max(1, h // 10), :, :].reshape(-1, 3),
+                rgb[-max(1, h // 10) :, :, :].reshape(-1, 3),
+                rgb[:, : max(1, w // 12), :].reshape(-1, 3),
+                rgb[:, -max(1, w // 12) :, :].reshape(-1, 3),
+            ],
+            axis=0,
+        )
+        bg = np.median(edge_samples, axis=0)
+        dist = np.linalg.norm(rgb.astype(np.float32) - bg.astype(np.float32), axis=2)
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        edges = cv2.Canny(gray, 30, 110)
+        alpha = ((dist > 10) | (edges > 0)).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, kernel, iterations=2)
+        alpha = cv2.dilate(alpha, kernel, iterations=1)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        rgba.putalpha(Image.fromarray(alpha, "L"))
+        return rgba
+    except Exception:
+        return rgba
+
+
+def _product_only_alpha_crop(
+    source: Image.Image,
+    source_box: tuple[int, int, int, int],
+    analysis: VisualAnalysis,
+) -> tuple[Image.Image, dict[str, Any]]:
+    source_box = _clip_box(source_box, source.width, source.height)
+    crop = source.crop(source_box).convert("RGBA")
+    meta: dict[str, Any] = {"productOnlySourceBox": list(source_box), "productOnlyAlpha": "cv_foreground_dominant_component"}
+    try:
+        import cv2
+
+        extracted = _cv_foreground_alpha_crop(crop)
+        alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
+        binary = (alpha > 24).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+        if count > 1:
+            components = []
+            for label in range(1, count):
+                area = int(stats[label, cv2.CC_STAT_AREA])
+                x = int(stats[label, cv2.CC_STAT_LEFT])
+                y = int(stats[label, cv2.CC_STAT_TOP])
+                bw = int(stats[label, cv2.CC_STAT_WIDTH])
+                bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+                if area >= max(80, int(crop.width * crop.height * 0.01)) and bh >= crop.height * 0.18:
+                    components.append((area, label, x, y, bw, bh))
+            if components:
+                components.sort(reverse=True)
+                keep = np.zeros_like(alpha)
+                keep[labels == components[0][1]] = 255
+                alpha = cv2.GaussianBlur(keep, (0, 0), sigmaX=0.8, sigmaY=0.8)
+                meta["productOnlyKeptComponent"] = [components[0][2], components[0][3], components[0][4], components[0][5]]
+        extracted.putalpha(Image.fromarray(alpha, "L"))
+        return _prepare_foreground_rgba_crop(extracted), meta
+    except Exception as exc:
+        meta["productOnlyAlphaError"] = str(exc)[:240]
+        crop.putalpha(Image.new("L", crop.size, 255))
+        return crop, meta
+
+
+def _trim_rgba_to_alpha(rgba: Image.Image) -> tuple[Image.Image, tuple[int, int, int, int] | None]:
+    alpha_box = rgba.convert("RGBA").getchannel("A").getbbox()
+    if not alpha_box:
+        return rgba.convert("RGBA"), None
+    return rgba.convert("RGBA").crop(alpha_box), alpha_box
+
+
+def _paste_rgba_contain(
+    output: Image.Image,
+    rgba: Image.Image,
+    target_bounds: tuple[int, int, int, int],
+    *,
+    layer_id: str,
+    role: str,
+    anchor: tuple[float, float] = (0.5, 1.0),
+) -> dict[str, Any]:
+    target_bounds = _clip_box(target_bounds, output.width, output.height)
+    rgba, trim_box = _trim_rgba_to_alpha(rgba)
+    tw = max(1, target_bounds[2] - target_bounds[0])
+    th = max(1, target_bounds[3] - target_bounds[1])
+    scale = min(tw / max(1, rgba.width), th / max(1, rgba.height))
+    nw = max(1, int(round(rgba.width * scale)))
+    nh = max(1, int(round(rgba.height * scale)))
+    px = target_bounds[0] + int(round((tw - nw) * anchor[0]))
+    py = target_bounds[1] + int(round((th - nh) * anchor[1]))
+    resized = rgba.convert("RGBA").resize((nw, nh), Image.Resampling.LANCZOS)
+    output.alpha_composite(resized, (px, py))
+    return {
+        "layerId": layer_id,
+        "role": role,
+        "sourceBox": [],
+        "targetBox": list(target_bounds),
+        "pasteBox": [px, py, px + nw, py + nh],
+        "scale": round(scale, 4),
+        "fitMode": "product_only_alpha_contain",
+        "alphaTrimBox": list(trim_box) if trim_box else None,
+    }
+
+
+def _resize_product_only_phase_enabled() -> bool:
+    return str(os.getenv("ADAPTIFAI_RESIZE_PRODUCT_ONLY_PHASE", "1")).strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _image_data_uri(image: Image.Image, *, fmt: str = "PNG") -> str:
     buffer = io.BytesIO()
     image.save(buffer, format=fmt)
@@ -1666,25 +1783,38 @@ def render_deterministic_compositor(
     
     # Sadece Foreground product piksellerini izole et
     for index, element_box in enumerate(visual_elements):
-        paste_box = (
+        target_box = (
             origin_x + int(round((element_box[0] - elements_union[0]) * element_scale)),
             origin_y + int(round((element_box[1] - elements_union[1]) * element_scale)),
             origin_x + int(round((element_box[2] - elements_union[0]) * element_scale)),
             origin_y + int(round((element_box[3] - elements_union[1]) * element_scale)),
         )
-        composited.append(
-            _paste_crop_exact(
-                output,
-                visual_source_clean,
-                element_box,
-                paste_box,
-                layer_id=f"role-aware-visual-element-{index + 1}",
-                role="product_visual_element",
-                feather=max(2, min(8, width // 150)),
-            )
+        product_rgba, product_meta = _product_only_alpha_crop(source, element_box, analysis)
+        layer_meta = _paste_rgba_contain(
+            output,
+            product_rgba,
+            target_box,
+            layer_id=f"product-only-alpha-element-{index + 1}",
+            role="product_visual_element",
+            anchor=(0.5, 1.0),
         )
+        layer_meta.update(product_meta)
+        composited.append(layer_meta)
 
     # KURAL 4 & 5: Tipografi (Katman 4 ve 5) - Adaptif Satır Korumalı Slogan ve RTB
+    if _resize_product_only_phase_enabled():
+        return output.convert("RGB"), {
+            "compositedLayers": composited,
+            "compositedLayerCount": len(composited),
+            "productOnlyPhase": True,
+            "textRedrawBlocks": 0,
+            "textRedrawError": "",
+            "creativeDirectorRelayout": True,
+            "layoutPlanBoxes": {
+                "visual": list(visual_bounds),
+            },
+        }
+
     redraw_blocks: list[Any] = []
     drawn_redraw_zone_boxes: list[tuple[int, int, int, int]] = []
     
