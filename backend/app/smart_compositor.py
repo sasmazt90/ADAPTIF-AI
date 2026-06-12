@@ -4945,6 +4945,23 @@ def composite_wide_creative_director_relayout(
     product_frame_source = product_foreground_source if product_foreground_ready_for_frame else None
     product_frame_box = product_foreground_box if product_foreground_ready_for_frame else None
 
+    def append_blocked_product_layer(layer_id: str, target_box: tuple[int, int, int, int], reason: str) -> None:
+        composited.append(
+            {
+                "layerId": layer_id,
+                "role": "product_asset_blocked_before_frame",
+                "sourceBox": list(meaningful_visuals[0]) if meaningful_visuals else list(visual_box),
+                "targetBox": list(target_box),
+                "pasteBox": [],
+                "scale": None,
+                "fitMode": "blocked_until_product_alpha_completion",
+                "blockedReason": reason,
+                "productCompletionRequired": product_completion_required,
+                "productForegroundReadyForFrame": product_foreground_ready_for_frame,
+                "productMeta": product_foreground_meta,
+            }
+        )
+
     if visual_completion_source is not None:
         composited.append(
             _paste_crop_fit(
@@ -4960,35 +4977,41 @@ def composite_wide_creative_director_relayout(
                 anchor_bottom_if_source_truncated=True,
             )
         )
-        composited.append(
-            _paste_crop_fit(
-                output,
-                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
-                product_frame_box or meaningful_visuals[0],
-                visual_render_bounds,
-                layer_id="visual-main-exact-label-overlay",
-                role="product_only_foreground_readability_overlay" if product_frame_source else "original_visual_label_readability_overlay",
-                mode="contain",
-                foreground_alpha=product_frame_source is None,
-                alpha_cut_source_boxes=[] if product_frame_source else visual_label_cut_boxes,
-                anchor_bottom_if_source_truncated=True,
+        if product_frame_source is not None and product_frame_box is not None:
+            composited.append(
+                _paste_crop_fit(
+                    output,
+                    product_frame_source,
+                    product_frame_box,
+                    visual_render_bounds,
+                    layer_id="visual-main-exact-label-overlay",
+                    role="product_only_foreground_readability_overlay",
+                    mode="contain",
+                    foreground_alpha=False,
+                    alpha_cut_source_boxes=[],
+                    anchor_bottom_if_source_truncated=True,
+                )
             )
-        )
+        else:
+            append_blocked_product_layer("visual-main-exact-label-overlay", visual_render_bounds, "product_alpha_not_frame_ready")
     elif visual_already_protected:
-        composited.append(
-            _paste_crop_fit(
-                output,
-                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
-                product_frame_box or meaningful_visuals[0],
-                visual_render_bounds,
-                layer_id="visual-main-exact-foreground",
-                role="product_only_visual_exact_preserve" if product_frame_source else "primary_visual_exact_readable_preserve",
-                mode="contain",
-                foreground_alpha=product_frame_source is None,
-                alpha_cut_source_boxes=[] if product_frame_source else visual_label_cut_boxes,
-                anchor_bottom_if_source_truncated=True,
+        if product_frame_source is not None and product_frame_box is not None:
+            composited.append(
+                _paste_crop_fit(
+                    output,
+                    product_frame_source,
+                    product_frame_box,
+                    visual_render_bounds,
+                    layer_id="visual-main-exact-foreground",
+                    role="product_only_visual_exact_preserve",
+                    mode="contain",
+                    foreground_alpha=False,
+                    alpha_cut_source_boxes=[],
+                    anchor_bottom_if_source_truncated=True,
+                )
             )
-        )
+        else:
+            append_blocked_product_layer("visual-main-exact-foreground", visual_render_bounds, "product_alpha_not_frame_ready")
         composited.append(
             {
                 "layerId": "visual-main",
@@ -5011,19 +5034,22 @@ def composite_wide_creative_director_relayout(
         visual_kwargs["anchor_bottom_if_source_truncated"] = True
         if paste_visual is _paste_crop_fit:
             visual_kwargs["mode"] = "cover" if plan_visual_fit_mode == "cover" else "contain"
-        composited.append(
-            paste_visual(
-                output,
-                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
-                product_frame_box or meaningful_visuals[0],
-                visual_render_bounds,
-                layer_id="visual-main",
-                role="product_only_primary_visual" if product_frame_source else "primary_visual_readable",
-                anchor=plan_visual_anchor,
-                foreground_alpha=product_frame_source is None,
-                **visual_kwargs,
+        if product_frame_source is not None and product_frame_box is not None:
+            composited.append(
+                paste_visual(
+                    output,
+                    product_frame_source,
+                    product_frame_box,
+                    visual_render_bounds,
+                    layer_id="visual-main",
+                    role="product_only_primary_visual",
+                    anchor=plan_visual_anchor,
+                    foreground_alpha=False,
+                    **visual_kwargs,
+                )
             )
-        )
+        else:
+            append_blocked_product_layer("visual-main", visual_render_bounds, "product_alpha_not_frame_ready")
     else:
         slot_gap = int(width * 0.035)
         slot_w = max(1, ((visual_bounds[2] - visual_bounds[0]) - slot_gap * (len(meaningful_visuals) - 1)) // len(meaningful_visuals))
@@ -5034,6 +5060,26 @@ def composite_wide_creative_director_relayout(
                 visual_bounds[0] + index * (slot_w + slot_gap) + slot_w,
                 visual_bounds[3],
             )
+            if index == 0:
+                if product_frame_source is None or product_frame_box is None:
+                    append_blocked_product_layer(f"visual-{index}", slot, "product_alpha_not_frame_ready")
+                    continue
+                composited.append(
+                    _paste_crop_fit(
+                        output,
+                        product_frame_source,
+                        product_frame_box,
+                        slot,
+                        layer_id=f"visual-{index}",
+                        role="product_only_visual_element",
+                        mode="contain",
+                        feather=max(6, min(width, height) // 85),
+                        foreground_alpha=False,
+                        alpha_cut_source_boxes=[],
+                        anchor_bottom_if_source_truncated=True,
+                    )
+                )
+                continue
             composited.append(
                 _paste_crop_fit(
                     output,
