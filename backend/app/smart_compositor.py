@@ -632,7 +632,7 @@ def _foreground_component_visual_boxes(source: Image.Image) -> list[tuple[int, i
     try:
         import cv2
 
-        rgba = _apply_foreground_alpha(source.convert("RGBA"))
+        rgba = _cv_foreground_alpha_crop(source.convert("RGBA"))
         alpha = np.array(rgba.getchannel("A"), dtype=np.uint8)
         h, w = alpha.shape[:2]
         source_area = max(1, w * h)
@@ -1130,7 +1130,7 @@ def _remove_foreground_visuals_for_background(source: Image.Image, boxes: list[t
             if right <= left or bottom <= top:
                 continue
             crop = rgb.crop((left, top, right, bottom)).convert("RGBA")
-            extracted = _apply_foreground_alpha(crop)
+            extracted = _cv_foreground_alpha_crop(crop)
             alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
             if not np.any(alpha > 12):
                 continue
@@ -1592,7 +1592,7 @@ def _source_crop_with_global_foreground_alpha(source: Image.Image, source_box: t
     source_box = _clip_box(source_box, source.width, source.height)
     crop = source.crop(source_box).convert("RGBA")
     try:
-        full_foreground = _apply_foreground_alpha(source.convert("RGBA"))
+        full_foreground = _cv_foreground_alpha_crop(source.convert("RGBA"))
         alpha_crop = full_foreground.getchannel("A").crop(source_box)
         alpha_crop = _remove_text_like_alpha_components(crop, alpha_crop)
         if np.count_nonzero(np.array(alpha_crop, dtype=np.uint8) > 16) >= max(64, crop.width * crop.height * 0.04):
@@ -1600,7 +1600,66 @@ def _source_crop_with_global_foreground_alpha(source: Image.Image, source_box: t
             return _prepare_foreground_rgba_crop(crop)
     except Exception:
         pass
-    return _apply_foreground_alpha(crop)
+    return _cv_foreground_alpha_crop(crop)
+
+
+def _cv_foreground_alpha_crop(crop: Image.Image) -> Image.Image:
+    """Lightweight deterministic foreground alpha for resize product extraction.
+
+    This intentionally avoids rembg/u2net. Resize E2E requests may process many
+    placements in one worker, and loading a heavy segmentation network for each
+    product crop can exceed Render memory. GrabCut + edge/color contrast is
+    deterministic, cheap, and good enough as an initial product isolation mask.
+    """
+    rgba = crop.convert("RGBA")
+    try:
+        import cv2
+
+        rgb = np.array(rgba.convert("RGB"), dtype=np.uint8)
+        h, w = rgb.shape[:2]
+        if h < 8 or w < 8:
+            return rgba
+
+        alpha: np.ndarray | None = None
+        if w * h <= 120_000:
+            mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+            border = max(2, min(w, h) // 18)
+            mask[:border, :] = cv2.GC_BGD
+            mask[-border:, :] = cv2.GC_BGD
+            mask[:, :border] = cv2.GC_BGD
+            mask[:, -border:] = cv2.GC_BGD
+            rect = (border, border, max(2, w - border * 2), max(2, h - border * 2))
+            bgd_model = np.zeros((1, 65), np.float64)
+            fgd_model = np.zeros((1, 65), np.float64)
+            try:
+                cv2.grabCut(rgb, mask, rect, bgd_model, fgd_model, 2, cv2.GC_INIT_WITH_RECT)
+                alpha = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+            except Exception:
+                alpha = None
+        if alpha is None:
+            edge_samples = np.concatenate(
+                [
+                    rgb[: max(1, h // 10), :, :].reshape(-1, 3),
+                    rgb[-max(1, h // 10) :, :, :].reshape(-1, 3),
+                    rgb[:, : max(1, w // 12), :].reshape(-1, 3),
+                    rgb[:, -max(1, w // 12) :, :].reshape(-1, 3),
+                ],
+                axis=0,
+            )
+            bg = np.median(edge_samples, axis=0)
+            dist = np.linalg.norm(rgb.astype(np.float32) - bg.astype(np.float32), axis=2)
+            gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 30, 110)
+            alpha = ((dist > 11) | (edges > 0)).astype(np.uint8) * 255
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        alpha = cv2.morphologyEx(alpha, cv2.MORPH_CLOSE, kernel, iterations=2)
+        alpha = cv2.dilate(alpha, kernel, iterations=1)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        rgba.putalpha(Image.fromarray(alpha, "L"))
+        return rgba
+    except Exception:
+        return rgba
 
 
 def _product_only_foreground_crop(
@@ -1627,7 +1686,7 @@ def _product_only_foreground_crop(
     try:
         import cv2
 
-        extracted = _source_crop_with_global_foreground_alpha(source, source_box).convert("RGBA")
+        extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
         alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
         h, w = alpha.shape[:2]
         if h < 8 or w < 8:
@@ -3579,7 +3638,7 @@ def build_wide_to_portrait_outpaint_layout_seed(
             default=0.0,
         )
         src = visual_source_clean if overlap_ratio > 0.005 else source
-        crop = _apply_foreground_alpha(src.crop(_clip_box(src_box, src.width, src.height)).convert("RGBA"))
+        crop = _cv_foreground_alpha_crop(src.crop(_clip_box(src_box, src.width, src.height)).convert("RGBA"))
         left, top, right, bottom, scale = _fit_inside(crop.size, visual_bounds)
         seed.alpha_composite(crop.resize((right - left, bottom - top), Image.Resampling.LANCZOS), (left, top))
         protected.append({"sourceBox": list(src_box), "pasteBox": [left, top, right, bottom], "scale": round(scale, 4)})
@@ -3593,7 +3652,7 @@ def build_wide_to_portrait_outpaint_layout_seed(
                 visual_bounds[0] + index * (slot_w + slot_gap) + slot_w,
                 visual_bounds[3],
             )
-            crop = _apply_foreground_alpha(source.crop(_clip_box(src_box, source.width, source.height)).convert("RGBA"))
+            crop = _cv_foreground_alpha_crop(source.crop(_clip_box(src_box, source.width, source.height)).convert("RGBA"))
             left, top, right, bottom, scale = _fit_inside(crop.size, slot)
             seed.alpha_composite(crop.resize((right - left, bottom - top), Image.Resampling.LANCZOS), (left, top))
             protected.append({"sourceBox": list(src_box), "pasteBox": [left, top, right, bottom], "scale": round(scale, 4)})
