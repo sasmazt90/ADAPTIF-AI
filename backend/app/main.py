@@ -13758,6 +13758,14 @@ def _constrain_completed_product_to_source_footprint(
         before = int(np.count_nonzero(alpha > 24))
         alpha = np.where(allowed > 0, alpha, 0).astype(np.uint8)
 
+        if "left" not in edge_touch and "right" not in edge_touch:
+            # Top/bottom completion must not invent lateral label/text fragments
+            # in the transparent side padding. Keep only the original footprint
+            # plus a narrow horizontal tolerance for the completed cap/bottom.
+            lateral_allowed = np.zeros(alpha.shape, dtype=bool)
+            lateral_allowed[:, max(0, x1 - pad_x) : min(alpha.shape[1], x2 + pad_x)] = True
+            alpha = np.where(lateral_allowed | (full_original > 24), alpha, 0).astype(np.uint8)
+
         # Product completion may invent a narrow detached neck/cap above a
         # package when the real asset only needs a smooth continuation. Generated
         # edge pixels must stay consistent with the original product footprint.
