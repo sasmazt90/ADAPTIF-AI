@@ -729,13 +729,26 @@ def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis)
     """Detect the main product/visual region without trusting over-wide analysis boxes."""
     def package_label_expanded_box() -> tuple[tuple[int, int, int, int] | None, int]:
         package_label_candidates: list[tuple[int, int, int, int]] = []
-        for layer in analysis.marketing_text_layers:
+        candidate_layers = [
+            *getattr(analysis, "text_layers", []),
+            *getattr(analysis, "marketing_text_layers", []),
+        ]
+        seen_candidate_ids: set[str] = set()
+        for layer in candidate_layers:
+            layer_id = str(getattr(layer, "id", ""))
+            if layer_id and layer_id in seen_candidate_ids:
+                continue
+            if layer_id:
+                seen_candidate_ids.add(layer_id)
             box = _layer_box(layer, source)
             cx, cy = _box_center(box)
             rel_x = cx / max(1, source.width)
             rel_y = cy / max(1, source.height)
             area_ratio = _box_area(box) / max(1, source.width * source.height)
-            if 0.42 <= rel_x <= 0.78 and rel_y >= 0.26 and area_ratio <= 0.035:
+            role = str(getattr(layer, "role", "") or "").lower()
+            label_like_role = "label" in role or "package" in role or "product" in role
+            max_area_ratio = 0.09 if label_like_role else 0.045
+            if 0.42 <= rel_x <= 0.78 and rel_y >= 0.26 and area_ratio <= max_area_ratio:
                 package_label_candidates.append(box)
         label_union = _union_boxes(package_label_candidates)
         if not label_union:
