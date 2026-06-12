@@ -13669,13 +13669,106 @@ def _validate_completed_product_asset(
     }
 
 
+def _constrain_completed_product_to_source_footprint(
+    completed_product: Image.Image,
+    original_product: Image.Image,
+    paste_box: list[int],
+    edge_touch: list[str],
+) -> tuple[Image.Image, dict[str, Any]]:
+    """Keep generative product completion inside the original product footprint.
+
+    The edit model may complete the surrounding cream/background texture as if it
+    were part of the product. That must never enter the frame-ready product
+    asset. We preserve the generated product shape near truncated edges, but
+    mathematically clip it to the source product's projected footprint.
+    """
+    try:
+        import cv2
+
+        completed = completed_product.convert("RGBA")
+        original = original_product.convert("RGBA")
+        comp = np.array(completed, dtype=np.uint8)
+        alpha = comp[:, :, 3]
+        original_alpha = np.array(original.getchannel("A"), dtype=np.uint8)
+        left, top, right, bottom = [int(v) for v in paste_box]
+        full_original = np.zeros(alpha.shape, dtype=np.uint8)
+        full_original[top:bottom, left:right] = np.maximum(
+            full_original[top:bottom, left:right],
+            original_alpha,
+        )
+        ys, xs = np.where(full_original > 24)
+        if xs.size == 0 or ys.size == 0:
+            return completed, {"productFootprintConstraint": "skipped_empty_original_alpha"}
+
+        x1, x2 = int(xs.min()), int(xs.max()) + 1
+        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        footprint_w = max(1, x2 - x1)
+        footprint_h = max(1, y2 - y1)
+        pad_x = max(10, int(footprint_w * 0.18))
+        pad_y = max(10, int(footprint_h * 0.18))
+
+        allowed = np.zeros(alpha.shape, dtype=np.uint8)
+        kernel_size = max(9, min(45, min(completed.width, completed.height) // 18) | 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        allowed = cv2.dilate((full_original > 24).astype(np.uint8) * 255, kernel, iterations=1)
+
+        if "top" in edge_touch:
+            allowed[:top, max(0, x1 - pad_x) : min(alpha.shape[1], x2 + pad_x)] = 255
+        if "bottom" in edge_touch:
+            allowed[bottom:, max(0, x1 - pad_x) : min(alpha.shape[1], x2 + pad_x)] = 255
+        if "left" in edge_touch:
+            allowed[max(0, y1 - pad_y) : min(alpha.shape[0], y2 + pad_y), :left] = 255
+        if "right" in edge_touch:
+            allowed[max(0, y1 - pad_y) : min(alpha.shape[0], y2 + pad_y), right:] = 255
+
+        before = int(np.count_nonzero(alpha > 24))
+        alpha = np.where(allowed > 0, alpha, 0).astype(np.uint8)
+
+        # Remove saturated/text-like hallucinated strokes in generated regions
+        # while preserving the generated silhouette. This is a cleanup pass on
+        # the provider result, not a replacement for generative completion.
+        new_area = np.zeros(alpha.shape, dtype=bool)
+        if "top" in edge_touch:
+            new_area[:top, :] = True
+        if "bottom" in edge_touch:
+            new_area[bottom:, :] = True
+        if "left" in edge_touch:
+            new_area[:, :left] = True
+        if "right" in edge_touch:
+            new_area[:, right:] = True
+        source_rgb = np.array(original.convert("RGB"), dtype=np.uint8)
+        original_visible = original_alpha > 24
+        if np.any(original_visible):
+            median_rgb = np.median(source_rgb[original_visible], axis=0).astype(np.uint8)
+            new_visible = new_area & (alpha > 24)
+            rgb = comp[:, :, :3]
+            saturation = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
+            dark = rgb.min(axis=2) < 42
+            artifact = new_visible & ((saturation > 96) | dark)
+            if np.any(artifact):
+                rgb[artifact] = median_rgb
+                comp[:, :, :3] = rgb
+
+        comp[:, :, 3] = alpha
+        constrained = Image.fromarray(comp, "RGBA")
+        after = int(np.count_nonzero(alpha > 24))
+        return _prepare_foreground_rgba_crop(constrained), {
+            "productFootprintConstraint": "applied",
+            "productFootprintAlphaBefore": before,
+            "productFootprintAlphaAfter": after,
+            "productFootprintAllowedBox": [max(0, x1 - pad_x), max(0, y1 - pad_y), min(alpha.shape[1], x2 + pad_x), min(alpha.shape[0], y2 + pad_y)],
+        }
+    except Exception as exc:
+        return completed_product.convert("RGBA"), {"productFootprintConstraint": "failed", "productFootprintConstraintError": str(exc)[:240]}
+
+
 def render_resize_product_asset_completion(product: Image.Image, meta: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
     edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
     if not edge_touch:
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v2-multiedge-gate"
+    cache_version = b"resize-product-completion-v3-footprint-constrained"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -13785,10 +13878,12 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         rendered = rendered.resize(seed.size, Image.Resampling.LANCZOS)
     paste_box = seed_meta["productCompletionSeedPasteBox"]
     completed = _extract_product_completion_from_seed(rendered, seed, product, paste_box)
+    completed, footprint_meta = _constrain_completed_product_to_source_footprint(completed, product, paste_box, edge_touch)
     accepted, gate_meta = _validate_completed_product_asset(product, completed, paste_box, edge_touch)
     result_meta = {
         **provider_meta,
         **seed_meta,
+        **footprint_meta,
         **gate_meta,
         "productCompletionInputEdgeTouch": edge_touch,
         "productCompletionOutputSize": list(completed.size),
