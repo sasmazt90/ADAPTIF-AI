@@ -13675,7 +13675,8 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8")).hexdigest()
+    cache_version = b"resize-product-completion-v2-multiedge-gate"
+    cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
         cached_image, cached_meta = cached
@@ -13795,7 +13796,6 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     }
     if not accepted:
         result = product.convert("RGBA")
-        _RESIZE_PRODUCT_COMPLETION_CACHE[cache_key] = (result.copy(), result_meta.copy())
         return result, result_meta
     if len(_RESIZE_PRODUCT_COMPLETION_CACHE) > 8:
         _RESIZE_PRODUCT_COMPLETION_CACHE.clear()
