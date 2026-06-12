@@ -172,6 +172,16 @@ def _product_only_alpha_crop(
         if np.any(saturated_edge_artifacts):
             alpha[saturated_edge_artifacts] = 0
             meta["productOnlyEdgeArtifactScrub"] = True
+        upper = alpha[: max(1, int(crop_h * 0.58)), :]
+        column_coverage = np.sum(upper > 32, axis=0)
+        threshold = max(8, int(upper.shape[0] * 0.24))
+        valid_columns = np.where(column_coverage > threshold)[0]
+        if valid_columns.size:
+            product_left = max(0, int(valid_columns[0]) - max(8, int(crop_w * 0.10)))
+            if product_left > 0 and crop_w - product_left >= max(18, int(crop_w * 0.45)):
+                extracted = extracted.crop((product_left, 0, crop_w, crop_h))
+                alpha = alpha[:, product_left:crop_w]
+                meta["productOnlyLeftTrimFromUpperSilhouette"] = [product_left, 0, crop_w, crop_h]
         binary = (alpha > 24).astype(np.uint8)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
