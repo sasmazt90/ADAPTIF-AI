@@ -930,6 +930,25 @@ def _partition_resize_layers(
     product_label: list[tuple[int, int, int, int]] = []
     visual_area = max(1, _box_area(visual_box))
 
+    def is_product_label_layer(layer: Any) -> bool:
+        role = str(getattr(layer, "role", "") or "").lower()
+        text = str(getattr(layer, "original_text", "") or "").lower()
+        notes = str(getattr(layer, "notes", "") or "").lower()
+        descriptor = f"{role} {text} {notes}"
+        return (
+            "product_label" in role
+            or "package_label" in role
+            or "packaging_label" in role
+            or "label_text" in role
+            or "product label" in descriptor
+            or "packaging label" in descriptor
+        )
+
+    def append_product_label_box(box: tuple[int, int, int, int]) -> None:
+        if any(_box_overlap(box, existing) / max(1, min(_box_area(box), _box_area(existing))) > 0.70 for existing in product_label):
+            return
+        product_label.append(box)
+
     def is_trust_badge_candidate(box: tuple[int, int, int, int], *, text: str = "", notes: str = "", role: str = "") -> bool:
         cx, cy = _box_center(box)
         box_w = max(1, box[2] - box[0])
@@ -964,12 +983,20 @@ def _partition_resize_layers(
             if cx >= w * 0.74 and raw_box[0] >= visual_box[0] + (visual_box[2] - visual_box[0]) * 0.42:
                 secondary.append(box)
             else:
-                product_label.append(raw_box)
+                append_product_label_box(raw_box)
             continue
         if cx < visual_box[0] or cx < w * 0.48:
             primary.append(box)
         else:
             secondary.append(box)
+    for layer in analysis.text_layers:
+        if not is_product_label_layer(layer):
+            continue
+        raw_box = _layer_box(layer, source)
+        raw_cx, raw_cy = _box_center(raw_box)
+        overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
+        if overlap_visual > 0.18 or (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]):
+            append_product_label_box(raw_box)
     for layer in analysis.logo_layers:
         box = _layer_box(layer, source)
         overlap_visual = _box_overlap(box, visual_box) / max(1, _box_area(box))
@@ -978,7 +1005,7 @@ def _partition_resize_layers(
         # A large or heavily visual-overlapping "logo" is usually text printed
         # on a product/person region, not a floating brand mark to relocate.
         if overlap_visual > 0.36 or box_h > h * 0.24 or box_w > w * 0.42:
-            product_label.append(box)
+            append_product_label_box(box)
             continue
         if is_trust_badge_candidate(box, notes=str(getattr(layer, "notes", "")), role=str(getattr(layer, "role", ""))):
             trust_badge.append(box)
@@ -1696,6 +1723,7 @@ def _product_only_foreground_crop(
     source_box: tuple[int, int, int, int],
     *,
     forbidden_source_boxes: list[tuple[int, int, int, int]] | None = None,
+    protected_source_boxes: list[tuple[int, int, int, int]] | None = None,
 ) -> tuple[Image.Image, tuple[int, int, int, int], dict[str, Any]]:
     """Extract a product-only RGBA crop and mathematically remove floating raster fragments.
 
@@ -1711,6 +1739,7 @@ def _product_only_foreground_crop(
         "productAlphaMode": "segmentation_minus_floating_layers",
         "productAlphaSourceBox": list(source_box),
         "productAlphaForbiddenBoxCount": len(forbidden_source_boxes or []),
+        "productAlphaProtectedBoxCount": len(protected_source_boxes or []),
     }
     try:
         import cv2
@@ -1744,6 +1773,15 @@ def _product_only_foreground_crop(
         sx1, sy1, sx2, sy2 = source_box
         forbidden = np.zeros((h, w), dtype=np.uint8)
         for box in forbidden_source_boxes or []:
+            protected_overlap = max(
+                (
+                    _box_overlap(box, protected_box) / max(1, min(_box_area(box), _box_area(protected_box)))
+                    for protected_box in protected_source_boxes or []
+                ),
+                default=0.0,
+            )
+            if protected_overlap >= 0.35:
+                continue
             ix1 = max(sx1, box[0])
             iy1 = max(sy1, box[1])
             ix2 = min(sx2, box[2])
@@ -1760,6 +1798,30 @@ def _product_only_foreground_crop(
             )
             forbidden = cv2.dilate(forbidden, kernel, iterations=1)
             alpha[forbidden > 0] = 0
+
+        protected_locals: list[tuple[int, int, int, int]] = []
+        for box in protected_source_boxes or []:
+            ix1 = max(sx1, box[0])
+            iy1 = max(sy1, box[1])
+            ix2 = min(sx2, box[2])
+            iy2 = min(sy2, box[3])
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            protected_locals.append((ix1 - sx1, iy1 - sy1, ix2 - sx1, iy2 - sy1))
+        protected_union = _union_boxes(protected_locals)
+        if protected_union:
+            px1, _py1, px2, _py2 = protected_union
+            protected_w = max(1, px2 - px1)
+            protected_cx = (px1 + px2) / 2.0
+            corridor_half = max(int(protected_w * 1.18), int(w * 0.20), 18)
+            gx1 = max(0, int(round(protected_cx - corridor_half)))
+            gx2 = min(w, int(round(protected_cx + corridor_half)))
+            if gx2 > gx1 and (gx2 - gx1) < w * 0.92:
+                guard = np.zeros((h, w), dtype=np.uint8)
+                guard[:, gx1:gx2] = 255
+                guard = cv2.GaussianBlur(guard, (0, 0), sigmaX=1.2, sigmaY=1.2)
+                alpha[guard <= 8] = 0
+                meta["productAlphaProtectedCorridor"] = [gx1, 0, gx2, h]
 
         # Keep only product-scale connected components. Detached logos/text and
         # cream-background flakes are rejected here even if the raw alpha kept them.
@@ -3569,6 +3631,15 @@ def build_wide_to_portrait_outpaint_layout_seed(
         raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
         if (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]) or raw_overlap_visual > 0.58:
             strict_product_label_boxes.append(raw_box)
+    for layer in analysis.text_layers:
+        role = str(getattr(layer, "role", "") or "").lower()
+        if "product_label" not in role and "package_label" not in role and "label_text" not in role:
+            continue
+        raw_box = _layer_box(layer, source)
+        raw_cx, raw_cy = _box_center(raw_box)
+        raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
+        if (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]) or raw_overlap_visual > 0.18:
+            strict_product_label_boxes.append(raw_box)
     for layer in analysis.logo_layers:
         raw_box = _layer_box(layer, source)
         raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
@@ -4140,6 +4211,15 @@ def composite_wide_creative_director_relayout(
         raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
         if (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]) or raw_overlap_visual > 0.58:
             strict_product_label_boxes.append(raw_box)
+    for layer in analysis.text_layers:
+        role = str(getattr(layer, "role", "") or "").lower()
+        if "product_label" not in role and "package_label" not in role and "label_text" not in role:
+            continue
+        raw_box = _layer_box(layer, source)
+        raw_cx, raw_cy = _box_center(raw_box)
+        raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
+        if (visual_box[0] <= raw_cx <= visual_box[2] and visual_box[1] <= raw_cy <= visual_box[3]) or raw_overlap_visual > 0.18:
+            strict_product_label_boxes.append(raw_box)
     for layer in analysis.logo_layers:
         raw_box = _layer_box(layer, source)
         raw_overlap_visual = _box_overlap(raw_box, visual_box) / max(1, _box_area(raw_box))
@@ -4685,6 +4765,7 @@ def composite_wide_creative_director_relayout(
             source,
             meaningful_visuals[0],
             forbidden_source_boxes=visual_alpha_cut_boxes,
+            protected_source_boxes=product_label_boxes,
         )
         if product_foreground_meta.get("productAlphaRejected") is None:
             product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
