@@ -4389,6 +4389,12 @@ def build_creative_director_resize_plan(
         fallback["allowGuides"] = True
         fallback["validationNotes"] = ["forced_display_skyscraper_hard_grid"]
         return fallback
+    if not display_placement and width / max(1, height) < 0.82:
+        fallback["allowLogo"] = False
+        fallback["allowCta"] = False
+        fallback["allowGuides"] = False
+        fallback["validationNotes"] = ["forced_social_portrait_hard_grid"]
+        return fallback
     ai_plan = _request_ai_creative_director_plan(
         width=width,
         height=height,

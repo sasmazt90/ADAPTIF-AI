@@ -13758,6 +13758,62 @@ def _constrain_completed_product_to_source_footprint(
         before = int(np.count_nonzero(alpha > 24))
         alpha = np.where(allowed > 0, alpha, 0).astype(np.uint8)
 
+        # Product completion may invent a narrow detached neck/cap above a
+        # package when the real asset only needs a smooth continuation. Generated
+        # edge pixels must stay consistent with the original product footprint.
+        if "top" in edge_touch and top > 0:
+            source_band_h = max(4, min(bottom - top, completed.height // 18))
+            source_band = full_original[top : min(bottom, top + source_band_h), :]
+            source_col_counts = np.count_nonzero(source_band > 24, axis=0)
+            source_cols = np.where(source_col_counts >= max(1, int(source_band_h * 0.12)))[0]
+            if source_cols.size >= 4:
+                source_left, source_right = int(source_cols.min()), int(source_cols.max()) + 1
+                source_width = max(1, source_right - source_left)
+                generated_top = (alpha[:top, :] > 24).astype(np.uint8)
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(generated_top, 8)
+                removed_top = 0
+                for label in range(1, count):
+                    gx = int(stats[label, cv2.CC_STAT_LEFT])
+                    gy = int(stats[label, cv2.CC_STAT_TOP])
+                    gw = int(stats[label, cv2.CC_STAT_WIDTH])
+                    gh = int(stats[label, cv2.CC_STAT_HEIGHT])
+                    if gw <= 0 or gh <= 0:
+                        continue
+                    overlap_x = max(0, min(gx + gw, source_right) - max(gx, source_left))
+                    overlap_ratio = overlap_x / max(1, gw)
+                    too_narrow = gw < source_width * 0.52
+                    poorly_aligned = overlap_ratio < 0.42
+                    high_protrusion = gy < max(1, int(top * 0.42))
+                    if too_narrow or poorly_aligned or (high_protrusion and gw < source_width * 0.72):
+                        alpha[:top, :][labels == label] = 0
+                        removed_top += 1
+                if removed_top:
+                    comp[:, :, 3] = alpha
+
+        if "bottom" in edge_touch and bottom < alpha.shape[0]:
+            source_band_h = max(4, min(bottom - top, completed.height // 18))
+            source_band = full_original[max(top, bottom - source_band_h) : bottom, :]
+            source_col_counts = np.count_nonzero(source_band > 24, axis=0)
+            source_cols = np.where(source_col_counts >= max(1, int(source_band_h * 0.12)))[0]
+            if source_cols.size >= 4:
+                source_left, source_right = int(source_cols.min()), int(source_cols.max()) + 1
+                source_width = max(1, source_right - source_left)
+                generated_bottom = (alpha[bottom:, :] > 24).astype(np.uint8)
+                count, labels, stats, _ = cv2.connectedComponentsWithStats(generated_bottom, 8)
+                removed_bottom = 0
+                for label in range(1, count):
+                    gx = int(stats[label, cv2.CC_STAT_LEFT])
+                    gw = int(stats[label, cv2.CC_STAT_WIDTH])
+                    if gw <= 0:
+                        continue
+                    overlap_x = max(0, min(gx + gw, source_right) - max(gx, source_left))
+                    overlap_ratio = overlap_x / max(1, gw)
+                    if gw < source_width * 0.48 or overlap_ratio < 0.35:
+                        alpha[bottom:, :][labels == label] = 0
+                        removed_bottom += 1
+                if removed_bottom:
+                    comp[:, :, 3] = alpha
+
         # Remove saturated/text-like hallucinated strokes in generated regions
         # while preserving the generated silhouette. This is a cleanup pass on
         # the provider result, not a replacement for generative completion.
@@ -13805,7 +13861,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v7-partial-edge-salvage"
+    cache_version = b"resize-product-completion-v8-protrusion-filter"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
