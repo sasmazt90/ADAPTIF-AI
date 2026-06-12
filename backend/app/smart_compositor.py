@@ -54,6 +54,40 @@ def _rgba_alpha_edge_touch(rgba: Image.Image, *, threshold: int = 24) -> list[st
         return []
 
 
+def _source_box_edge_touch(
+    clean_box: tuple[int, int, int, int],
+    source_box: tuple[int, int, int, int],
+    *,
+    ratio: float = 0.035,
+    min_px: int = 8,
+) -> list[str]:
+    """Detect truncation against the source product crop before frame placement.
+
+    Alpha trimming can remove edge evidence after a product is isolated. The
+    resize compositor still needs to know whether the clean product asset was
+    clipped by its original visual crop so completion happens before layout.
+    """
+    try:
+        sx1, sy1, sx2, sy2 = source_box
+        cx1, cy1, cx2, cy2 = clean_box
+        source_w = max(1, sx2 - sx1)
+        source_h = max(1, sy2 - sy1)
+        threshold_x = max(min_px, int(round(source_w * ratio)))
+        threshold_y = max(min_px, int(round(source_h * ratio)))
+        touches: list[str] = []
+        if cy1 <= sy1 + threshold_y:
+            touches.append("top")
+        if cy2 >= sy2 - threshold_y:
+            touches.append("bottom")
+        if cx1 <= sx1 + threshold_x:
+            touches.append("left")
+        if cx2 >= sx2 - threshold_x:
+            touches.append("right")
+        return touches
+    except Exception:
+        return []
+
+
 def _resize_provider_must_not_see_brand_layers(placement_id: str | None) -> bool:
     """AI background/outpaint providers should never rasterize brand marks for social placements."""
     return not _placement_preserves_creative_brand_layers(placement_id)
@@ -4999,13 +5033,18 @@ def composite_wide_creative_director_relayout(
         )
         if product_foreground_meta.get("productAlphaRejected") is None:
             product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
-            product_edge_touch = _rgba_alpha_edge_touch(product_foreground_source)
+            alpha_edge_touch = _rgba_alpha_edge_touch(product_foreground_source)
+            source_edge_touch = _source_box_edge_touch(product_foreground_source_box, meaningful_visuals[0])
+            product_edge_touch = list(dict.fromkeys([*alpha_edge_touch, *source_edge_touch]))
             product_foreground_meta["productAlphaEdgeTouch"] = product_edge_touch
+            product_foreground_meta["productAlphaRasterEdgeTouch"] = alpha_edge_touch
+            product_foreground_meta["productAlphaSourceEdgeTouch"] = source_edge_touch
             product_completion_required = bool(product_edge_touch)
             product_foreground_ready_for_frame = not product_completion_required
             print(
                 f"[resize_e2e] product_asset_alpha_ready size={product_foreground_source.width}x{product_foreground_source.height} "
-                f"edgeTouch={','.join(product_edge_touch) or 'none'} cutoutProvider={product_foreground_meta.get('productCutoutProvider')}",
+                f"edgeTouch={','.join(product_edge_touch) or 'none'} sourceEdgeTouch={','.join(source_edge_touch) or 'none'} "
+                f"cutoutProvider={product_foreground_meta.get('productCutoutProvider')}",
                 flush=True,
             )
             if product_completion_renderer is not None and product_edge_touch:
