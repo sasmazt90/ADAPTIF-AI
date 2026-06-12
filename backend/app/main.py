@@ -17535,223 +17535,87 @@ def draw_resize_display_copy_stack(draw: ImageDraw.ImageDraw, block: TextBlock) 
     if not spans:
         return
 
-    orphan_tokens = {
-        "&",
-        "+",
-        "/",
-        "and",
-        "or",
-        "of",
-        "for",
-        "to",
-        "in",
-        "a",
-        "an",
-        "the",
-        "ve",
-        "veya",
-        "ile",
-        "için",
-        "icin",
-        "de",
-        "da",
-    }
-
-    def is_orphan_token(text: str) -> bool:
-        clean = text.strip().strip(".,;:!?()[]{}").lower()
-        return clean in orphan_tokens or len(clean) <= 1
-
-    def token_width(token: dict[str, Any]) -> float:
-        return float(token["width"])
-
-    def line_width(tokens: list[dict[str, Any]]) -> float:
-        if not tokens:
-            return 0.0
-        return sum(token_width(token) for token in tokens) + sum(float(token["space"]) for token in tokens[:-1])
-
-    def repair_orphan_lines(lines: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
-        repaired = [list(line) for line in lines if line]
-        index = 1
-        while index < len(repaired):
-            while repaired[index] and is_orphan_token(str(repaired[index][0]["text"])) and repaired[index - 1]:
-                moved = repaired[index - 1].pop()
-                repaired[index].insert(0, moved)
-                if not repaired[index - 1]:
-                    repaired.pop(index - 1)
-                    index = max(1, index - 1)
-                    break
-                if line_width(repaired[index]) <= max_width:
-                    break
-            index += 1
-        return [line for line in repaired if line]
-
-    def build_lines(font_size: int) -> tuple[list[list[dict[str, Any]]], int]:
-        lines: list[list[dict[str, Any]]] = []
-        current: list[dict[str, Any]] = []
-        current_width = 0.0
-        line_height = max(font_size + 2, int(round(font_size * 1.22)))
-
-        for span in spans:
-            text = str(span.get("translatedText") or span.get("sourceText") or "").strip()
-            if not text:
-                continue
-            style = dict(span.get("style") or {})
-            style["fontSize"] = font_size
-            font_weight = int(style.get("fontWeight") or 700)
-            font = get_font(
-                font_size,
-                bold=font_weight >= 700,
-                category=str(style.get("fontCategory") or "sans-serif"),
-                weight=font_weight,
-            )
-            fill = style.get("color") or "#111111"
-            bg = style.get("backgroundColor") if style.get("hasTextBackground") else None
-            for word in [part for part in text.split() if part]:
-                try:
-                    word_width = draw.textlength(word, font=font)
-                    space_width = draw.textlength(" ", font=font)
-                except AttributeError:
-                    word_width = text_width(draw, word, font)
-                    space_width = text_width(draw, " ", font)
-                addition = word_width if not current else word_width + space_width
-                if current and current_width + addition > max_width:
-                    lines.append(current)
-                    current = []
-                    current_width = 0.0
-                    addition = word_width
-                current.append(
-                    {
-                        "text": word,
-                        "font": font,
-                        "fill": fill,
-                        "background": bg,
-                        "width": word_width,
-                        "space": space_width,
-                        "fontSize": font_size,
-                    }
-                )
-                current_width += addition
-            if span.get("forceBreakAfter") and current:
-                lines.append(current)
-                current = []
-                current_width = 0.0
-        if current:
-            lines.append(current)
-        return repair_orphan_lines(lines), line_height
-
-    preferred_size = max(8, int(block.font_size_estimate or 16))
-    font_size = preferred_size
-    lines: list[list[dict[str, Any]]] = []
+    # Adaptif font size (Compositor'dan hesaplanmış gelir)
+    font_size = block.font_size_estimate or 16
     line_height = max(font_size + 2, int(round(font_size * 1.22)))
-    max_candidate = max(8, min(72, int(getattr(block, "resize_max_font_size", 42) or 42)))
-    min_candidate = max(6, int(getattr(block, "resize_min_font_size", 8) or 8))
-    target_fill = float(getattr(block, "resize_target_fill", 0.72) or 0.72)
-    preferred_line_count = max(
-        1,
-        int(getattr(block, "resize_preferred_line_count", 0) or 0),
-        len([line for line in (block.line_texts or []) if str(line).strip()]),
-    )
-    readable_min = max(
-        min_candidate,
-        min(
-            max_candidate,
-            int(
-                getattr(
-                    block,
-                    "resize_min_readable_font_size",
-                    max(10, round(min(max_width, max_height) * 0.035)),
-                )
-                or 10
-            ),
-        ),
-    )
-    best_fit: tuple[int, list[list[dict[str, Any]]], int, float] | None = None
 
-    # First priority: preserve the original line rhythm while the copy remains readable.
-    for candidate in range(max_candidate, readable_min - 1, -1):
-        candidate_lines, candidate_line_height = build_lines(candidate)
-        if (
-            candidate_lines
-            and len(candidate_lines) == preferred_line_count
-            and len(candidate_lines) * candidate_line_height <= max_height
-        ):
-            widest = max((line_width(line) for line in candidate_lines), default=0.0)
-            best_fit = (candidate, candidate_lines, candidate_line_height, widest / max(1, max_width))
-            break
+    try:
+        from PIL import ImageFont
+        font = ImageFont.truetype("arialbd.ttf", font_size)
+    except Exception:
+        font = ImageFont.load_default()
 
-    # Second priority: avoid adding extra line breaks if exact preservation is impossible.
-    if best_fit is None:
-        for candidate in range(max_candidate, readable_min - 1, -1):
-            candidate_lines, candidate_line_height = build_lines(candidate)
-            if (
-                candidate_lines
-                and len(candidate_lines) <= preferred_line_count
-                and len(candidate_lines) * candidate_line_height <= max_height
-            ):
-                widest = max((line_width(line) for line in candidate_lines), default=0.0)
-                best_fit = (candidate, candidate_lines, candidate_line_height, widest / max(1, max_width))
-                break
+    # 1. Metni spans ve \n karakterlerine göre satırlara ayır.
+    lines_to_draw = []
+    current_line = []
+    current_width = 0.0
 
-    # Final fallback: if preserving line count makes the copy unreadable, allow more lines
-    # before shrinking below the readable threshold.
-    for candidate in range(max_candidate, min_candidate - 1, -1):
-        if best_fit is not None:
-            break
-        candidate_lines, candidate_line_height = build_lines(candidate)
-        if candidate_lines and len(candidate_lines) * candidate_line_height <= max_height:
-            widest = max((line_width(line) for line in candidate_lines), default=0.0)
-            fill_ratio = widest / max(1, max_width)
-            if best_fit is None:
-                best_fit = (candidate, candidate_lines, candidate_line_height, fill_ratio)
-            if fill_ratio >= target_fill:
-                best_fit = (candidate, candidate_lines, candidate_line_height, fill_ratio)
-                break
-    if best_fit is not None:
-        font_size, lines, line_height, _ = best_fit
-    if not lines:
-        lines, line_height = build_lines(font_size)
+    for span in spans:
+        raw_text = str(span.get("translatedText") or span.get("sourceText") or "").strip()
+        if not raw_text:
+            continue
+        
+        # Metni orijinal satırlarına göre böl
+        hard_lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+        
+        for hard_idx, hard_line in enumerate(hard_lines):
+            words = hard_line.split()
+            for word in words:
+                try:
+                    word_w = font.getlength(word + " ")
+                except Exception:
+                    word_w = len(word + " ") * font_size * 0.58
+                
+                # Eğer kelime max_width'i aşıyorsa mecburen alt satıra kır (Word-wrap fallback)
+                if current_width + word_w > max_width and current_line:
+                    lines_to_draw.append((current_line, span))
+                    current_line = [word]
+                    current_width = word_w
+                else:
+                    current_line.append(word)
+                    current_width += word_w
+            
+            # Her hard line'ın sonunda satırı kesinlikle kapat (Satır sayısı korunumu)
+            if current_line:
+                lines_to_draw.append((current_line, span))
+                current_line = []
+                current_width = 0.0
 
-    y = box[1]
-    for line in lines:
-        x = box[0]
-        line_width = int(round(sum(float(token["width"]) for token in line) + sum(float(token["space"]) for token in line[:-1])))
-        ribbon_background = next((token.get("background") for token in line if token.get("background")), None)
-        if ribbon_background:
-            text_boxes = []
-            probe_x = box[0]
-            for token_index, token in enumerate(line):
-                if token_index > 0:
-                    probe_x += int(round(float(token["space"])))
-                text_boxes.append(draw.textbbox((probe_x, y), str(token["text"]), font=token["font"]))
-                probe_x += int(round(float(token["width"])))
-            if text_boxes:
-                ribbon_top = min(item[1] for item in text_boxes)
-                ribbon_bottom = max(item[3] for item in text_boxes)
-            else:
-                ribbon_top = y
-                ribbon_bottom = y + line_height
-            pad_y = max(1, min(8, int(round(font_size * 0.15))))
-            ribbon_left = box[0]
-            ribbon_right = min(box[2], box[0] + line_width)
+    if current_line:
+        lines_to_draw.append((current_line, spans[-1] if spans else {}))
+
+    # 2. Tuvale Çizim
+    start_y = box[1]
+    for idx, (line_words, span) in enumerate(lines_to_draw):
+        line_text = " ".join(line_words)
+        try:
+            text_w = font.getlength(line_text)
+        except Exception:
+            text_w = len(line_text) * font_size * 0.58
+            
+        if block.align == "center":
+            x = box[0] + (max_width - text_w) / 2
+        else:
+            x = box[0]
+            
+        y = start_y + idx * line_height
+        
+        # Ribbon / Vurgu Bandı
+        style = span.get("style", {})
+        has_bg = style.get("hasTextBackground")
+        bg_color = style.get("backgroundColor")
+        text_color = style.get("color", "#111111")
+        
+        if has_bg and bg_color:
+            pad_y = max(4, int(font_size * 0.15))
+            pad_x = max(6, int(font_size * 0.25))
+            # Ribbon'ın satır metnini tam sarması için obeziteyi (aşırı büyük draw) engelledik
             draw.rectangle(
-                (
-                    max(0, ribbon_left),
-                    max(0, ribbon_top - pad_y),
-                    min(box[2], ribbon_right),
-                    max(ribbon_top + 1, ribbon_bottom + pad_y),
-                ),
-                fill=ribbon_background,
+                [x - pad_x, y - pad_y, x + text_w + pad_x, y + line_height + pad_y],
+                fill=bg_color
             )
-        for token_index, token in enumerate(line):
-            if token_index > 0:
-                x += int(round(float(token["space"])))
-            text = str(token["text"])
-            font = token["font"]
-            left, top, right, bottom = draw.textbbox((x, y), text, font=font)
-            draw.text((x, y), text, fill=token["fill"], font=font)
-            x += int(round(float(token["width"])))
-        y += line_height
-
+            
+        draw.text((x, y), line_text, fill=text_color, font=font)
 
 def draw_v5_numeric_bypass_fallback(draw: ImageDraw.ImageDraw, block: TextBlock) -> None:
     box = tuple(int(value) for value in block.bbox)
