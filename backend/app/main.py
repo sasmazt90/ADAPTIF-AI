@@ -13556,11 +13556,16 @@ def _product_completion_geometry_failures(
     def check_horizontal_edge(edge: str, region: np.ndarray, source_width: float, source_center: float, offset_x: int) -> None:
         if region.size == 0 or not np.any(region > 24):
             return
-        ys, _xs = np.where(region > 24)
+        ys, xs = np.where(region > 24)
         extension_h = int(ys.max() - ys.min() + 1)
         max_extension = max(28, int(original_h * float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MAX_EDGE_EXTENSION_RATIO", "0.34"))))
         if extension_h > max_extension:
             failures.append(f"{edge}:extension_height_{extension_h}>{max_extension}")
+        bbox_area = max(1, int((ys.max() - ys.min() + 1) * (xs.max() - xs.min() + 1)))
+        density = float(xs.size) / float(bbox_area)
+        min_density = float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MIN_EDGE_DENSITY", "0.38"))
+        if density < min_density:
+            failures.append(f"{edge}:sparse_alpha_density_{density:.2f}<{min_density:.2f}")
         min_component_area = max(18, int(np.count_nonzero(region > 24) * 0.035))
         components = _significant_alpha_components(region > 24, min_area=min_component_area)
         if components > 1:
@@ -13958,7 +13963,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v9-geometry-gate"
+    cache_version = b"resize-product-completion-v10-dense-edge-gate"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
