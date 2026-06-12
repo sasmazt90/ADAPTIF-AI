@@ -1375,7 +1375,7 @@ def _partition_resize_layers(
     parts: dict[str, list[tuple[int, int, int, int]]] = {
         "brand": [],
         "primary": [],
-        "rtb": [],
+        "secondary": [],
         "trust_badge": [],
     }
     visual_cy = (visual_box[1] + visual_box[3]) / 2
