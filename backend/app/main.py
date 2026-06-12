@@ -117,6 +117,7 @@ except ImportError:
 REPO_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(REPO_ROOT / ".env.local")
 load_dotenv(REPO_ROOT / ".env")
+_RESIZE_PRODUCT_COMPLETION_CACHE: dict[str, tuple[Image.Image, dict[str, Any]]] = {}
 
 SUPPORTED_UPLOAD_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg", ".pdf", ".zip"}
 IMAGE_EXTENSIONS = {".png", ".webp", ".jpg", ".jpeg"}
@@ -13477,6 +13478,13 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
     if not edge_touch:
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
+    cache_file = io.BytesIO()
+    product.convert("RGBA").save(cache_file, format="PNG")
+    cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8")).hexdigest()
+    cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
+    if cached is not None:
+        cached_image, cached_meta = cached
+        return cached_image.copy(), {**cached_meta, "productCompletionCache": "hit"}
     seed, seed_meta = build_resize_product_completion_seed(product, edge_touch)
     prompt = build_resize_product_completion_prompt(edge_touch)
     openai_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_PRODUCT_COMPLETION", "0").strip().lower() in {"1", "true", "yes", "on"}
@@ -13583,12 +13591,17 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     paste_box = seed_meta["productCompletionSeedPasteBox"]
     completed.alpha_composite(product.convert("RGBA"), (paste_box[0], paste_box[1]))
     completed = _prepare_foreground_rgba_crop(completed)
-    return completed, {
+    result_meta = {
         **provider_meta,
         **seed_meta,
         "productCompletionInputEdgeTouch": edge_touch,
         "productCompletionOutputSize": list(completed.size),
+        "productCompletionCache": "miss",
     }
+    if len(_RESIZE_PRODUCT_COMPLETION_CACHE) > 8:
+        _RESIZE_PRODUCT_COMPLETION_CACHE.clear()
+    _RESIZE_PRODUCT_COMPLETION_CACHE[cache_key] = (completed.copy(), result_meta.copy())
+    return completed, result_meta
 
 
 def smart_reframe_text_style_to_block_color(style: TextStyle | None) -> str:
@@ -13979,6 +13992,7 @@ def render_smart_reframe_image(
     analysis: VisualAnalysis,
     *,
     allow_provider_outpaint: bool = True,
+    allow_product_completion: bool = True,
 ) -> tuple[Image.Image, dict[str, Any]]:
     text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
     return render_deterministic_compositor(
@@ -13991,7 +14005,7 @@ def render_smart_reframe_image(
         draw_text=draw_fitted_localize_v2_text,
         outpaint_renderer=render_clean_base_outpaint_for_compositor if allow_provider_outpaint else None,
         fallback_renderer=render_nonblur_contain_placeholder,
-        product_completion_renderer=render_resize_product_asset_completion if allow_provider_outpaint else None,
+        product_completion_renderer=render_resize_product_asset_completion if allow_product_completion else None,
     )
 
 
@@ -18216,6 +18230,7 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
                     plan,
                     source_entry["visual_analysis"],
                     allow_provider_outpaint=allow_provider_outpaint,
+                    allow_product_completion=True,
                 )
                 render_meta = {
                     **render_meta,
