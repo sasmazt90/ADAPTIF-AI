@@ -2036,7 +2036,8 @@ def _product_only_foreground_crop(
         elif protected_union:
             meta["productAlphaProtectedCorridor"] = "skipped_non_rectangular_product_alpha"
 
-        if protected_union:
+        provider_cutout_succeeded = bool(meta.get("productCutoutProvider")) and not meta.get("productCutoutError")
+        if protected_union and (not provider_cutout_succeeded or meta.get("productAlphaFallback") == "label_seeded_grabcut_after_provider_failure"):
             try:
                 meta["productAlphaFallbackRefinementInput"] = meta.get("productAlphaFallback") or "label_seeded_grabcut"
                 rgb = np.array(crop.convert("RGB"), dtype=np.uint8)
