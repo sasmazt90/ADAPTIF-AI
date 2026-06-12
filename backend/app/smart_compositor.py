@@ -1861,10 +1861,18 @@ def _product_only_foreground_crop(
     try:
         import cv2
 
-        # Render's CPU/memory budget cannot safely load local torch/rembg for
-        # every resize request. Use deterministic CV by default; opt into
-        # rembg/provider explicitly when the service tier is sized for it.
-        segmentation_backend = os.getenv("ADAPTIFAI_PRODUCT_SEGMENTATION_BACKEND", "cv2").strip().lower()
+        # Product extraction is an asset-preparation stage, not a placement
+        # shortcut. Prefer an external cutout provider when available so Render
+        # does not load local torch/rembg during E2E resize requests.
+        segmentation_backend = os.getenv("ADAPTIFAI_PRODUCT_SEGMENTATION_BACKEND", "").strip().lower()
+        if not segmentation_backend:
+            segmentation_backend = "replicate" if os.getenv("REPLICATE_API_TOKEN", "").strip() else "cv2"
+        heavy_local_fallback = os.getenv("ADAPTIFAI_ALLOW_HEAVY_LOCAL_PRODUCT_SEGMENTATION", "0").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         cache_key = (id(source), source_box, segmentation_backend)
         cached = _PRODUCT_ALPHA_BASE_CACHE.get(cache_key)
         if cached is not None:
@@ -1878,13 +1886,13 @@ def _product_only_foreground_crop(
                 meta.update(cutout_meta)
             if extracted is not None:
                 extracted = extracted.convert("RGBA")
-            elif segmentation_backend in {"rembg", "u2net", "isnet", "auto", "1", "true", "yes", "on", "provider"}:
+            elif heavy_local_fallback and segmentation_backend in {"rembg", "u2net", "isnet", "auto", "1", "true", "yes", "on", "provider"}:
                 extracted = _apply_foreground_alpha(crop).convert("RGBA")
             else:
                 extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
             raw_alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
             raw_ratio = float(np.count_nonzero(raw_alpha > 16)) / max(1, raw_alpha.size)
-            if raw_ratio < 0.12:
+            if raw_ratio < 0.12 and heavy_local_fallback:
                 # Lightweight CV often sees only printed labels on white packaging.
                 # If the product body did not survive, try the real matting path once.
                 extracted = _apply_foreground_alpha(crop).convert("RGBA")
@@ -2000,40 +2008,6 @@ def _product_only_foreground_crop(
         keep = cv2.morphologyEx((keep > 12).astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel, iterations=1)
         keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=1.0, sigmaY=1.0)
         visible_ratio = float(np.count_nonzero(keep > 16)) / crop_area
-        if protected_union and visible_ratio > 0.66:
-            px1, _py1, px2, _py2 = protected_union
-            protected_w = max(1, px2 - px1)
-            protected_cx = (px1 + px2) / 2.0
-            body_half = max(int(protected_w * 1.08), int(w * 0.18), 22)
-            top_half = max(16, int(body_half * 0.68))
-            bottom_half = max(18, int(body_half * 0.98))
-            silhouette = np.zeros((h, w), dtype=np.uint8)
-            polygon = np.array(
-                [
-                    [max(0, int(round(protected_cx - top_half))), 0],
-                    [min(w - 1, int(round(protected_cx + top_half))), 0],
-                    [min(w - 1, int(round(protected_cx + bottom_half))), h - 1],
-                    [max(0, int(round(protected_cx - bottom_half))), h - 1],
-                ],
-                dtype=np.int32,
-            )
-            cv2.fillConvexPoly(silhouette, polygon, 255)
-            label_pad_x = max(4, int(protected_w * 0.18))
-            for px1, py1, px2, py2 in protected_locals:
-                cv2.rectangle(
-                    silhouette,
-                    (max(0, px1 - label_pad_x), max(0, py1 - max(3, h // 80))),
-                    (min(w - 1, px2 + label_pad_x), min(h - 1, py2 + max(3, h // 80))),
-                    255,
-                    thickness=-1,
-                )
-            silhouette = cv2.GaussianBlur(silhouette, (0, 0), sigmaX=1.4, sigmaY=1.4)
-            salvaged = np.minimum(keep, silhouette)
-            salvaged_ratio = float(np.count_nonzero(salvaged > 16)) / crop_area
-            if 0.12 <= salvaged_ratio < visible_ratio:
-                keep = salvaged
-                visible_ratio = salvaged_ratio
-                meta["productAlphaSalvage"] = "label_seeded_silhouette_for_rectangular_matte"
         if not (0.035 <= visible_ratio <= 0.90):
             return crop, source_box, {
                 **meta,
@@ -4889,6 +4863,8 @@ def composite_wide_creative_director_relayout(
 
     product_foreground_source: Image.Image | None = None
     product_foreground_box: tuple[int, int, int, int] | None = None
+    product_foreground_ready_for_frame = False
+    product_completion_required = False
     product_foreground_meta: dict[str, Any] = {}
     if meaningful_visuals:
         product_foreground_source, product_foreground_source_box, product_foreground_meta = _product_only_foreground_crop(
@@ -4901,6 +4877,8 @@ def composite_wide_creative_director_relayout(
             product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
             product_edge_touch = _rgba_alpha_edge_touch(product_foreground_source)
             product_foreground_meta["productAlphaEdgeTouch"] = product_edge_touch
+            product_completion_required = bool(product_edge_touch)
+            product_foreground_ready_for_frame = not product_completion_required
             if product_completion_renderer is not None and product_edge_touch:
                 try:
                     completed_product, completion_meta = product_completion_renderer(
@@ -4926,6 +4904,7 @@ def composite_wide_creative_director_relayout(
                                 "productCompletionEdgeTouchAfter": _rgba_alpha_edge_touch(product_foreground_source),
                             }
                         )
+                        product_foreground_ready_for_frame = True
                     else:
                         product_foreground_meta.update(
                             {
@@ -4935,8 +4914,14 @@ def composite_wide_creative_director_relayout(
                         )
                 except Exception as exc:
                     product_foreground_meta["productCompletionError"] = str(exc)[:300]
+            if product_completion_required and not product_foreground_ready_for_frame:
+                product_foreground_meta["productCompletionRequiredBeforePlacement"] = True
+                product_foreground_meta["productCompletionPlacementBlocked"] = True
         else:
             product_foreground_source = None
+
+    product_frame_source = product_foreground_source if product_foreground_ready_for_frame else None
+    product_frame_box = product_foreground_box if product_foreground_ready_for_frame else None
 
     if visual_completion_source is not None:
         composited.append(
@@ -4956,14 +4941,14 @@ def composite_wide_creative_director_relayout(
         composited.append(
             _paste_crop_fit(
                 output,
-                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
-                product_foreground_box or meaningful_visuals[0],
+                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
+                product_frame_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main-exact-label-overlay",
-                role="product_only_foreground_readability_overlay" if product_foreground_source else "original_visual_label_readability_overlay",
+                role="product_only_foreground_readability_overlay" if product_frame_source else "original_visual_label_readability_overlay",
                 mode="contain",
-                foreground_alpha=product_foreground_source is None,
-                alpha_cut_source_boxes=[] if product_foreground_source else visual_label_cut_boxes,
+                foreground_alpha=product_frame_source is None,
+                alpha_cut_source_boxes=[] if product_frame_source else visual_label_cut_boxes,
                 anchor_bottom_if_source_truncated=True,
             )
         )
@@ -4971,14 +4956,14 @@ def composite_wide_creative_director_relayout(
         composited.append(
             _paste_crop_fit(
                 output,
-                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
-                product_foreground_box or meaningful_visuals[0],
+                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
+                product_frame_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main-exact-foreground",
-                role="product_only_visual_exact_preserve" if product_foreground_source else "primary_visual_exact_readable_preserve",
+                role="product_only_visual_exact_preserve" if product_frame_source else "primary_visual_exact_readable_preserve",
                 mode="contain",
-                foreground_alpha=product_foreground_source is None,
-                alpha_cut_source_boxes=[] if product_foreground_source else visual_label_cut_boxes,
+                foreground_alpha=product_frame_source is None,
+                alpha_cut_source_boxes=[] if product_frame_source else visual_label_cut_boxes,
                 anchor_bottom_if_source_truncated=True,
             )
         )
@@ -4997,7 +4982,7 @@ def composite_wide_creative_director_relayout(
         use_fit_visual = plan_visual_fit_mode == "cover" or not (target_ratio < 0.78 and visual_edge_sides)
         paste_visual = _paste_crop_fit if use_fit_visual else _paste_crop_contain_limited
         visual_kwargs: dict[str, Any] = (
-            {"alpha_cut_source_boxes": [] if product_foreground_source else visual_label_cut_boxes}
+            {"alpha_cut_source_boxes": [] if product_frame_source else visual_label_cut_boxes}
             if paste_visual is _paste_crop_fit
             else {"max_scale": 3.65}
         )
@@ -5007,13 +4992,13 @@ def composite_wide_creative_director_relayout(
         composited.append(
             paste_visual(
                 output,
-                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
-                product_foreground_box or meaningful_visuals[0],
+                product_frame_source or source_for_visual_element(meaningful_visuals[0]),
+                product_frame_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main",
-                role="product_only_primary_visual" if product_foreground_source else "primary_visual_readable",
+                role="product_only_primary_visual" if product_frame_source else "primary_visual_readable",
                 anchor=plan_visual_anchor,
-                foreground_alpha=product_foreground_source is None,
+                foreground_alpha=product_frame_source is None,
                 **visual_kwargs,
             )
         )
