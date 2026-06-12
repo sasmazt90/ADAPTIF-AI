@@ -92,7 +92,7 @@ try:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
-    from app.smart_compositor import _apply_foreground_alpha, _prepare_foreground_rgba_crop, render_deterministic_compositor
+    from app.smart_compositor import _prepare_foreground_rgba_crop, render_deterministic_compositor
 except ImportError:
     from backend.app.smart_reframe import (  # type: ignore[no-redef]
         BackgroundStyle,
@@ -111,7 +111,7 @@ except ImportError:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
-    from backend.app.smart_compositor import _apply_foreground_alpha, _prepare_foreground_rgba_crop, render_deterministic_compositor  # type: ignore[no-redef]
+    from backend.app.smart_compositor import _prepare_foreground_rgba_crop, render_deterministic_compositor  # type: ignore[no-redef]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13499,6 +13499,70 @@ def _edge_strip_color_stats(image: Image.Image, edge: str, strip: int) -> tuple[
     return np.median(visible.astype(np.float32), axis=0), np.std(visible.astype(np.float32), axis=0)
 
 
+def _extract_product_completion_from_seed(
+    rendered: Image.Image,
+    seed: Image.Image,
+    product: Image.Image,
+    paste_box: list[int],
+) -> Image.Image:
+    rendered_rgb = rendered.convert("RGB")
+    seed_rgba = seed.convert("RGBA")
+    product_rgba = product.convert("RGBA")
+    rendered_np = np.array(rendered_rgb, dtype=np.uint8)
+    seed_alpha = np.array(seed_rgba.getchannel("A"), dtype=np.uint8)
+    original_mask = seed_alpha > 24
+    transparent_pixels = rendered_np[~original_mask]
+    if transparent_pixels.size:
+        matte = np.median(transparent_pixels.astype(np.float32), axis=0)
+    else:
+        corner = max(4, min(rendered_rgb.width, rendered_rgb.height) // 24)
+        corners = np.concatenate(
+            [
+                rendered_np[:corner, :corner].reshape(-1, 3),
+                rendered_np[:corner, -corner:].reshape(-1, 3),
+                rendered_np[-corner:, :corner].reshape(-1, 3),
+                rendered_np[-corner:, -corner:].reshape(-1, 3),
+            ],
+            axis=0,
+        )
+        matte = np.median(corners.astype(np.float32), axis=0)
+
+    color_delta = np.linalg.norm(rendered_np.astype(np.float32) - matte.reshape(1, 1, 3), axis=2)
+    candidate = (color_delta > 18) | original_mask
+    try:
+        import cv2
+
+        kernel_size = max(3, min(9, int(min(seed.size) * 0.012) | 1))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        candidate_u8 = (candidate.astype(np.uint8) * 255)
+        candidate_u8 = cv2.morphologyEx(candidate_u8, cv2.MORPH_CLOSE, kernel, iterations=2)
+        candidate_u8 = cv2.morphologyEx(candidate_u8, cv2.MORPH_OPEN, kernel, iterations=1)
+        count, labels, stats, _centroids = cv2.connectedComponentsWithStats((candidate_u8 > 0).astype(np.uint8), 8)
+        keep = np.zeros(candidate_u8.shape, dtype=np.uint8)
+        for label in range(1, count):
+            component = labels == label
+            if not np.any(component & original_mask):
+                continue
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            if area < max(16, int(np.count_nonzero(original_mask) * 0.002)):
+                continue
+            keep[component] = 255
+        if keep.max() == 0:
+            keep = (original_mask.astype(np.uint8) * 255)
+        keep = cv2.dilate(keep, kernel, iterations=1)
+        keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=0.85, sigmaY=0.85)
+        alpha = keep
+    except Exception:
+        alpha = Image.fromarray((candidate.astype(np.uint8) * 255), "L").filter(ImageFilter.GaussianBlur(radius=0.85))
+        alpha = np.array(alpha, dtype=np.uint8)
+
+    completed = rendered_rgb.convert("RGBA")
+    completed.putalpha(Image.fromarray(alpha, "L"))
+    left, top, _right, _bottom = [int(v) for v in paste_box]
+    completed.alpha_composite(product_rgba, (left, top))
+    return _prepare_foreground_rgba_crop(completed)
+
+
 def _validate_completed_product_asset(
     original_product: Image.Image,
     completed_product: Image.Image,
@@ -13693,10 +13757,8 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
 
     if rendered.size != seed.size:
         rendered = rendered.resize(seed.size, Image.Resampling.LANCZOS)
-    completed = _apply_foreground_alpha(rendered.convert("RGB")).convert("RGBA")
     paste_box = seed_meta["productCompletionSeedPasteBox"]
-    completed.alpha_composite(product.convert("RGBA"), (paste_box[0], paste_box[1]))
-    completed = _prepare_foreground_rgba_crop(completed)
+    completed = _extract_product_completion_from_seed(rendered, seed, product, paste_box)
     accepted, gate_meta = _validate_completed_product_asset(product, completed, paste_box, edge_touch)
     result_meta = {
         **provider_meta,
