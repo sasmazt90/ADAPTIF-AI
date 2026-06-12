@@ -82,85 +82,105 @@ def _image_data_uri(image: Image.Image, *, fmt: str = "PNG") -> str:
 
 def _replicate_product_cutout(crop: Image.Image) -> tuple[Image.Image | None, dict[str, Any]]:
     token = os.getenv("REPLICATE_API_TOKEN", "").strip()
-    model = os.getenv("REPLICATE_PRODUCT_CUTOUT_MODEL", "851-labs/background-remover").strip()
-    if not token or "/" not in model:
+    configured_model = os.getenv("REPLICATE_PRODUCT_CUTOUT_MODEL", "851-labs/background-remover").strip()
+    fallback_models = [
+        item.strip()
+        for item in os.getenv("REPLICATE_PRODUCT_CUTOUT_FALLBACK_MODELS", "lucataco/remove-bg,recraft-ai/recraft-remove-background").split(",")
+        if item.strip()
+    ]
+    models = []
+    for model in [configured_model, *fallback_models]:
+        if model and model not in models:
+            models.append(model)
+    if not token or not models:
         return None, {
             "productCutoutProvider": "replicate",
             "productCutoutSkipped": "missing_token_or_model",
         }
+    errors: list[str] = []
     try:
         import requests
 
-        owner, name = model.split("/", 1)
-        endpoint = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
-        payload = {"input": {"image": _image_data_uri(crop.convert("RGBA"))}}
         timeout = int(os.getenv("REPLICATE_PRODUCT_CUTOUT_TIMEOUT", "90"))
-        response = requests.post(
-            endpoint,
-            headers={
-                "Authorization": f"Token {token}",
-                "Content-Type": "application/json",
-                "Prefer": "wait=45",
-            },
-            json=payload,
-            timeout=timeout,
-        )
-        response.raise_for_status()
-        prediction = response.json()
-        deadline = time.time() + int(os.getenv("REPLICATE_PRODUCT_CUTOUT_POLL_TIMEOUT", "120"))
-        while prediction.get("status") not in {"succeeded", "failed", "canceled"} and time.time() < deadline:
-            poll_url = (prediction.get("urls") or {}).get("get")
-            if not poll_url:
-                break
-            time.sleep(1.5)
-            poll = requests.get(poll_url, headers={"Authorization": f"Token {token}"}, timeout=timeout)
-            poll.raise_for_status()
-            prediction = poll.json()
-        if prediction.get("status") != "succeeded":
-            return None, {
-                "productCutoutProvider": "replicate",
-                "productCutoutModel": model,
-                "productCutoutError": f"status={prediction.get('status')}; error={prediction.get('error')}",
-            }
-        output = prediction.get("output")
-        if isinstance(output, list):
-            output = output[0] if output else None
-        if isinstance(output, dict):
-            output = output.get("image") or output.get("url") or output.get("output")
-        if not isinstance(output, str) or not output:
-            return None, {
-                "productCutoutProvider": "replicate",
-                "productCutoutModel": model,
-                "productCutoutError": "empty_output",
-            }
-        if output.startswith("data:image"):
-            encoded = output.split(",", 1)[1]
-            image_bytes = base64.b64decode(encoded)
-        else:
-            download = requests.get(output, timeout=timeout)
-            download.raise_for_status()
-            image_bytes = download.content
-        extracted = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-        if extracted.size != crop.size:
-            extracted = extracted.resize(crop.size, Image.Resampling.LANCZOS)
-        alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
-        alpha_ratio = float(np.count_nonzero(alpha > 8)) / max(1, alpha.size)
-        if not (0.025 <= alpha_ratio <= 0.82):
-            return None, {
-                "productCutoutProvider": "replicate",
-                "productCutoutModel": model,
-                "productCutoutError": "unsafe_alpha_ratio",
-                "productCutoutAlphaRatio": round(alpha_ratio, 4),
-            }
-        return _prepare_foreground_rgba_crop(extracted), {
+        headers = {
+            "Authorization": f"Token {token}",
+            "Content-Type": "application/json",
+            "Prefer": "wait=45",
+        }
+        image_input = _image_data_uri(crop.convert("RGBA"))
+        for model in models:
+            if "/" not in model:
+                errors.append(f"{model}: invalid_model")
+                continue
+            try:
+                if ":" in model:
+                    model_name, version = model.split(":", 1)
+                    if "/" not in model_name or len(version.strip()) < 16:
+                        errors.append(f"{model}: invalid_version_model")
+                        continue
+                    endpoint = "https://api.replicate.com/v1/predictions"
+                    payload = {"version": version.strip(), "input": {"image": image_input}}
+                else:
+                    owner, name = model.split("/", 1)
+                    endpoint = f"https://api.replicate.com/v1/models/{owner}/{name}/predictions"
+                    payload = {"input": {"image": image_input}}
+                response = requests.post(endpoint, headers=headers, json=payload, timeout=timeout)
+                response.raise_for_status()
+                prediction = response.json()
+                deadline = time.time() + int(os.getenv("REPLICATE_PRODUCT_CUTOUT_POLL_TIMEOUT", "120"))
+                while prediction.get("status") not in {"succeeded", "failed", "canceled"} and time.time() < deadline:
+                    poll_url = (prediction.get("urls") or {}).get("get")
+                    if not poll_url:
+                        break
+                    time.sleep(1.5)
+                    poll = requests.get(poll_url, headers={"Authorization": f"Token {token}"}, timeout=timeout)
+                    poll.raise_for_status()
+                    prediction = poll.json()
+                if prediction.get("status") != "succeeded":
+                    errors.append(f"{model}: status={prediction.get('status')}; error={prediction.get('error')}")
+                    continue
+                output = prediction.get("output")
+                if isinstance(output, list):
+                    output = output[0] if output else None
+                if isinstance(output, dict):
+                    output = output.get("image") or output.get("url") or output.get("output")
+                if not isinstance(output, str) or not output:
+                    errors.append(f"{model}: empty_output")
+                    continue
+                if output.startswith("data:image"):
+                    encoded = output.split(",", 1)[1]
+                    image_bytes = base64.b64decode(encoded)
+                else:
+                    download = requests.get(output, timeout=timeout)
+                    download.raise_for_status()
+                    image_bytes = download.content
+                extracted = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+                if extracted.size != crop.size:
+                    extracted = extracted.resize(crop.size, Image.Resampling.LANCZOS)
+                alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
+                alpha_ratio = float(np.count_nonzero(alpha > 8)) / max(1, alpha.size)
+                if not (0.025 <= alpha_ratio <= 0.82):
+                    errors.append(f"{model}: unsafe_alpha_ratio={alpha_ratio:.4f}")
+                    continue
+                return _prepare_foreground_rgba_crop(extracted), {
+                    "productCutoutProvider": "replicate",
+                    "productCutoutModel": model,
+                    "productCutoutAlphaRatio": round(alpha_ratio, 4),
+                    "productCutoutFallbackTried": models,
+                }
+            except Exception as exc:
+                errors.append(f"{model}: {str(exc)[:220]}")
+                continue
+        return None, {
             "productCutoutProvider": "replicate",
-            "productCutoutModel": model,
-            "productCutoutAlphaRatio": round(alpha_ratio, 4),
+            "productCutoutModel": configured_model,
+            "productCutoutFallbackTried": models,
+            "productCutoutError": " | ".join(errors)[-900:],
         }
     except Exception as exc:
         return None, {
             "productCutoutProvider": "replicate",
-            "productCutoutModel": model,
+            "productCutoutModel": configured_model,
             "productCutoutError": str(exc)[:500],
         }
 
@@ -1902,6 +1922,13 @@ def _product_only_foreground_crop(
                 extracted = extracted.convert("RGBA")
             elif heavy_local_fallback and segmentation_backend in {"rembg", "u2net", "isnet", "auto", "1", "true", "yes", "on", "provider"}:
                 extracted = _apply_foreground_alpha(crop).convert("RGBA")
+            elif segmentation_backend in {"replicate", "provider"} and os.getenv("REPLICATE_API_TOKEN", "").strip():
+                return crop, source_box, {
+                    **meta,
+                    **cutout_meta,
+                    "productAlphaRejected": "product_cutout_provider_failed",
+                    "productAlphaFallbackBlocked": "dirty_cv_alpha_cannot_enter_frame",
+                }
             else:
                 extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
             raw_alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
