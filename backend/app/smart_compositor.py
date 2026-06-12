@@ -4962,7 +4962,7 @@ def composite_wide_creative_director_relayout(
             }
         )
 
-    if visual_completion_source is not None:
+    if visual_completion_source is not None and product_frame_source is not None and product_frame_box is not None:
         composited.append(
             _paste_crop_fit(
                 output,
@@ -4977,23 +4977,22 @@ def composite_wide_creative_director_relayout(
                 anchor_bottom_if_source_truncated=True,
             )
         )
-        if product_frame_source is not None and product_frame_box is not None:
-            composited.append(
-                _paste_crop_fit(
-                    output,
-                    product_frame_source,
-                    product_frame_box,
-                    visual_render_bounds,
-                    layer_id="visual-main-exact-label-overlay",
-                    role="product_only_foreground_readability_overlay",
-                    mode="contain",
-                    foreground_alpha=False,
-                    alpha_cut_source_boxes=[],
-                    anchor_bottom_if_source_truncated=True,
-                )
+        composited.append(
+            _paste_crop_fit(
+                output,
+                product_frame_source,
+                product_frame_box,
+                visual_render_bounds,
+                layer_id="visual-main-exact-label-overlay",
+                role="product_only_foreground_readability_overlay",
+                mode="contain",
+                foreground_alpha=False,
+                alpha_cut_source_boxes=[],
+                anchor_bottom_if_source_truncated=True,
             )
-        else:
-            append_blocked_product_layer("visual-main-exact-label-overlay", visual_render_bounds, "product_alpha_not_frame_ready")
+        )
+    elif visual_completion_source is not None:
+        append_blocked_product_layer("visual-main-provider-completion-foreground", visual_render_bounds, "product_alpha_not_frame_ready")
     elif visual_already_protected:
         if product_frame_source is not None and product_frame_box is not None:
             composited.append(
@@ -5803,7 +5802,6 @@ def render_deterministic_compositor(
         fallback_background_source = background_source
         provider_background_meta: dict[str, Any] = {}
         provider_ready = False
-        provider_visual_completion_source: Image.Image | None = None
         source_ratio = source.width / max(1, source.height)
         target_ratio = width / max(1, height)
         target_area_smaller = width * height < source.width * source.height
@@ -5849,12 +5847,9 @@ def render_deterministic_compositor(
                         background_source = fallback_background_source
                         provider_background_meta["providerRejected"] = "layout_seed_background_can_hallucinate_product_or_text"
                         provider_background_meta["productionReady"] = False
-                        if source_ratio > 1.25 and target_ratio < 0.78:
-                            provider_background_meta["providerSalvage"] = "foreground_completion_only"
-                            provider_visual_completion_source = provider_rgb
-                            provider_ready = True
-                        else:
-                            provider_ready = False
+                        provider_background_meta["providerSalvage"] = None
+                        provider_background_meta["providerForegroundSalvageDisabled"] = "resize_requires_prepared_product_alpha_asset"
+                        provider_ready = False
                 else:
                     background_source = provider_rgb
                     provider_ready = True
@@ -5876,7 +5871,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
-                visual_completion_source=provider_visual_completion_source,
+                visual_completion_source=None,
                 product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
@@ -5893,7 +5888,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
-                visual_completion_source=provider_visual_completion_source,
+                visual_completion_source=None,
                 product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
@@ -5957,7 +5952,6 @@ def render_deterministic_compositor(
         }
     elif role_aware_candidate:
         provider_role_meta: dict[str, Any] = {}
-        provider_role_visual_completion_source: Image.Image | None = None
         role_provider_seed = background_seed
         source_ratio_for_seed = source.width / max(1, source.height)
         target_ratio_for_seed = width / max(1, height)
@@ -5977,21 +5971,12 @@ def render_deterministic_compositor(
                 provider_background, provider_role_meta = outpaint_renderer(role_provider_seed, width, height, plan, analysis)
                 if provider_background.size != (width, height):
                     provider_background = provider_background.resize((width, height), Image.Resampling.LANCZOS)
-                provider_foreground_salvage_enabled = os.getenv(
-                    "ADAPTIFAI_RESIZE_ENABLE_PROVIDER_FOREGROUND_SALVAGE",
-                    "0",
-                ).strip().lower() in {"1", "true", "yes", "on"}
-                if (
-                    provider_foreground_salvage_enabled
-                    and source.width / max(1, source.height) > 1.25
-                    and width / max(1, height) < 1.25
-                ):
-                    provider_role_visual_completion_source = provider_background.convert("RGB")
                 background = build_resize_texture_background_canvas(clean_source, width, height)
                 provider_role_meta = {
                     **provider_role_meta,
                     "providerRejected": "role_provider_background_can_hallucinate_text_or_products",
-                    "providerSalvage": "foreground_completion_only" if provider_role_visual_completion_source is not None else None,
+                    "providerSalvage": None,
+                    "providerForegroundSalvageDisabled": "resize_requires_prepared_product_alpha_asset",
                     "productionReady": False,
                 }
             except Exception as exc:
@@ -6034,7 +6019,7 @@ def render_deterministic_compositor(
                 analysis,
                 text_blocks=text_blocks,
                 draw_text=draw_text,
-                visual_completion_source=provider_role_visual_completion_source,
+                visual_completion_source=None,
                 product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
@@ -6050,7 +6035,7 @@ def render_deterministic_compositor(
                 analysis,
                 text_blocks=text_blocks,
                 draw_text=draw_text,
-                visual_completion_source=provider_role_visual_completion_source,
+                visual_completion_source=None,
                 product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
