@@ -92,7 +92,7 @@ try:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
-    from app.smart_compositor import render_deterministic_compositor
+    from app.smart_compositor import _apply_foreground_alpha, _prepare_foreground_rgba_crop, render_deterministic_compositor
 except ImportError:
     from backend.app.smart_reframe import (  # type: ignore[no-redef]
         BackgroundStyle,
@@ -111,7 +111,7 @@ except ImportError:
         build_visual_analysis_prompt,
         parse_visual_analysis_payload,
     )
-    from backend.app.smart_compositor import render_deterministic_compositor  # type: ignore[no-redef]
+    from backend.app.smart_compositor import _apply_foreground_alpha, _prepare_foreground_rgba_crop, render_deterministic_compositor  # type: ignore[no-redef]
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -13446,6 +13446,151 @@ def render_vertex_compositor_background_outpaint(source: Image.Image, width: int
     }
 
 
+def build_resize_product_completion_prompt(edge_touch: list[str]) -> str:
+    missing_parts = ", ".join(edge_touch) if edge_touch else "outer edges"
+    return (
+        "Complete only the missing outer shape of this isolated product packaging asset. "
+        f"The product is visibly truncated at: {missing_parts}. "
+        "Preserve the existing opaque product pixels exactly, especially all brand marks, label text, colors, shadows, perspective, and bottle geometry. "
+        "Do not translate, rewrite, redraw, approximate, or invent any label text. "
+        "Do not add marketing copy, badges, logos, UI, background scenery, frames, hands, people, or extra products. "
+        "Generate only the physically continuous missing cap/body/bottom pixels needed to make the same single product look complete. "
+        "Keep the surrounding area plain/transparent-looking and free of text; deterministic code will place the completed product into the final ad layout."
+    )
+
+
+def build_resize_product_completion_seed(product: Image.Image, edge_touch: list[str]) -> tuple[Image.Image, dict[str, Any]]:
+    product = product.convert("RGBA")
+    pad_x = max(24, int(product.width * 0.18))
+    top_pad = max(32, int(product.height * (0.32 if "top" in edge_touch else 0.16)))
+    bottom_pad = max(32, int(product.height * (0.32 if "bottom" in edge_touch else 0.16)))
+    canvas = Image.new("RGBA", (product.width + pad_x * 2, product.height + top_pad + bottom_pad), (0, 0, 0, 0))
+    canvas.alpha_composite(product, (pad_x, top_pad))
+    return canvas, {
+        "productCompletionSeedPasteBox": [pad_x, top_pad, pad_x + product.width, top_pad + product.height],
+        "productCompletionSeedPadding": [pad_x, top_pad, pad_x, bottom_pad],
+        "layoutSeedTransparentPixels": True,
+    }
+
+
+def render_resize_product_asset_completion(product: Image.Image, meta: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
+    edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
+    if not edge_touch:
+        return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
+    seed, seed_meta = build_resize_product_completion_seed(product, edge_touch)
+    prompt = build_resize_product_completion_prompt(edge_touch)
+    openai_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_PRODUCT_COMPLETION", "0").strip().lower() in {"1", "true", "yes", "on"}
+    vertex_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_PRODUCT_COMPLETION", "1")
+    rendered: Image.Image | None = None
+    provider_meta: dict[str, Any] = {}
+
+    if vertex_enabled and vertex_available():
+        base_image, mask_image = build_vertex_outpaint_base_and_mask(seed, seed_meta)
+        project_id = vertex_project_id()
+        location = vertex_location()
+        model = vertex_imagen_edit_model()
+        endpoint = (
+            f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/"
+            f"locations/{location}/publishers/google/models/{model}:predict"
+        )
+        response = vertex_authorized_session().post(
+            endpoint,
+            json={
+                "instances": [
+                    {
+                        "prompt": prompt,
+                        "referenceImages": [
+                            {
+                                "referenceType": "REFERENCE_TYPE_RAW",
+                                "referenceId": 1,
+                                "referenceImage": {"bytesBase64Encoded": image_to_base64_png(base_image)},
+                            },
+                            {
+                                "referenceType": "REFERENCE_TYPE_MASK",
+                                "referenceId": 2,
+                                "referenceImage": {"bytesBase64Encoded": image_to_base64_png(mask_image)},
+                                "maskImageConfig": {
+                                    "maskMode": "MASK_MODE_USER_PROVIDED",
+                                    "dilation": float(os.getenv("VERTEX_IMAGEN_PRODUCT_MASK_DILATION", "0.01")),
+                                },
+                            },
+                        ],
+                    }
+                ],
+                "parameters": {
+                    "sampleCount": 1,
+                    "editMode": "EDIT_MODE_OUTPAINT",
+                    "editConfig": {
+                        "baseSteps": int(os.getenv("VERTEX_IMAGEN_PRODUCT_EDIT_STEPS", "35")),
+                        "outpaintingConfig": {
+                            "blendingMode": os.getenv("VERTEX_IMAGEN_OUTPAINT_BLEND_MODE", "alpha-blending"),
+                            "blendingFactor": float(os.getenv("VERTEX_IMAGEN_PRODUCT_BLEND_FACTOR", "0.01")),
+                        },
+                    },
+                    "safetyFilterLevel": os.getenv("VERTEX_IMAGEN_SAFETY_FILTER_LEVEL", "block_some"),
+                    "personGeneration": os.getenv("VERTEX_IMAGEN_PERSON_GENERATION", "allow_adult"),
+                },
+            },
+            timeout=int(os.getenv("VERTEX_IMAGEN_TIMEOUT", "35")),
+        )
+        try:
+            response.raise_for_status()
+        except requests.HTTPError as exc:
+            raise RuntimeError(f"Vertex Imagen product completion failed with HTTP {response.status_code}: {response.text[:1200]}") from exc
+        payload = response.json()
+        predictions = payload.get("predictions", []) if isinstance(payload, dict) else []
+        if not predictions:
+            raise ValueError("Vertex Imagen product completion returned no predictions.")
+        rendered = decode_vertex_imagen_prediction(predictions[0])
+        provider_meta = {"provider": "vertex", "model": model, "location": location, "strategy": "vertex_resize_product_asset_completion"}
+    elif openai_enabled:
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        if not api_key:
+            raise RuntimeError("OPENAI_API_KEY is required for OpenAI product completion.")
+        mask_arr = np.where(np.array(seed.getchannel("A"), dtype=np.uint8) >= 250, 0, 255).astype(np.uint8)
+        mask = Image.fromarray(mask_arr, "L")
+        image_file = io.BytesIO()
+        seed.save(image_file, format="PNG")
+        image_file.seek(0)
+        mask_file = io.BytesIO()
+        mask.save(mask_file, format="PNG")
+        mask_file.seek(0)
+        model = os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-1").strip() or "gpt-image-1"
+        client = OpenAI(api_key=api_key)
+        response, api_variant = create_openai_image_edit_with_fallback(
+            client,
+            {
+                "model": model,
+                "image": ("product-completion-seed.png", image_file, "image/png"),
+                "mask": ("product-completion-mask.png", mask_file, "image/png"),
+                "prompt": prompt,
+                "quality": os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium").strip().lower() or "medium",
+            },
+            [image_file, mask_file],
+            output_format="png",
+            size="auto",
+            width=seed.width,
+            height=seed.height,
+        )
+        rendered = decode_openai_image_response(response)
+        provider_meta = {"provider": "openai", "model": model, "strategy": "openai_resize_product_asset_completion", "apiVariant": api_variant}
+    else:
+        raise RuntimeError("No product completion provider is enabled.")
+
+    if rendered.size != seed.size:
+        rendered = rendered.resize(seed.size, Image.Resampling.LANCZOS)
+    completed = _apply_foreground_alpha(rendered.convert("RGB")).convert("RGBA")
+    paste_box = seed_meta["productCompletionSeedPasteBox"]
+    completed.alpha_composite(product.convert("RGBA"), (paste_box[0], paste_box[1]))
+    completed = _prepare_foreground_rgba_crop(completed)
+    return completed, {
+        **provider_meta,
+        **seed_meta,
+        "productCompletionInputEdgeTouch": edge_touch,
+        "productCompletionOutputSize": list(completed.size),
+    }
+
+
 def smart_reframe_text_style_to_block_color(style: TextStyle | None) -> str:
     if style is None:
         return "#111111"
@@ -13683,7 +13828,6 @@ def build_resize_compositor_text_blocks(
         if layer is None or not layer.original_text.strip():
             continue
         resize_text = normalize_resize_ocr_copy(repair_mojibake(layer.original_text).strip())
-        translated_resize_text = normalize_resize_ocr_copy(repair_mojibake(getattr(layer, "translated_text", "") or "").strip())
         source_box = layer.bbox.to_pixel_box(source.width, source.height)
         placement_box = placement.target_bbox.to_pixel_box(width, height)
         union_w = max(1, text_source_union[2] - text_source_union[0])
@@ -13716,15 +13860,14 @@ def build_resize_compositor_text_blocks(
         font_weight = 700 if style is None or style.is_bold else 400
         align = style.alignment if style and style.alignment != "unknown" else "center"
         font_category = (style.font_type if style and style.font_type != "unknown" else "sans-serif").replace("script", "handwriting")
-        translated_lines = [line.strip() for line in translated_resize_text.splitlines() if line.strip()]
-        if not translated_lines:
-            translated_lines = [line.strip() for line in resize_text.splitlines() if line.strip()]
-        if not translated_lines:
-            translated_lines = [resize_text]
         source_lines = [line.strip() for line in resize_text.splitlines() if line.strip()]
         if not source_lines:
-            source_lines = translated_lines
-        line_count_for_style = max(len(source_lines), len(translated_lines), 1)
+            source_lines = [resize_text]
+        # Resize is not localization: keep the source creative language exactly.
+        # Analyzer translated_text may be populated by layout providers, but using
+        # it here changes the user's uploaded creative language in Resize output.
+        translated_lines = source_lines
+        line_count_for_style = max(len(source_lines), 1)
         line_source_boxes = split_resize_box_into_line_boxes(source_box, line_count_for_style)
 
         source_word_styles: list[dict[str, Any]] = []
@@ -13848,6 +13991,7 @@ def render_smart_reframe_image(
         draw_text=draw_fitted_localize_v2_text,
         outpaint_renderer=render_clean_base_outpaint_for_compositor if allow_provider_outpaint else None,
         fallback_renderer=render_nonblur_contain_placeholder,
+        product_completion_renderer=render_resize_product_asset_completion if allow_provider_outpaint else None,
     )
 
 

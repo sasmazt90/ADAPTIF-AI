@@ -17,6 +17,7 @@ except ImportError:
 
 
 ImageRenderer = Callable[[Image.Image, int, int, ReframePlan, VisualAnalysis], tuple[Image.Image, dict[str, Any]]]
+ProductCompletionRenderer = Callable[[Image.Image, dict[str, Any]], tuple[Image.Image, dict[str, Any]]]
 FallbackRenderer = Callable[[Image.Image, int, int], Image.Image]
 TextRenderer = Callable[[Image.Image, list[Any]], Image.Image]
 _REMBG_SESSION: Any | None = None
@@ -31,6 +32,26 @@ def _placement_preserves_creative_brand_layers(placement_id: str | None) -> bool
 
 def _placement_is_display_ad(placement_id: str | None) -> bool:
     return _placement_preserves_creative_brand_layers(placement_id)
+
+
+def _rgba_alpha_edge_touch(rgba: Image.Image, *, threshold: int = 24) -> list[str]:
+    try:
+        alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
+        if alpha.size == 0:
+            return []
+        band = max(1, min(alpha.shape[:2]) // 80)
+        touches: list[str] = []
+        if float(np.count_nonzero(alpha[:band, :] > threshold)) / max(1, alpha[:band, :].size) > 0.025:
+            touches.append("top")
+        if float(np.count_nonzero(alpha[-band:, :] > threshold)) / max(1, alpha[-band:, :].size) > 0.025:
+            touches.append("bottom")
+        if float(np.count_nonzero(alpha[:, :band] > threshold)) / max(1, alpha[:, :band].size) > 0.025:
+            touches.append("left")
+        if float(np.count_nonzero(alpha[:, -band:] > threshold)) / max(1, alpha[:, -band:].size) > 0.025:
+            touches.append("right")
+        return touches
+    except Exception:
+        return []
 
 
 def _resize_provider_must_not_see_brand_layers(placement_id: str | None) -> bool:
@@ -4298,6 +4319,7 @@ def composite_wide_creative_director_relayout(
     draw_text: TextRenderer | None = None,
     visual_already_protected: bool = False,
     visual_completion_source: Image.Image | None = None,
+    product_completion_renderer: ProductCompletionRenderer | None = None,
     preserve_brand_layers: bool = True,
 ) -> tuple[Image.Image, dict[str, Any]]:
     display_placement = preserve_brand_layers
@@ -4906,6 +4928,40 @@ def composite_wide_creative_director_relayout(
         )
         if product_foreground_meta.get("productAlphaRejected") is None:
             product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
+            product_edge_touch = _rgba_alpha_edge_touch(product_foreground_source)
+            product_foreground_meta["productAlphaEdgeTouch"] = product_edge_touch
+            if product_completion_renderer is not None and product_edge_touch:
+                try:
+                    completed_product, completion_meta = product_completion_renderer(
+                        product_foreground_source,
+                        {
+                            **product_foreground_meta,
+                            "productAlphaEdgeTouch": product_edge_touch,
+                            "productAlphaSourceBox": list(product_foreground_source_box),
+                            "targetCanvas": [width, height],
+                        },
+                    )
+                    completed_product = _prepare_foreground_rgba_crop(completed_product.convert("RGBA"))
+                    if completed_product.getchannel("A").getbbox():
+                        product_foreground_source = completed_product
+                        product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
+                        product_foreground_meta.update(
+                            {
+                                **completion_meta,
+                                "productCompletionAppliedBeforePlacement": True,
+                                "productCompletionEdgeTouchBefore": product_edge_touch,
+                                "productCompletionEdgeTouchAfter": _rgba_alpha_edge_touch(product_foreground_source),
+                            }
+                        )
+                    else:
+                        product_foreground_meta.update(
+                            {
+                                **completion_meta,
+                                "productCompletionRejected": "empty_completed_alpha",
+                            }
+                        )
+                except Exception as exc:
+                    product_foreground_meta["productCompletionError"] = str(exc)[:300]
         else:
             product_foreground_source = None
 
@@ -5681,6 +5737,7 @@ def render_deterministic_compositor(
     draw_text: TextRenderer,
     outpaint_renderer: ImageRenderer | None,
     fallback_renderer: FallbackRenderer,
+    product_completion_renderer: ProductCompletionRenderer | None = None,
 ) -> tuple[Image.Image, dict[str, Any]]:
     placement_id = getattr(plan, "placement_id", None)
     preserve_brand_layers = _placement_preserves_creative_brand_layers(placement_id)
@@ -5794,6 +5851,7 @@ def render_deterministic_compositor(
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
                 visual_completion_source=provider_visual_completion_source,
+                product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
@@ -5810,6 +5868,7 @@ def render_deterministic_compositor(
                 draw_text=draw_text,
                 visual_already_protected=provider_ready and bool(provider_background_meta.get("layoutOutpaintSeed")),
                 visual_completion_source=provider_visual_completion_source,
+                product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
@@ -5950,6 +6009,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_completion_source=provider_role_visual_completion_source,
+                product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
@@ -5965,6 +6025,7 @@ def render_deterministic_compositor(
                 text_blocks=text_blocks,
                 draw_text=draw_text,
                 visual_completion_source=provider_role_visual_completion_source,
+                product_completion_renderer=product_completion_renderer,
                 preserve_brand_layers=preserve_brand_layers,
             )
             strategy = "deterministic_compositor_creative_director_relayout"
