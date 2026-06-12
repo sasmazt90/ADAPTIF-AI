@@ -116,7 +116,10 @@ def _image_data_uri(image: Image.Image, *, fmt: str = "PNG") -> str:
 
 def _replicate_product_cutout(crop: Image.Image) -> tuple[Image.Image | None, dict[str, Any]]:
     token = os.getenv("REPLICATE_API_TOKEN", "").strip()
-    configured_model = os.getenv("REPLICATE_PRODUCT_CUTOUT_MODEL", "851-labs/background-remover").strip()
+    configured_model = os.getenv(
+        "REPLICATE_PRODUCT_CUTOUT_MODEL",
+        "851-labs/background-remover:a029dff38972b5fda4ec5d75d7d1cd25aeff621d2cf4946a41055d7db66b80bc",
+    ).strip()
     fallback_models = [
         item.strip()
         for item in os.getenv("REPLICATE_PRODUCT_CUTOUT_FALLBACK_MODELS", "lucataco/remove-bg,recraft-ai/recraft-remove-background").split(",")
