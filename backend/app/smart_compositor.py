@@ -1677,21 +1677,38 @@ def render_deterministic_compositor(
             for rb in redrawn:
                 drawn_redraw_zone_boxes.append(tuple(int(v) for v in getattr(rb, "bbox", (0, 0, 0, 0))))
 
+    text_redraw_error = ""
     if redraw_blocks and draw_text:
-        # Drawing is done via the injected draw_text (which links to draw_resize_display_copy_stack in main.py)
-        output = draw_text(output.convert("RGB"), redraw_blocks).convert("RGBA")
-        composited.append(
-            {
-                "layerId": "resize-redrawn-marketing-copy",
-                "role": "phase1_typography_redraw",
-                "sourceBox": [],
-                "targetBox": [],
-                "pasteBox": [],
-                "scale": None,
-                "fitMode": "text_redraw",
-                "blockCount": len(redraw_blocks),
-            }
-        )
+        try:
+            # Drawing is done via the injected draw_text (which links to draw_resize_display_copy_stack in main.py)
+            output = draw_text(output.convert("RGB"), redraw_blocks).convert("RGBA")
+            composited.append(
+                {
+                    "layerId": "resize-redrawn-marketing-copy",
+                    "role": "phase1_typography_redraw",
+                    "sourceBox": [],
+                    "targetBox": [],
+                    "pasteBox": [],
+                    "scale": None,
+                    "fitMode": "text_redraw",
+                    "blockCount": len(redraw_blocks),
+                }
+            )
+        except Exception as exc:
+            text_redraw_error = str(exc)[:500]
+            composited.append(
+                {
+                    "layerId": "resize-redrawn-marketing-copy-error",
+                    "role": "phase1_typography_redraw_error",
+                    "sourceBox": [],
+                    "targetBox": [],
+                    "pasteBox": [],
+                    "scale": None,
+                    "fitMode": "text_redraw_error",
+                    "blockCount": len(redraw_blocks),
+                    "error": text_redraw_error,
+                }
+            )
 
     brand_union = _union_boxes(parts["brand"])
     if preserve_brand_layers and brand_union:
@@ -1741,6 +1758,7 @@ def render_deterministic_compositor(
         "compositedLayers": composited,
         "compositedLayerCount": len(composited),
         "textRedrawBlocks": len(redraw_blocks),
+        "textRedrawError": text_redraw_error,
         "creativeDirectorRelayout": True,
         "layoutPlanBoxes": {
             "brand": list(brand_bounds),

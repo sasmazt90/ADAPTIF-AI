@@ -14417,18 +14417,27 @@ def render_smart_reframe_image(
     allow_product_completion: bool = True,
 ) -> tuple[Image.Image, dict[str, Any]]:
     text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
-    return render_deterministic_compositor(
-        source,
-        width,
-        height,
-        plan,
-        analysis,
-        text_blocks=text_blocks,
-        draw_text=draw_fitted_localize_v2_text,
-        outpaint_renderer=render_clean_base_outpaint_for_compositor if allow_provider_outpaint else None,
-        fallback_renderer=render_nonblur_contain_placeholder,
-        product_completion_renderer=render_resize_product_asset_completion if allow_product_completion else None,
-    )
+    try:
+        return render_deterministic_compositor(
+            source,
+            width,
+            height,
+            plan,
+            analysis,
+            text_blocks=text_blocks,
+            draw_text=draw_fitted_localize_v2_text,
+            outpaint_renderer=render_clean_base_outpaint_for_compositor if allow_provider_outpaint else None,
+            fallback_renderer=render_nonblur_contain_placeholder,
+            product_completion_renderer=render_resize_product_asset_completion if allow_product_completion else None,
+        )
+    except Exception as exc:
+        fallback = render_nonblur_contain_placeholder(source, width, height)
+        return fallback, {
+            "provider": "local",
+            "strategy": "deterministic_compositor_runtime_fallback",
+            "productionReady": False,
+            "fallbackReason": str(exc)[:500],
+        }
 
 
 def crop_to_ratio(image: Image.Image, focus_bbox: tuple[int, int, int, int], target_ratio: float, offset_x: int = 0, offset_y: int = 0) -> Image.Image:
