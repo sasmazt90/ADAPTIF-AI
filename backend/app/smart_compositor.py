@@ -5414,7 +5414,7 @@ def render_deterministic_compositor(
                     provider_background = provider_background.resize((width, height), Image.Resampling.LANCZOS)
                 provider_foreground_salvage_enabled = os.getenv(
                     "ADAPTIFAI_RESIZE_ENABLE_PROVIDER_FOREGROUND_SALVAGE",
-                    "0",
+                    "1",
                 ).strip().lower() in {"1", "true", "yes", "on"}
                 if (
                     provider_foreground_salvage_enabled
@@ -5422,7 +5422,7 @@ def render_deterministic_compositor(
                     and width / max(1, height) < 1.25
                 ):
                     provider_role_visual_completion_source = provider_background.convert("RGB")
-                background = build_deterministic_background_canvas(background_seed, width, height)
+                background = build_resize_texture_background_canvas(clean_source, width, height)
                 provider_role_meta = {
                     **provider_role_meta,
                     "providerRejected": "role_provider_background_can_hallucinate_text_or_products",
@@ -5430,7 +5430,7 @@ def render_deterministic_compositor(
                     "productionReady": False,
                 }
             except Exception as exc:
-                background = build_deterministic_background_canvas(background_seed, width, height)
+                background = build_resize_texture_background_canvas(clean_source, width, height)
                 provider_role_meta = {
                     "provider": "local",
                     "outpaintProviderFailure": str(exc),
