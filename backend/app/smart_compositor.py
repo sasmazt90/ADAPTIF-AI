@@ -1870,6 +1870,40 @@ def _product_only_foreground_crop(
         keep = cv2.morphologyEx((keep > 12).astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel, iterations=1)
         keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=1.0, sigmaY=1.0)
         visible_ratio = float(np.count_nonzero(keep > 16)) / crop_area
+        if protected_union and visible_ratio > 0.66:
+            px1, _py1, px2, _py2 = protected_union
+            protected_w = max(1, px2 - px1)
+            protected_cx = (px1 + px2) / 2.0
+            body_half = max(int(protected_w * 1.08), int(w * 0.18), 22)
+            top_half = max(16, int(body_half * 0.68))
+            bottom_half = max(18, int(body_half * 0.98))
+            silhouette = np.zeros((h, w), dtype=np.uint8)
+            polygon = np.array(
+                [
+                    [max(0, int(round(protected_cx - top_half))), 0],
+                    [min(w - 1, int(round(protected_cx + top_half))), 0],
+                    [min(w - 1, int(round(protected_cx + bottom_half))), h - 1],
+                    [max(0, int(round(protected_cx - bottom_half))), h - 1],
+                ],
+                dtype=np.int32,
+            )
+            cv2.fillConvexPoly(silhouette, polygon, 255)
+            label_pad_x = max(4, int(protected_w * 0.18))
+            for px1, py1, px2, py2 in protected_locals:
+                cv2.rectangle(
+                    silhouette,
+                    (max(0, px1 - label_pad_x), max(0, py1 - max(3, h // 80))),
+                    (min(w - 1, px2 + label_pad_x), min(h - 1, py2 + max(3, h // 80))),
+                    255,
+                    thickness=-1,
+                )
+            silhouette = cv2.GaussianBlur(silhouette, (0, 0), sigmaX=1.4, sigmaY=1.4)
+            salvaged = np.minimum(keep, silhouette)
+            salvaged_ratio = float(np.count_nonzero(salvaged > 16)) / crop_area
+            if 0.12 <= salvaged_ratio < visible_ratio:
+                keep = salvaged
+                visible_ratio = salvaged_ratio
+                meta["productAlphaSalvage"] = "label_seeded_silhouette_for_rectangular_matte"
         if not (0.035 <= visible_ratio <= 0.90):
             return crop, source_box, {
                 **meta,
