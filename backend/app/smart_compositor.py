@@ -63,6 +63,15 @@ def classify_text_role(text: str) -> str:
     return "headline" if len(text or "") > 10 else "product_label"
 
 
+def _layer_text(layer: Any) -> str:
+    return str(
+        getattr(layer, "translated_text", None)
+        or getattr(layer, "original_text", None)
+        or getattr(layer, "text", None)
+        or ""
+    ).strip()
+
+
 def _rgba_alpha_edge_touch(rgba: Image.Image, *, threshold: int = 24) -> list[str]:
     try:
         alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
@@ -1370,7 +1379,7 @@ def _partition_resize_layers(
         "trust_badge": [],
     }
     visual_cy = (visual_box[1] + visual_box[3]) / 2
-    brand_texts = [layer for layer in analysis.marketing_text_layers if classify_text_role(layer.text) == "product_label" and layer.bbox.to_pixel_box(source.width, source.height)[3] < source.height * 0.22]
+    brand_texts = [layer for layer in analysis.marketing_text_layers if classify_text_role(_layer_text(layer)) == "product_label" and layer.bbox.to_pixel_box(source.width, source.height)[3] < source.height * 0.22]
     brand_union = _union_boxes([_layer_box(layer, source) for layer in [*analysis.logo_layers, *brand_texts]])
     for layer in analysis.marketing_text_layers:
         box = _layer_box(layer, source)
@@ -1403,9 +1412,9 @@ def _load_cta_font(size: int) -> ImageFont.ImageFont:
 
 
 def _localized_display_cta_label(analysis: VisualAnalysis) -> str:
-    cta_layers = [layer for layer in analysis.marketing_text_layers if classify_text_role(layer.text) == "cta"]
+    cta_layers = [layer for layer in analysis.marketing_text_layers if classify_text_role(_layer_text(layer)) == "cta"]
     if cta_layers:
-        return cta_layers[0].text.strip()
+        return _layer_text(cta_layers[0])
     return "İncele"
 
 
