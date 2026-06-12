@@ -733,7 +733,9 @@ def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis)
         box = _layer_box(layer, source)
         _, cy = _box_center(box)
         box_h_ratio = (box[3] - box[1]) / max(1, source.height)
-        if source_ratio > 1.35 and (box_h_ratio < 0.38 or cy < source.height * 0.24):
+        if source_ratio > 1.35 and cy < source.height * 0.24 and box_h_ratio < 0.30:
+            continue
+        if source_ratio > 1.35 and box_h_ratio < 0.38:
             box = _expand_product_seed_box(source, box)
         text_overlap_ratio = sum(_box_overlap(box, text_box) for text_box in text_boxes_for_filter) / max(1, _box_area(box))
         if source_ratio > 1.35 and text_overlap_ratio > 0.18:
@@ -3558,10 +3560,10 @@ def _fallback_creative_director_plan(
             "pattern": "display-skyscraper-vertical-stack",
             "brand": (safe_x, safe_y, width - safe_x, int(height * 0.12)),
             "copy": (safe_x, int(height * 0.14), width - safe_x, int(height * 0.36)),
-            "visual": (safe_x, int(height * 0.38), width - safe_x, int(height * 0.64)),
-            "rtb": (safe_x, int(height * 0.67), width - safe_x, int(height * 0.79)),
-            "badge": (safe_x, int(height * 0.81), width - safe_x, int(height * 0.87)),
-            "cta": (safe_x, int(height * 0.90), width - safe_x, height - safe_y),
+            "rtb": (safe_x, int(height * 0.46), width - safe_x, int(height * 0.56)),
+            "cta": (safe_x, int(height * 0.59), width - safe_x, int(height * 0.66)),
+            "visual": (safe_x, int(height * 0.68), width - safe_x, height),
+            "badge": (safe_x, int(height * 0.80), width - safe_x, int(height * 0.88)),
             "visualFitMode": "contain",
             "visualAnchor": (0.50, 1.0),
             "allowLogo": True,
@@ -4085,7 +4087,11 @@ def composite_wide_creative_director_relayout(
     if "bottom" in visual_edge_sides and target_ratio <= 1.25:
         visual_w = max(1, visual_render_bounds[2] - visual_render_bounds[0])
         visual_h = max(1, visual_render_bounds[3] - visual_render_bounds[1])
-        min_visual_h = int(round(height * (0.46 if target_ratio < 0.78 else 0.38)))
+        if display_placement and target_ratio < 0.78:
+            min_visual_ratio = 0.32
+        else:
+            min_visual_ratio = 0.46 if target_ratio < 0.78 else 0.38
+        min_visual_h = int(round(height * min_visual_ratio))
         if visual_h < min_visual_h:
             center_x = (visual_render_bounds[0] + visual_render_bounds[2]) / 2.0
             expanded_h = min(height, min_visual_h)
@@ -4258,7 +4264,7 @@ def composite_wide_creative_director_relayout(
             secondary_overlap_global = _box_overlap(source_box, secondary_effective_union) / max(1, _box_area(source_box)) if secondary_effective_union else 0.0
             if secondary_overlap_global >= 0.35 and product_label_overlap < 0.45:
                 target_box = _map_box_between_unions(source_box, secondary_effective_union, secondary_bounds, width, height) if secondary_effective_union else _clip_box(tuple(getattr(block, "bbox", source_box)), width, height)
-            elif target_ratio < 0.78 and product_label_overlap < 0.45:
+            elif target_ratio < 0.78 and not display_placement and product_label_overlap < 0.45:
                 if is_top_brand_like:
                     continue
                 if portrait_redraw_union:
@@ -4620,21 +4626,28 @@ def composite_wide_creative_director_relayout(
             if guide:
                 composited.append(guide)
 
-    safe_cta_bounds = (
-        _resolve_display_cta_zone(
-            cta_bounds,
-            drawn_text_boxes=[
-                *drawn_redraw_zone_boxes,
-                *([primary_visual_paste_box] if primary_visual_paste_box else []),
-            ],
-            width=width,
-            height=height,
-            margin_x=margin_x,
-            margin_y=margin_y,
+    if preserve_brand_layers and display_placement and target_ratio < 0.78:
+        # Skyscraper display uses explicit non-overlapping flex zones
+        # (copy -> RTB -> CTA -> product). Re-running the generic collision
+        # resolver against oversized text layout boxes can falsely suppress
+        # the required display CTA.
+        safe_cta_bounds = cta_bounds
+    else:
+        safe_cta_bounds = (
+            _resolve_display_cta_zone(
+                cta_bounds,
+                drawn_text_boxes=[
+                    *drawn_redraw_zone_boxes,
+                    *([primary_visual_paste_box] if primary_visual_paste_box else []),
+                ],
+                width=width,
+                height=height,
+                margin_x=margin_x,
+                margin_y=margin_y,
+            )
+            if preserve_brand_layers
+            else None
         )
-        if preserve_brand_layers
-        else None
-    )
     display_cta_layer = _draw_display_cta_button(output, safe_cta_bounds, label=_localized_display_cta_label(analysis)) if safe_cta_bounds else None
     if display_cta_layer:
         composited.append(display_cta_layer)
