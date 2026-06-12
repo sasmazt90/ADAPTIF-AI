@@ -727,9 +727,40 @@ def _visual_focus_from_product_label_union(
 
 def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis) -> tuple[tuple[int, int, int, int], dict[str, Any]]:
     """Detect the main product/visual region without trusting over-wide analysis boxes."""
+    def package_label_expanded_box() -> tuple[tuple[int, int, int, int] | None, int]:
+        package_label_candidates: list[tuple[int, int, int, int]] = []
+        for layer in analysis.marketing_text_layers:
+            box = _layer_box(layer, source)
+            cx, cy = _box_center(box)
+            rel_x = cx / max(1, source.width)
+            rel_y = cy / max(1, source.height)
+            area_ratio = _box_area(box) / max(1, source.width * source.height)
+            if 0.42 <= rel_x <= 0.78 and rel_y >= 0.26 and area_ratio <= 0.035:
+                package_label_candidates.append(box)
+        label_union = _union_boxes(package_label_candidates)
+        if not label_union:
+            return None, 0
+        label_w = max(1, label_union[2] - label_union[0])
+        label_h = max(1, label_union[3] - label_union[1])
+        expand_left = max(int(source.width * 0.16), int(label_w * 0.78))
+        expand_right = max(int(source.width * 0.13), int(label_w * 0.62))
+        expand_top = max(int(source.height * 0.34), int(label_h * 0.70))
+        expand_bottom = max(int(source.height * 0.30), int(label_h * 0.55))
+        return _clip_box(
+            (
+                label_union[0] - expand_left,
+                label_union[1] - expand_top,
+                label_union[2] + expand_right,
+                label_union[3] + expand_bottom,
+            ),
+            source.width,
+            source.height,
+        ), len(package_label_candidates)
+
     product_boxes = []
     source_ratio = source.width / max(1, source.height)
     text_boxes_for_filter = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.marketing_text_layers]
+    label_expanded_box, label_candidate_count = package_label_expanded_box()
     for layer in analysis.product_layers:
         box = _layer_box(layer, source)
         _, cy = _box_center(box)
@@ -746,6 +777,18 @@ def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis)
             product_boxes.append(box)
     product_union = _union_boxes(product_boxes)
     if product_union:
+        if source_ratio > 1.35 and label_expanded_box:
+            product_w = max(1, product_union[2] - product_union[0])
+            label_w = max(1, label_expanded_box[2] - label_expanded_box[0])
+            misses_likely_body = product_union[0] > label_expanded_box[0] + source.width * 0.07
+            overreaches_right_artwork = product_union[2] > source.width * 0.82 and product_w > label_w * 0.82
+            too_narrow_for_package = product_w < label_w * 0.72
+            if misses_likely_body or overreaches_right_artwork or too_narrow_for_package:
+                return label_expanded_box, {
+                    "visualBoxMethod": "package_label_expanded_product_override",
+                    "packageLabelCandidateCount": label_candidate_count,
+                    "rejectedProductUnion": list(product_union),
+                }
         return _pad_box(product_union, source.width, source.height, pad_x=max(6, source.width // 36), pad_y=max(6, source.height // 28)), {
             "visualBoxMethod": "product_layer_union"
         }
@@ -823,39 +866,11 @@ def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis)
         raise ValueError("no usable visual components")
     except Exception as exc:
         source_ratio = source.width / max(1, source.height)
-        package_label_candidates: list[tuple[int, int, int, int]] = []
-        for layer in analysis.marketing_text_layers:
-            box = _layer_box(layer, source)
-            cx, cy = _box_center(box)
-            rel_x = cx / max(1, source.width)
-            rel_y = cy / max(1, source.height)
-            area_ratio = _box_area(box) / max(1, source.width * source.height)
-            if 0.42 <= rel_x <= 0.78 and rel_y >= 0.26 and area_ratio <= 0.035:
-                package_label_candidates.append(box)
-        label_union = _union_boxes(package_label_candidates)
-        if label_union:
-            label_w = max(1, label_union[2] - label_union[0])
-            label_h = max(1, label_union[3] - label_union[1])
-            # A package label is only an inner detail of the sellable product.
-            # Expand from the mathematically detected label toward the probable
-            # pack/body bounds so the resize layer carries the product, not only
-            # the printed label rectangle.
-            expand_left = max(int(source.width * 0.16), int(label_w * 0.78))
-            expand_right = max(int(source.width * 0.13), int(label_w * 0.62))
-            expand_top = max(int(source.height * 0.34), int(label_h * 0.70))
-            expand_bottom = max(int(source.height * 0.30), int(label_h * 0.55))
-            return _clip_box(
-                (
-                    label_union[0] - expand_left,
-                    label_union[1] - expand_top,
-                    label_union[2] + expand_right,
-                    label_union[3] + expand_bottom,
-                ),
-                source.width,
-                source.height,
-            ), {
+        label_expanded_box, label_candidate_count = package_label_expanded_box()
+        if label_expanded_box:
+            return label_expanded_box, {
                 "visualBoxMethod": "package_label_expanded_fallback",
-                "packageLabelCandidateCount": len(package_label_candidates),
+                "packageLabelCandidateCount": label_candidate_count,
                 "visualBoxError": str(exc),
             }
         text_boxes = [layer.bbox.to_pixel_box(source.width, source.height) for layer in analysis.marketing_text_layers]
