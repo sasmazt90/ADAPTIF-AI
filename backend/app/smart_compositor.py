@@ -1893,6 +1893,7 @@ def _product_only_foreground_crop(
         h, w = alpha.shape[:2]
         if h < 8 or w < 8:
             return crop, source_box, {**meta, "productAlphaRejected": "crop_too_small"}
+        raw_visible_ratio = float(np.count_nonzero(alpha > 16)) / max(1, alpha.size)
 
         sx1, sy1, sx2, sy2 = source_box
         forbidden = np.zeros((h, w), dtype=np.uint8)
@@ -1933,7 +1934,7 @@ def _product_only_foreground_crop(
                 continue
             protected_locals.append((ix1 - sx1, iy1 - sy1, ix2 - sx1, iy2 - sy1))
         protected_union = _union_boxes(protected_locals)
-        if protected_union:
+        if protected_union and raw_visible_ratio > 0.70:
             px1, _py1, px2, _py2 = protected_union
             protected_w = max(1, px2 - px1)
             protected_cx = (px1 + px2) / 2.0
@@ -1946,6 +1947,8 @@ def _product_only_foreground_crop(
                 guard = cv2.GaussianBlur(guard, (0, 0), sigmaX=1.2, sigmaY=1.2)
                 alpha[guard <= 8] = 0
                 meta["productAlphaProtectedCorridor"] = [gx1, 0, gx2, h]
+        elif protected_union:
+            meta["productAlphaProtectedCorridor"] = "skipped_non_rectangular_product_alpha"
 
         # Keep only product-scale connected components. Detached logos/text and
         # cream-background flakes are rejected here even if the raw alpha kept them.
@@ -4013,11 +4016,11 @@ def _fallback_creative_director_plan(
             "pattern": "social-portrait-art-directed",
             "brand": (safe_x, safe_y, width - safe_x, int(height * 0.14)),
             "copy": (safe_x, int(height * 0.055), width - safe_x, int(height * 0.265)),
-            "rtb": (int(width * 0.62), int(height * 0.56), width - safe_x, int(height * 0.84)),
-            "visual": (0, int(height * 0.31), int(width * 0.56), height),
-            "badge": (int(width * 0.60), int(height * 0.28), width - safe_x, int(height * 0.43)),
+            "rtb": (int(width * 0.58), int(height * 0.57), width - safe_x, int(height * 0.88)),
+            "visual": (safe_x // 2, int(height * 0.31), int(width * 0.63), height),
+            "badge": (int(width * 0.54), int(height * 0.28), width - safe_x, int(height * 0.43)),
             "cta": (safe_x, int(height * 0.90), width - safe_x, height - safe_y),
-            "visualFitMode": "cover",
+            "visualFitMode": "contain",
             "visualAnchor": (0.50, 1.0),
             "allowLogo": False,
             "allowCta": False,
@@ -4448,61 +4451,25 @@ def composite_wide_creative_director_relayout(
         if label_union_for_social:
             label_cx, _label_cy = _box_center(label_union_for_social)
             label_w = max(1, label_union_for_social[2] - label_union_for_social[0])
-            crop_w = max(int(label_w * 2.55), int(source.height * 0.96))
+            # The product crop is an asset-preparation boundary, not a collision
+            # avoidance boundary. Keep the full sellable package readable here;
+            # RTB/copy placement must move around the pasted product later.
+            crop_w = max(int(label_w * 3.20), int(source.height * 1.10))
             product_union_for_social = _clip_box(
                 (
-                    int(round(label_cx - crop_w * 0.58)),
+                    int(round(label_cx - crop_w * 0.62)),
                     0,
-                    int(round(label_cx + crop_w * 0.62)),
+                    int(round(label_cx + crop_w * 0.68)),
                     source.height,
                 ),
                 source.width,
                 source.height,
             )
-            secondary_union_for_social = _union_boxes(parts["secondary"])
-            if secondary_union_for_social and product_union_for_social[2] > secondary_union_for_social[0]:
-                product_union_for_social = _clip_box(
-                    (
-                        product_union_for_social[0],
-                        product_union_for_social[1],
-                        max(product_union_for_social[0] + 1, secondary_union_for_social[0] - max(4, source.width // 100)),
-                        product_union_for_social[3],
-                    ),
-                    source.width,
-                    source.height,
-                )
         if product_union_for_social:
             if _box_area(product_union_for_social) / max(1, source.width * source.height) > 0.52:
                 product_union_for_social = visual_box
             crop_left, crop_top, crop_right, crop_bottom = product_union_for_social
             crop_w = max(1, crop_right - crop_left)
-            min_product_crop_w = max(int(source.height * 0.58), int(crop_w * 0.46))
-            max_social_product_right = visual_box[0] + int((visual_box[2] - visual_box[0]) * 0.68)
-            if max_social_product_right - crop_left >= min_product_crop_w:
-                crop_right = min(crop_right, max_social_product_right)
-            for text_box in floating_text_boxes:
-                vertical_overlap = _box_overlap((crop_left, crop_top, crop_right, crop_bottom), text_box) / max(1, min(_box_area((crop_left, crop_top, crop_right, crop_bottom)), _box_area(text_box)))
-                if vertical_overlap <= 0.01:
-                    continue
-                text_cx, _text_cy = _box_center(text_box)
-                if text_cx > crop_left + crop_w * 0.46:
-                    proposed_right = min(crop_right, max(crop_left + 1, text_box[0] - max(4, source.width // 100)))
-                    if proposed_right - crop_left >= min_product_crop_w:
-                        crop_right = proposed_right
-                elif text_cx < crop_left + crop_w * 0.18:
-                    proposed_left = max(crop_left, min(crop_right - 1, text_box[2] + max(4, source.width // 100)))
-                    if crop_right - proposed_left >= min_product_crop_w:
-                        crop_left = proposed_left
-            for layer in analysis.marketing_text_layers:
-                text_box = _expand_text_box_line_region(source, _layer_box(layer, source))
-                text_cx, text_cy = _box_center(text_box)
-                if text_cx <= source.width * 0.54 or text_cy <= source.height * 0.34:
-                    continue
-                if _box_overlap((crop_left, crop_top, crop_right, crop_bottom), text_box) <= 0:
-                    continue
-                proposed_right = min(crop_right, max(crop_left + 1, text_box[0] - max(4, source.width // 100)))
-                if proposed_right - crop_left >= min_product_crop_w:
-                    crop_right = proposed_right
             product_union_for_social = _clip_box((crop_left, crop_top, crop_right, crop_bottom), source.width, source.height)
             # Social/story outputs still need the whole sellable product, but
             # not the old broad visual box that also contains RTB/text artwork.
@@ -4683,9 +4650,10 @@ def composite_wide_creative_director_relayout(
     if preserve_brand_layers:
         trust_badge_boxes_for_output = parts.get("trust_badge", [])[:3]
     else:
-        # Social placements already have platform/account chrome. Do not carry
-        # detached source badges or brand-mark fragments into the creative.
-        trust_badge_boxes_for_output = []
+        # Social placements already have platform/account chrome, so source
+        # brand logos stay hidden. Independent trust badges are still ad
+        # evidence/RTB assets and may be carried into their own zone.
+        trust_badge_boxes_for_output = parts.get("trust_badge", [])[:2] if target_ratio < 0.82 else []
     for index, box in enumerate(trust_badge_boxes_for_output):
         badge_scale = brand_scale
         composited.append(
