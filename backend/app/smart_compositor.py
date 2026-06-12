@@ -72,6 +72,14 @@ def _layer_text(layer: Any) -> str:
     ).strip()
 
 
+def _block_source_box(block: Any) -> tuple[int, int, int, int]:
+    box = getattr(block, "resize_source_box", None) or getattr(block, "bbox", None) or (0, 0, 0, 0)
+    try:
+        return tuple(int(v) for v in box)  # type: ignore[arg-type, return-value]
+    except Exception:
+        return (0, 0, 0, 0)
+
+
 def _rgba_alpha_edge_touch(rgba: Image.Image, *, threshold: int = 24) -> list[str]:
     try:
         alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
@@ -1686,7 +1694,7 @@ def render_deterministic_compositor(
     if primary_union:
         primary_source_blocks = [
             block for block in source_text_blocks
-            if _box_overlap(getattr(block, "bbox", (0, 0, 0, 0)), primary_union) / max(1, _box_area(getattr(block, "bbox", (1, 1, 1, 1)))) >= 0.35
+            if _box_overlap(_block_source_box(block), primary_union) / max(1, _box_area(_block_source_box(block))) >= 0.35
         ]
         if primary_source_blocks:
             redrawn = _build_display_copy_stack_blocks(
@@ -1703,7 +1711,7 @@ def render_deterministic_compositor(
     if secondary_union_for_ids:
         secondary_source_blocks = [
             block for block in source_text_blocks
-            if _box_overlap(getattr(block, "bbox", (0, 0, 0, 0)), secondary_union_for_ids) / max(1, _box_area(getattr(block, "bbox", (1, 1, 1, 1)))) >= 0.35
+            if _box_overlap(_block_source_box(block), secondary_union_for_ids) / max(1, _box_area(_block_source_box(block))) >= 0.35
         ]
         if secondary_source_blocks:
             redrawn = _build_display_copy_stack_blocks(
