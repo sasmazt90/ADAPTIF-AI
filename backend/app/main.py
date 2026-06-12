@@ -18391,13 +18391,22 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
 
     source_entries: list[dict[str, Any]] = []
     for image_path in image_paths(paths):
+        print(f"[resize_e2e] source_start name={image_path.name}", flush=True)
         source_image = Image.open(image_path).convert("RGB")
         focus_bbox = (0, 0, source_image.width, source_image.height) if safe_resize_strategy else build_resize_focus_bbox(source_image)
+        print(f"[resize_e2e] analysis_start name={image_path.name}", flush=True)
         visual_analysis = build_smart_reframe_analysis(source_image, focus_bbox)
+        print(
+            f"[resize_e2e] analysis_done name={image_path.name} provider={smart_reframe_analysis_provider(visual_analysis)} "
+            f"text={len(visual_analysis.text_layers)} products={len(visual_analysis.product_layers)} other={len(visual_analysis.other_layers)}",
+            flush=True,
+        )
+        print(f"[resize_e2e] plan_start name={image_path.name} placements={','.join(canonical_placement_ids)}", flush=True)
         reframe_plans = {
             plan.placement_id: plan
             for plan in await SmartReframe(visual_analysis).execute(canonical_placement_ids, custom_width, custom_height)
         }
+        print(f"[resize_e2e] plan_done name={image_path.name} count={len(reframe_plans)}", flush=True)
         source_entries.append(
             {
                 "path": image_path,
@@ -18416,6 +18425,7 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
             plan = source_entry["reframe_plans"].get(canonical_id)
             render_meta: dict[str, Any] = {"provider": "local", "strategy": "legacy"}
             if smart_reframe_enabled and plan is not None:
+                print(f"[resize_e2e] render_start placement={canonical_id} source={source_entry['path'].name}", flush=True)
                 rendered, render_meta = render_smart_reframe_image(
                     source_entry["image"],
                     width,
@@ -18431,6 +18441,11 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
                     "providerOutpaintPlacementLimit": max_provider_placements,
                     "requestPlacementCount": len(canonical_placement_ids),
                 }
+                print(
+                    f"[resize_e2e] render_done placement={canonical_id} strategy={render_meta.get('strategy')} "
+                    f"provider={render_meta.get('provider')} productionReady={render_meta.get('productionReady')}",
+                    flush=True,
+                )
             elif safe_resize_strategy:
                 rendered = render_blurred_fit_resize(source_entry["image"], width, height)
                 render_meta = {"provider": "local", "strategy": "blurred_fit"}

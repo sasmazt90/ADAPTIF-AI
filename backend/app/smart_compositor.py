@@ -4879,8 +4879,14 @@ def composite_wide_creative_director_relayout(
             product_foreground_meta["productAlphaEdgeTouch"] = product_edge_touch
             product_completion_required = bool(product_edge_touch)
             product_foreground_ready_for_frame = not product_completion_required
+            print(
+                f"[resize_e2e] product_asset_alpha_ready size={product_foreground_source.width}x{product_foreground_source.height} "
+                f"edgeTouch={','.join(product_edge_touch) or 'none'} cutoutProvider={product_foreground_meta.get('productCutoutProvider')}",
+                flush=True,
+            )
             if product_completion_renderer is not None and product_edge_touch:
                 try:
+                    print("[resize_e2e] product_completion_start", flush=True)
                     completed_product, completion_meta = product_completion_renderer(
                         product_foreground_source,
                         {
@@ -4893,6 +4899,10 @@ def composite_wide_creative_director_relayout(
                     completed_product = _prepare_foreground_rgba_crop(completed_product.convert("RGBA"))
                     if completion_meta.get("productCompletionRejected"):
                         product_foreground_meta.update(completion_meta)
+                        print(
+                            f"[resize_e2e] product_completion_rejected reason={completion_meta.get('productCompletionRejected')}",
+                            flush=True,
+                        )
                     elif completed_product.getchannel("A").getbbox():
                         product_foreground_source = completed_product
                         product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
@@ -4905,6 +4915,11 @@ def composite_wide_creative_director_relayout(
                             }
                         )
                         product_foreground_ready_for_frame = True
+                        print(
+                            f"[resize_e2e] product_completion_done size={product_foreground_source.width}x{product_foreground_source.height} "
+                            f"provider={completion_meta.get('provider')} edgeAfter={','.join(_rgba_alpha_edge_touch(product_foreground_source)) or 'none'}",
+                            flush=True,
+                        )
                     else:
                         product_foreground_meta.update(
                             {
@@ -4912,13 +4927,20 @@ def composite_wide_creative_director_relayout(
                                 "productCompletionRejected": "empty_completed_alpha",
                             }
                         )
+                        print("[resize_e2e] product_completion_rejected reason=empty_completed_alpha", flush=True)
                 except Exception as exc:
                     product_foreground_meta["productCompletionError"] = str(exc)[:300]
+                    print(f"[resize_e2e] product_completion_error error={str(exc)[:180]}", flush=True)
             if product_completion_required and not product_foreground_ready_for_frame:
                 product_foreground_meta["productCompletionRequiredBeforePlacement"] = True
                 product_foreground_meta["productCompletionPlacementBlocked"] = True
+                print("[resize_e2e] product_completion_blocked_before_placement", flush=True)
         else:
             product_foreground_source = None
+            print(
+                f"[resize_e2e] product_asset_alpha_rejected reason={product_foreground_meta.get('productAlphaRejected')}",
+                flush=True,
+            )
 
     product_frame_source = product_foreground_source if product_foreground_ready_for_frame else None
     product_frame_box = product_foreground_box if product_foreground_ready_for_frame else None
