@@ -163,34 +163,15 @@ def _product_only_alpha_crop(
 
         extracted = _cv_foreground_alpha_crop(crop)
         alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
-        sx1, sy1, sx2, sy2 = source_box
-        for layer in [
-            *getattr(analysis, "marketing_text_layers", []),
-            *getattr(analysis, "logo_layers", []),
-            *getattr(analysis, "text_layers", []),
-        ]:
-            box = _pad_box(_layer_box(layer, source), source.width, source.height, pad_x=18, pad_y=8)
-            ix1, iy1 = max(sx1, box[0]), max(sy1, box[1])
-            ix2, iy2 = min(sx2, box[2]), min(sy2, box[3])
-            if ix2 <= ix1 or iy2 <= iy1:
-                continue
-            local_left = ix1 - sx1
-            local_right = ix2 - sx1
-            touches_crop_edge = local_left <= crop.width * 0.18 or local_right >= crop.width * 0.92
-            if touches_crop_edge:
-                alpha[iy1 - sy1 : iy2 - sy1, local_left:local_right] = 0
+        rgb = np.array(extracted.convert("RGB"), dtype=np.uint8)
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
         crop_h, crop_w = alpha.shape[:2]
-        upper = alpha[: max(1, int(crop_h * 0.58)), :]
-        column_coverage = np.sum(upper > 32, axis=0)
-        threshold = max(3, int(upper.shape[0] * 0.12))
-        valid_columns = np.where(column_coverage > threshold)[0]
-        if valid_columns.size:
-            product_left = max(0, int(valid_columns[0]) - 4)
-            product_right = min(crop_w, int(valid_columns[-1]) + 5)
-            if product_right - product_left >= max(12, int(crop_w * 0.28)) and product_left > 0:
-                extracted = extracted.crop((product_left, 0, product_right, crop_h))
-                alpha = alpha[:, product_left:product_right]
-                meta["productOnlyColumnTighten"] = [product_left, 0, product_right, crop_h]
+        x_grid = np.tile(np.arange(crop_w), (crop_h, 1))
+        edge_band = (x_grid < int(crop_w * 0.24)) | (x_grid > int(crop_w * 0.96))
+        saturated_edge_artifacts = edge_band & (hsv[:, :, 1] > 55) & (hsv[:, :, 2] > 45)
+        if np.any(saturated_edge_artifacts):
+            alpha[saturated_edge_artifacts] = 0
+            meta["productOnlyEdgeArtifactScrub"] = True
         binary = (alpha > 24).astype(np.uint8)
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
