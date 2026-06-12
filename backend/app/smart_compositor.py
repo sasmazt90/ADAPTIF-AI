@@ -1572,7 +1572,7 @@ def render_deterministic_compositor(
     target_ratio = width / max(1, height)
     source_ratio = source.width / max(1, source.height)
     is_social_square = abs(target_ratio - 1.0) < 0.1
-    display_placement = _placement_is_display_ad(plan.expansion.placement_id)
+    display_placement = _placement_is_display_ad(plan.placement_id)
     preserve_brand_layers = display_placement
     
     margin_x = max(12, int(width * 0.055))
