@@ -1177,7 +1177,7 @@ def _build_display_copy_stack_blocks(
         source_word_styles.extend(item_words)
 
     total_h = len(all_lines) * stack_line_height
-    start_y = stack_zone[1] + max(0, (stack_h - total_h) // 2)
+    start_y = stack_zone[1]
 
     updates = {
         "text": "\n".join(texts),
@@ -1192,7 +1192,7 @@ def _build_display_copy_stack_blocks(
         "line_height_estimate": stack_line_height,
         "render_strategy": "resize_display_copy_stack",
         "resize_stack_role": stack_role,
-        "align": "left" if not social else "center",
+        "align": "left",
     }
     for key, value in updates.items():
         setattr(base, key, value)
@@ -1830,6 +1830,29 @@ def _fallback_creative_director_plan(width: int, height: int, *, display_placeme
                 "cta": (margin_x, int(height * 0.76), int(width * 0.52), int(height * 0.92)),
                 "visual": (int(width * 0.50), int(height * 0.10), width - margin_x, int(height * 0.93)),
                 "rtb": (int(width * 0.58), int(height * 0.52), width - margin_x, int(height * 0.90)),
+            }
+        }
+    if abs(target_ratio - 1.0) <= 0.12:
+        split_x = width // 2
+        return {
+            "boxes": {
+                "brand": (margin_x, margin_y, split_x - margin_x, int(height * 0.14)),
+                "badge": (int(width * 0.72), margin_y, width - margin_x, int(height * 0.18)),
+                "copy": (margin_x, int(height * 0.12), split_x - margin_x, int(height * 0.54)),
+                "cta": (margin_x, int(height * 0.82), split_x - margin_x, height - margin_y),
+                "visual": (split_x + margin_x // 2, int(height * 0.12), width - margin_x, height - margin_y),
+                "rtb": (margin_x, int(height * 0.58), split_x - margin_x, int(height * 0.82)),
+            }
+        }
+    if target_ratio < 0.75:
+        return {
+            "boxes": {
+                "brand": (margin_x, margin_y, width - margin_x, int(height * 0.10)),
+                "badge": (int(width * 0.58), int(height * 0.24), width - margin_x, int(height * 0.36)),
+                "copy": (margin_x, int(height * 0.06), width - margin_x, int(height * 0.26)),
+                "cta": (margin_x, int(height * 0.88), width - margin_x, height - margin_y),
+                "visual": (margin_x, int(height * 0.32), int(width * 0.68), height - margin_y),
+                "rtb": (int(width * 0.54), int(height * 0.54), width - margin_x, int(height * 0.86)),
             }
         }
     if target_ratio <= 1.25:
