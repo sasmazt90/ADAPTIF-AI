@@ -13700,11 +13700,21 @@ def _constrain_completed_product_to_source_footprint(
         if xs.size == 0 or ys.size == 0:
             return completed, {"productFootprintConstraint": "skipped_empty_original_alpha"}
 
-        x1, x2 = int(xs.min()), int(xs.max()) + 1
-        y1, y2 = int(ys.min()), int(ys.max()) + 1
+        col_density = np.count_nonzero(full_original > 24, axis=0)
+        row_density = np.count_nonzero(full_original > 24, axis=1)
+        dense_cols = np.where(col_density >= max(6, int(float(col_density.max()) * 0.34)))[0]
+        dense_rows = np.where(row_density >= max(6, int(float(row_density.max()) * 0.18)))[0]
+        if dense_cols.size >= 4:
+            x1, x2 = int(dense_cols.min()), int(dense_cols.max()) + 1
+        else:
+            x1, x2 = int(xs.min()), int(xs.max()) + 1
+        if dense_rows.size >= 4:
+            y1, y2 = int(dense_rows.min()), int(dense_rows.max()) + 1
+        else:
+            y1, y2 = int(ys.min()), int(ys.max()) + 1
         footprint_w = max(1, x2 - x1)
         footprint_h = max(1, y2 - y1)
-        pad_x = max(10, int(footprint_w * 0.18))
+        pad_x = max(8, int(footprint_w * 0.12))
         pad_y = max(10, int(footprint_h * 0.18))
 
         allowed = np.zeros(alpha.shape, dtype=np.uint8)
@@ -13768,7 +13778,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v3-footprint-constrained"
+    cache_version = b"resize-product-completion-v4-dense-footprint"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
