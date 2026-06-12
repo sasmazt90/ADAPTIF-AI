@@ -13609,7 +13609,13 @@ def _validate_completed_product_asset(
 
     original_alpha_pixels = np.count_nonzero(np.array(original.getchannel("A"), dtype=np.uint8) > 24)
     new_alpha_pixels = int(np.count_nonzero(new_visible))
-    max_new_ratio = float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MAX_NEW_ALPHA_RATIO", "0.55"))
+    configured_max_new_ratio = float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MAX_NEW_ALPHA_RATIO", "0.55"))
+    # Completing both top and bottom of a pre-cropped package legitimately adds
+    # much more alpha than a single-edge repair. Keep the single-edge gate tight,
+    # but allow multi-edge product completion to pass the later color/artifact
+    # gates instead of being rejected only for area.
+    dynamic_max_new_ratio = 0.55 if len(set(edge_touch)) <= 1 else min(0.90, 0.36 + 0.24 * len(set(edge_touch)))
+    max_new_ratio = max(configured_max_new_ratio, dynamic_max_new_ratio)
     new_ratio = new_alpha_pixels / max(1, int(original_alpha_pixels))
     if new_ratio > max_new_ratio:
         return False, {
