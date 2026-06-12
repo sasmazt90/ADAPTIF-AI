@@ -13720,7 +13720,15 @@ def render_clean_base_outpaint_for_compositor(source: Image.Image, width: int, h
     raise RuntimeError("No outpaint provider is enabled for deterministic compositor.")
 
 
-def render_smart_reframe_image(source: Image.Image, width: int, height: int, plan: Any, analysis: VisualAnalysis) -> tuple[Image.Image, dict[str, Any]]:
+def render_smart_reframe_image(
+    source: Image.Image,
+    width: int,
+    height: int,
+    plan: Any,
+    analysis: VisualAnalysis,
+    *,
+    allow_provider_outpaint: bool = True,
+) -> tuple[Image.Image, dict[str, Any]]:
     text_blocks = build_resize_compositor_text_blocks(source, width, height, plan, analysis)
     return render_deterministic_compositor(
         source,
@@ -13730,7 +13738,7 @@ def render_smart_reframe_image(source: Image.Image, width: int, height: int, pla
         analysis,
         text_blocks=text_blocks,
         draw_text=draw_fitted_localize_v2_text,
-        outpaint_renderer=render_clean_base_outpaint_for_compositor,
+        outpaint_renderer=render_clean_base_outpaint_for_compositor if allow_provider_outpaint else None,
         fallback_renderer=render_nonblur_contain_placeholder,
     )
 
@@ -17916,6 +17924,8 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
     resize_strategy = os.getenv("ADAPTIFAI_RESIZE_STRATEGY", "smart-reframe").strip().lower()
     smart_reframe_enabled = resize_strategy in {"smart-reframe", "smart", "reframe"}
     safe_resize_strategy = resize_strategy in {"blurred-fit", "fit", "contain-blur", "safe"}
+    max_provider_placements = max(1, int(os.getenv("ADAPTIFAI_RESIZE_MAX_PROVIDER_PLACEMENTS_PER_REQUEST", "2")))
+    allow_provider_outpaint = len(canonical_placement_ids) <= max_provider_placements
     parity_report = build_preview_template_parity_report(canonical_placement_ids)
     parity_report_filename = "previewTemplateParityReport.json"
     (job_dir / parity_report_filename).write_text(json.dumps(parity_report, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -17953,7 +17963,14 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
                     height,
                     plan,
                     source_entry["visual_analysis"],
+                    allow_provider_outpaint=allow_provider_outpaint,
                 )
+                render_meta = {
+                    **render_meta,
+                    "providerOutpaintAllowedForRequest": allow_provider_outpaint,
+                    "providerOutpaintPlacementLimit": max_provider_placements,
+                    "requestPlacementCount": len(canonical_placement_ids),
+                }
             elif safe_resize_strategy:
                 rendered = render_blurred_fit_resize(source_entry["image"], width, height)
                 render_meta = {"provider": "local", "strategy": "blurred_fit"}
