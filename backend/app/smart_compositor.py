@@ -1603,6 +1603,138 @@ def _source_crop_with_global_foreground_alpha(source: Image.Image, source_box: t
     return _apply_foreground_alpha(crop)
 
 
+def _product_only_foreground_crop(
+    source: Image.Image,
+    source_box: tuple[int, int, int, int],
+    *,
+    forbidden_source_boxes: list[tuple[int, int, int, int]] | None = None,
+) -> tuple[Image.Image, tuple[int, int, int, int], dict[str, Any]]:
+    """Extract a product-only RGBA crop and mathematically remove floating raster fragments.
+
+    The compositor must not treat a rectangular product bbox as a product layer.
+    This function builds alpha from foreground segmentation, subtracts known
+    floating copy/logo/badge/RTB boxes, then keeps only the dominant connected
+    foreground component. Product packaging/label text remains because it is
+    connected to the bottle alpha; detached old raster text cannot leak through.
+    """
+    source_box = _clip_box(source_box, source.width, source.height)
+    crop = source.crop(source_box).convert("RGBA")
+    meta: dict[str, Any] = {
+        "productAlphaMode": "segmentation_minus_floating_layers",
+        "productAlphaSourceBox": list(source_box),
+        "productAlphaForbiddenBoxCount": len(forbidden_source_boxes or []),
+    }
+    try:
+        import cv2
+
+        extracted = _source_crop_with_global_foreground_alpha(source, source_box).convert("RGBA")
+        alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
+        h, w = alpha.shape[:2]
+        if h < 8 or w < 8:
+            return crop, source_box, {**meta, "productAlphaRejected": "crop_too_small"}
+
+        sx1, sy1, sx2, sy2 = source_box
+        forbidden = np.zeros((h, w), dtype=np.uint8)
+        for box in forbidden_source_boxes or []:
+            ix1 = max(sx1, box[0])
+            iy1 = max(sy1, box[1])
+            ix2 = min(sx2, box[2])
+            iy2 = min(sy2, box[3])
+            if ix2 <= ix1 or iy2 <= iy1:
+                continue
+            lx1, ly1 = ix1 - sx1, iy1 - sy1
+            lx2, ly2 = ix2 - sx1, iy2 - sy1
+            forbidden[ly1:ly2, lx1:lx2] = 255
+        if np.any(forbidden):
+            kernel = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE,
+                (max(5, min(19, w // 28) | 1), max(5, min(19, h // 28) | 1)),
+            )
+            forbidden = cv2.dilate(forbidden, kernel, iterations=1)
+            alpha[forbidden > 0] = 0
+
+        # Keep only product-scale connected components. Detached logos/text and
+        # cream-background flakes are rejected here even if the raw alpha kept them.
+        binary = (alpha > 24).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+        if num_labels <= 1:
+            return crop, source_box, {**meta, "productAlphaRejected": "empty_after_forbidden_subtraction"}
+
+        crop_area = max(1, w * h)
+        components: list[tuple[int, int, int, int, int, int]] = []
+        for label in range(1, num_labels):
+            area = int(stats[label, cv2.CC_STAT_AREA])
+            x = int(stats[label, cv2.CC_STAT_LEFT])
+            y = int(stats[label, cv2.CC_STAT_TOP])
+            bw = int(stats[label, cv2.CC_STAT_WIDTH])
+            bh = int(stats[label, cv2.CC_STAT_HEIGHT])
+            if area < max(80, int(crop_area * 0.012)):
+                continue
+            if bw < max(8, w * 0.06) and bh < max(8, h * 0.14):
+                continue
+            components.append((area, x, y, bw, bh, label))
+        if not components:
+            return crop, source_box, {**meta, "productAlphaRejected": "no_product_scale_component"}
+
+        components.sort(reverse=True)
+        main_area, main_x, main_y, main_w, main_h, main_label = components[0]
+        keep = np.zeros_like(alpha)
+        keep[labels == main_label] = alpha[labels == main_label]
+
+        # Allow smaller components only when they are close to / overlapping the
+        # main product silhouette. This keeps detached badges or old text out.
+        main_box = (main_x, main_y, main_x + main_w, main_y + main_h)
+        for area, x, y, bw, bh, label in components[1:]:
+            comp_box = (x, y, x + bw, y + bh)
+            expanded_main = (
+                main_box[0] - max(5, w // 28),
+                main_box[1] - max(5, h // 28),
+                main_box[2] + max(5, w // 28),
+                main_box[3] + max(5, h // 28),
+            )
+            if area >= main_area * 0.28 or _box_overlap(expanded_main, comp_box) > 0:
+                keep[labels == label] = alpha[labels == label]
+
+        keep = cv2.morphologyEx((keep > 12).astype(np.uint8) * 255, cv2.MORPH_CLOSE, kernel, iterations=1)
+        keep = cv2.GaussianBlur(keep, (0, 0), sigmaX=1.0, sigmaY=1.0)
+        visible_ratio = float(np.count_nonzero(keep > 16)) / crop_area
+        if not (0.035 <= visible_ratio <= 0.90):
+            return crop, source_box, {
+                **meta,
+                "productAlphaRejected": "unsafe_visible_ratio",
+                "productAlphaVisibleRatio": round(visible_ratio, 4),
+            }
+
+        result = crop.copy()
+        result.putalpha(Image.fromarray(keep, "L"))
+        trimmed = _trim_rgba_to_alpha(result, pad_ratio=0.025)
+        trim_box = result.getchannel("A").point(lambda value: 255 if value >= 32 else 0).getbbox()
+        if trim_box:
+            clean_source_box = _clip_box(
+                (
+                    source_box[0] + trim_box[0],
+                    source_box[1] + trim_box[1],
+                    source_box[0] + trim_box[2],
+                    source_box[1] + trim_box[3],
+                ),
+                source.width,
+                source.height,
+            )
+        else:
+            clean_source_box = source_box
+        return trimmed, clean_source_box, {
+            **meta,
+            "productAlphaRejected": None,
+            "productAlphaVisibleRatio": round(visible_ratio, 4),
+            "productAlphaComponentCount": len(components),
+            "productAlphaCleanSourceBox": list(clean_source_box),
+        }
+    except Exception as exc:
+        return crop, source_box, {**meta, "productAlphaRejected": "exception", "productAlphaError": str(exc)}
+
+
 def _remove_text_like_alpha_components(crop: Image.Image, alpha: Image.Image) -> Image.Image:
     try:
         import cv2
@@ -4198,10 +4330,14 @@ def composite_wide_creative_director_relayout(
                     preserve_source_position=True,
                 )
             )
-    for index, box in enumerate(parts.get("trust_badge", [])[:3]):
+    if preserve_brand_layers:
+        trust_badge_boxes_for_output = parts.get("trust_badge", [])[:3]
+    else:
+        # Social placements already have platform/account chrome. Do not carry
+        # detached source badges or brand-mark fragments into the creative.
+        trust_badge_boxes_for_output = []
+    for index, box in enumerate(trust_badge_boxes_for_output):
         badge_scale = brand_scale
-        if not display_placement:
-            badge_scale = max(brand_scale, min(1.30, max(width, height) / max(1, max(source.width, source.height)) * 1.12))
         composited.append(
             _paste_layer_relative(
                 output,
@@ -4430,6 +4566,20 @@ def composite_wide_creative_director_relayout(
         # or product labels, which is worse than preserving the exact source layer.
         return source
 
+    product_foreground_source: Image.Image | None = None
+    product_foreground_box: tuple[int, int, int, int] | None = None
+    product_foreground_meta: dict[str, Any] = {}
+    if meaningful_visuals:
+        product_foreground_source, product_foreground_source_box, product_foreground_meta = _product_only_foreground_crop(
+            source,
+            meaningful_visuals[0],
+            forbidden_source_boxes=visual_alpha_cut_boxes,
+        )
+        if product_foreground_meta.get("productAlphaRejected") is None:
+            product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
+        else:
+            product_foreground_source = None
+
     if visual_completion_source is not None:
         composited.append(
             _paste_crop_fit(
@@ -4448,14 +4598,14 @@ def composite_wide_creative_director_relayout(
         composited.append(
             _paste_crop_fit(
                 output,
-                source_for_visual_element(meaningful_visuals[0]),
-                meaningful_visuals[0],
+                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
+                product_foreground_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main-exact-label-overlay",
-                role="original_visual_label_readability_overlay",
+                role="product_only_foreground_readability_overlay" if product_foreground_source else "original_visual_label_readability_overlay",
                 mode="contain",
-                foreground_alpha=True,
-                alpha_cut_source_boxes=visual_label_cut_boxes,
+                foreground_alpha=product_foreground_source is None,
+                alpha_cut_source_boxes=[] if product_foreground_source else visual_label_cut_boxes,
                 anchor_bottom_if_source_truncated=True,
             )
         )
@@ -4463,14 +4613,14 @@ def composite_wide_creative_director_relayout(
         composited.append(
             _paste_crop_fit(
                 output,
-                source_for_visual_element(meaningful_visuals[0]),
-                meaningful_visuals[0],
+                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
+                product_foreground_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main-exact-foreground",
-                role="primary_visual_exact_readable_preserve",
+                role="product_only_visual_exact_preserve" if product_foreground_source else "primary_visual_exact_readable_preserve",
                 mode="contain",
-                foreground_alpha=True,
-                alpha_cut_source_boxes=visual_label_cut_boxes,
+                foreground_alpha=product_foreground_source is None,
+                alpha_cut_source_boxes=[] if product_foreground_source else visual_label_cut_boxes,
                 anchor_bottom_if_source_truncated=True,
             )
         )
@@ -4489,7 +4639,7 @@ def composite_wide_creative_director_relayout(
         use_fit_visual = plan_visual_fit_mode == "cover" or not (target_ratio < 0.78 and visual_edge_sides)
         paste_visual = _paste_crop_fit if use_fit_visual else _paste_crop_contain_limited
         visual_kwargs: dict[str, Any] = (
-            {"alpha_cut_source_boxes": visual_label_cut_boxes}
+            {"alpha_cut_source_boxes": [] if product_foreground_source else visual_label_cut_boxes}
             if paste_visual is _paste_crop_fit
             else {"max_scale": 3.65}
         )
@@ -4499,13 +4649,13 @@ def composite_wide_creative_director_relayout(
         composited.append(
             paste_visual(
                 output,
-                source_for_visual_element(meaningful_visuals[0]),
-                meaningful_visuals[0],
+                product_foreground_source or source_for_visual_element(meaningful_visuals[0]),
+                product_foreground_box or meaningful_visuals[0],
                 visual_render_bounds,
                 layer_id="visual-main",
-                role="primary_visual_readable",
+                role="product_only_primary_visual" if product_foreground_source else "primary_visual_readable",
                 anchor=plan_visual_anchor,
-                foreground_alpha=True,
+                foreground_alpha=product_foreground_source is None,
                 **visual_kwargs,
             )
         )
@@ -4680,6 +4830,7 @@ def composite_wide_creative_director_relayout(
         "visualSourceEdgeTouch": visual_edge_sides,
         "visualRenderBounds": list(visual_render_bounds),
         "partitionVisualBox": list(partition_visual_box),
+        **product_foreground_meta,
         **visual_meta,
     }
 
