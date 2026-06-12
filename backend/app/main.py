@@ -18912,13 +18912,16 @@ async def adapt(
     if not files:
         raise HTTPException(status_code=400, detail="Upload at least one creative.")
 
+    print(f"[adapt] start files={len(files)} mode={mode or 'auto'} placements={placements} output={output_format}", flush=True)
     background_tasks.add_task(cleanup_old_temp_files)
     job_id = uuid4().hex[:12]
     job_dir = temp_root() / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
 
+    print(f"[adapt] persist_uploads_start job={job_id}", flush=True)
     saved_paths = await persist_uploads(files, job_dir)
     uploaded_images = image_paths(saved_paths)
+    print(f"[adapt] persist_uploads_done job={job_id} saved={len(saved_paths)} images={len(uploaded_images)}", flush=True)
     if not uploaded_images:
         raise HTTPException(status_code=400, detail="No image files were found in the upload.")
 
@@ -18931,6 +18934,7 @@ async def adapt(
     except json.JSONDecodeError:
         parsed_creative_modes = {}
     resolved_mode = (mode or ("localize" if placement_ids == ["custom-display"] else "resize")).strip().lower()
+    print(f"[adapt] resolved job={job_id} mode={resolved_mode} placements={','.join(placement_ids)}", flush=True)
 
     async with ADAPT_PROCESSING_SEMAPHORE:
         if resolved_mode == "localize":
