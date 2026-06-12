@@ -18586,6 +18586,14 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
                 language=None,
                 translated_text="",
                 extracted_blocks=[],
+                debug={
+                    "analysisProvider": analysis_provider,
+                    "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
+                    "renderMeta": active_render_meta,
+                    "resizeDecisionLog": f"/api/download/{job_dir.name}/{resize_log_filename}",
+                    "resizedAsset": f"/api/download/{job_dir.name}/{resized_asset_filename}",
+                    "nativePlacementPreview": f"/api/download/{job_dir.name}/{preview_filename}",
+                },
             )
             outputs.append(asset)
             manifest_assets.append(

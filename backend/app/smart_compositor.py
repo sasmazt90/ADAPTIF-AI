@@ -1072,10 +1072,24 @@ def _partition_resize_layers(
         box_h = max(1, box[3] - box[1])
         area_ratio = _box_area(box) / max(1, w * h)
         descriptor = f"{text} {notes} {role}".lower()
-        explicit_trust = any(token in descriptor for token in ("badge", "seal", "award", "trust", "tavsiye", "recommended", "dermatolog"))
+        explicit_trust = any(
+            token in descriptor
+            for token in (
+                "trust",
+                "trusted",
+                "tavsiye",
+                "öneri",
+                "onay",
+                "recommended",
+                "dermatolog",
+                "dermatologist",
+                "dermatologist-tested",
+                "dermatologically",
+            )
+        )
         top_right_free_asset = cy <= h * 0.26 and cx >= w * 0.58 and box_w <= w * 0.34 and box_h <= h * 0.24
         not_product_overlap = _box_overlap(box, visual_box) / max(1, _box_area(box)) < 0.18
-        return not_product_overlap and 0.001 <= area_ratio <= 0.08 and (explicit_trust or top_right_free_asset)
+        return not_product_overlap and 0.001 <= area_ratio <= 0.08 and explicit_trust and top_right_free_asset
 
     for layer in analysis.marketing_text_layers:
         raw_box = _layer_box(layer, source)
