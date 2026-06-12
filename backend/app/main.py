@@ -13496,6 +13496,107 @@ def sample_resize_text_background_color(source: Image.Image, source_box: tuple[i
         return False, None
 
 
+def sample_resize_line_style(
+    source: Image.Image,
+    source_box: tuple[int, int, int, int],
+    fallback_color: str,
+) -> tuple[str, bool, str | None]:
+    """Sample a single source text line so resize redraw keeps per-line style.
+
+    Visual providers often group several marketing lines into one semantic layer.
+    Rendering must still preserve the source line styling: blue headline lines stay
+    blue, highlighted ribbon lines stay white-on-ribbon, and RTB lines keep their
+    own color.
+    """
+    box = (
+        max(0, min(source.width, int(source_box[0]))),
+        max(0, min(source.height, int(source_box[1]))),
+        max(0, min(source.width, int(source_box[2]))),
+        max(0, min(source.height, int(source_box[3]))),
+    )
+    if box[2] <= box[0] or box[3] <= box[1]:
+        return fallback_color, False, None
+    def dominant_highlight_in_box(candidate_box: tuple[int, int, int, int]) -> tuple[bool, str | None]:
+        crop_arr = np.array(source.crop(candidate_box).convert("RGB"), dtype=np.uint8)
+        if crop_arr.size == 0:
+            return False, None
+        pixels_arr = crop_arr.reshape(-1, 3)
+        brightness_arr = pixels_arr.mean(axis=1).astype(np.float32)
+        chroma_arr = (pixels_arr.max(axis=1) - pixels_arr.min(axis=1)).astype(np.float32)
+        saturated_arr = pixels_arr[(chroma_arr >= 54) & (brightness_arr >= 80) & (brightness_arr <= 245)]
+        saturated_ratio_arr = len(saturated_arr) / max(1, len(pixels_arr))
+        if len(saturated_arr) < 24 or saturated_ratio_arr < 0.07:
+            return False, None
+        quantized_arr = (saturated_arr.astype(np.uint16) // 24).astype(np.uint16)
+        packed_arr = quantized_arr[:, 0] * 256 + quantized_arr[:, 1] * 16 + quantized_arr[:, 2]
+        values_arr, counts_arr = np.unique(packed_arr, return_counts=True)
+        dominant_arr = saturated_arr[packed_arr == values_arr[int(np.argmax(counts_arr))]]
+        bg_arr = np.median(dominant_arr.reshape(-1, 3), axis=0).astype(int)
+        bg_tuple_arr = (int(bg_arr[0]), int(bg_arr[1]), int(bg_arr[2]))
+        if max(bg_tuple_arr) - min(bg_tuple_arr) < 42:
+            return False, None
+        # Avoid mistaking ordinary blue letters for a ribbon. A valid ribbon is
+        # a visible filled band, so the dominant saturated cluster must occupy a
+        # meaningful share of the local row window.
+        dominant_ratio = len(dominant_arr) / max(1, len(pixels_arr))
+        if dominant_ratio < 0.035:
+            return False, None
+        return True, rgb_to_hex(bg_tuple_arr)
+
+    try:
+        search_pad_x = max(6, int(round((box[2] - box[0]) * 0.10)))
+        search_pad_y = max(5, int(round((box[3] - box[1]) * 0.85)))
+        search_box = (
+            max(0, box[0] - search_pad_x),
+            max(0, box[1] - search_pad_y),
+            min(source.width, box[2] + search_pad_x),
+            min(source.height, box[3] + search_pad_y),
+        )
+        has_highlight, highlight_color = dominant_highlight_in_box(search_box)
+        if has_highlight and highlight_color:
+            return "#ffffff", True, highlight_color
+
+        crop = np.array(source.crop(box).convert("RGB"), dtype=np.uint8)
+        if crop.size == 0:
+            return fallback_color, False, None
+        sampled = sample_deterministic_text_color(source, box, fallback_color)
+        try:
+            sr, sg, sb = hex_to_rgb(sampled)
+            sampled_luma = 0.2126 * sr + 0.7152 * sg + 0.0722 * sb
+            sampled_chroma = max(sr, sg, sb) - min(sr, sg, sb)
+            if sampled_luma >= 165 and sampled_chroma <= 28:
+                widened = sample_deterministic_text_color(source, search_box, fallback_color)
+                if widened.lower() != "#111111":
+                    sampled = widened
+        except Exception:
+            pass
+        if sampled.lower() == "#111111" and fallback_color and fallback_color.lower() != "#111111":
+            # LLM/vision global style sometimes collapses to black for grouped
+            # layers. Prefer a non-black inherited fallback when deterministic
+            # sampling cannot isolate a better foreground.
+            return fallback_color, False, None
+        return sampled, False, None
+    except Exception:
+        return fallback_color, False, None
+
+
+def split_resize_box_into_line_boxes(
+    source_box: tuple[int, int, int, int],
+    line_count: int,
+) -> list[tuple[int, int, int, int]]:
+    line_count = max(1, int(line_count))
+    left, top, right, bottom = source_box
+    height = max(1, bottom - top)
+    line_boxes: list[tuple[int, int, int, int]] = []
+    for index in range(line_count):
+        y1 = top + int(round(index * height / line_count))
+        y2 = top + int(round((index + 1) * height / line_count))
+        if y2 <= y1:
+            y2 = y1 + 1
+        line_boxes.append((left, y1, right, bottom if index == line_count - 1 else y2))
+    return line_boxes
+
+
 _RESIZE_TURKISH_OCR_TOKEN_FIXES = {
     "TUM": "TÜM",
     "CILT": "CİLT",
@@ -13582,6 +13683,7 @@ def build_resize_compositor_text_blocks(
         if layer is None or not layer.original_text.strip():
             continue
         resize_text = normalize_resize_ocr_copy(repair_mojibake(layer.original_text).strip())
+        translated_resize_text = normalize_resize_ocr_copy(repair_mojibake(getattr(layer, "translated_text", "") or "").strip())
         source_box = layer.bbox.to_pixel_box(source.width, source.height)
         placement_box = placement.target_bbox.to_pixel_box(width, height)
         union_w = max(1, text_source_union[2] - text_source_union[0])
@@ -13611,76 +13713,82 @@ def build_resize_compositor_text_blocks(
         target_line_capacity = max(8, int(max(1, target_box[3] - target_box[1]) / line_count * 0.76))
         font_size = max(8, min(180, int(round(min(source_font_size * area_scale, target_line_capacity)))))
         color = smart_reframe_text_style_to_block_color(style)
-        _has_text_background, _text_background_color = sample_resize_text_background_color(source, source_box, color)
-        # Resize redraw must not invent solid rectangular backing plates. Those
-        # plates can cover the recomposed product layer and make the output look
-        # like text was drawn inside a foreign frame. Saturated source highlight
-        # bars are allowed; neutral white/gray backing plates are suppressed.
-        has_text_background = False
-        text_background_color = None
-        if _has_text_background and _text_background_color:
-            try:
-                bg_r, bg_g, bg_b = hex_to_rgb(_text_background_color)
-                bg_max = max(bg_r, bg_g, bg_b)
-                bg_min = min(bg_r, bg_g, bg_b)
-                bg_saturation = (bg_max - bg_min) / max(1, bg_max)
-                bg_luma = 0.2126 * bg_r + 0.7152 * bg_g + 0.0722 * bg_b
-                if bg_saturation >= 0.18 and bg_luma < 248:
-                    has_text_background = True
-                    text_background_color = _text_background_color
-            except Exception:
-                has_text_background = False
-                text_background_color = None
         font_weight = 700 if style is None or style.is_bold else 400
         align = style.alignment if style and style.alignment != "unknown" else "center"
         font_category = (style.font_type if style and style.font_type != "unknown" else "sans-serif").replace("script", "handwriting")
-        words = [word for word in resize_text.replace("\n", " ").split() if word]
-        source_word_styles = [
-            {
-                "id": f"{layer.id}-w{index}",
-                "text": word,
-                "bbox": [target_box[0], target_box[1], target_box[0] + max(1, font_size), target_box[1] + font_size],
-                "fontSize": font_size,
-                "peerRowFontSize": font_size,
-                "fontWeight": font_weight,
-                "fontCategory": font_category,
-                "color": color,
-                "hasTextBackground": has_text_background,
-                "backgroundColor": text_background_color,
-                "lineIndex": 0,
-            }
-            for index, word in enumerate(words)
-        ]
-        spans = [
-            {
-                "translatedText": resize_text,
-                "sourceText": resize_text,
-                "semanticRole": layer.role.value,
-                "matchedSourceRole": layer.role.value,
-                "sourceWordStyles": source_word_styles,
-                "sourceWordIds": [item["id"] for item in source_word_styles],
-                "style": {
-                    "fontFamily": "DejaVu Sans",
-                    "fontCategory": font_category,
-                    "fontWeight": font_weight,
+        translated_lines = [line.strip() for line in translated_resize_text.splitlines() if line.strip()]
+        if not translated_lines:
+            translated_lines = [line.strip() for line in resize_text.splitlines() if line.strip()]
+        if not translated_lines:
+            translated_lines = [resize_text]
+        source_lines = [line.strip() for line in resize_text.splitlines() if line.strip()]
+        if not source_lines:
+            source_lines = translated_lines
+        line_count_for_style = max(len(source_lines), len(translated_lines), 1)
+        line_source_boxes = split_resize_box_into_line_boxes(source_box, line_count_for_style)
+
+        source_word_styles: list[dict[str, Any]] = []
+        spans: list[dict[str, Any]] = []
+        for line_index, translated_line in enumerate(translated_lines):
+            source_line = source_lines[min(line_index, len(source_lines) - 1)] if source_lines else translated_line
+            line_source_box = line_source_boxes[min(line_index, len(line_source_boxes) - 1)]
+            line_color, has_text_background, text_background_color = sample_resize_line_style(source, line_source_box, color)
+            line_words = [word for word in translated_line.split() if word]
+            line_word_styles: list[dict[str, Any]] = []
+            line_target_top = target_box[1] + int(round(line_index * max(1, target_box[3] - target_box[1]) / max(1, len(translated_lines))))
+            for word_index, word in enumerate(line_words):
+                style_item = {
+                    "id": f"{layer.id}-l{line_index}-w{word_index}",
+                    "text": word,
+                    "bbox": [
+                        target_box[0],
+                        line_target_top,
+                        target_box[0] + max(1, font_size),
+                        line_target_top + font_size,
+                    ],
                     "fontSize": font_size,
-                    "color": color,
+                    "peerRowFontSize": font_size,
+                    "fontWeight": font_weight,
+                    "fontCategory": font_category,
+                    "color": line_color,
                     "hasTextBackground": has_text_background,
                     "backgroundColor": text_background_color,
-                    "opacity": 1.0,
-                    "letterSpacing": 0.0,
-                    "lineHeight": int(round(font_size * 1.18)),
-                    "alignment": align,
-                    "casing": "uppercase" if style and style.uppercase else "mixed",
-                    "strokeWidth": 0,
-                    "strokeFill": None,
-                },
-            }
-        ]
+                    "lineIndex": line_index,
+                }
+                line_word_styles.append(style_item)
+                source_word_styles.append(style_item)
+            spans.append(
+                {
+                    "translatedText": translated_line,
+                    "sourceText": source_line,
+                    "semanticRole": layer.role.value,
+                    "matchedSourceRole": layer.role.value,
+                    "forceBreakAfter": True,
+                    "sourceWordStyles": line_word_styles,
+                    "sourceWordIds": [item["id"] for item in line_word_styles],
+                    "style": {
+                        "fontFamily": "DejaVu Sans",
+                        "fontCategory": font_category,
+                        "fontWeight": font_weight,
+                        "fontSize": font_size,
+                        "color": line_color,
+                        "hasTextBackground": has_text_background,
+                        "backgroundColor": text_background_color,
+                        "opacity": 1.0,
+                        "letterSpacing": 0.0,
+                        "lineHeight": int(round(font_size * 1.18)),
+                        "alignment": align,
+                        "casing": "uppercase" if style and style.uppercase else "mixed",
+                        "strokeWidth": 0,
+                        "strokeFill": None,
+                    },
+                }
+            )
+        block_text = "\n".join(translated_lines)
         block = TextBlock(
             id=f"v5-resize-{layer.id}",
-            text=resize_text,
-            translated_text=resize_text,
+            text=block_text,
+            translated_text=block_text,
             role=layer.role.value,
             translate=True,
             bbox=target_box,
@@ -13692,7 +13800,7 @@ def build_resize_compositor_text_blocks(
             align=align,
             surface="overlay",
             line_boxes=[target_box],
-            line_texts=source_lines or [resize_text],
+            line_texts=translated_lines,
             resize_source_box=source_box,
             source_word_styles=source_word_styles,
             translated_style_spans=spans,

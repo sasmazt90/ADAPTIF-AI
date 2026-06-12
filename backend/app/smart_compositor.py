@@ -2436,7 +2436,7 @@ def _build_display_copy_stack_blocks(
                 continue
             span["translatedText"] = text
             span["sourceText"] = text
-            span["forceBreakAfter"] = span_index == len(block_spans) - 1
+            span["forceBreakAfter"] = bool(span.get("forceBreakAfter")) or span_index == len(block_spans) - 1
             style = span.setdefault("style", {})
             style["fontSize"] = stack_font_size
             style["lineHeight"] = stack_line_height
