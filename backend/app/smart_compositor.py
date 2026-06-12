@@ -1923,12 +1923,9 @@ def _product_only_foreground_crop(
             elif heavy_local_fallback and segmentation_backend in {"rembg", "u2net", "isnet", "auto", "1", "true", "yes", "on", "provider"}:
                 extracted = _apply_foreground_alpha(crop).convert("RGBA")
             elif segmentation_backend in {"replicate", "provider"} and os.getenv("REPLICATE_API_TOKEN", "").strip():
-                return crop, source_box, {
-                    **meta,
-                    **cutout_meta,
-                    "productAlphaRejected": "product_cutout_provider_failed",
-                    "productAlphaFallbackBlocked": "dirty_cv_alpha_cannot_enter_frame",
-                }
+                extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
+                meta.update(cutout_meta)
+                meta["productAlphaFallback"] = "label_seeded_grabcut_after_provider_failure"
             else:
                 extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
             raw_alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
@@ -2001,6 +1998,92 @@ def _product_only_foreground_crop(
                 meta["productAlphaProtectedCorridor"] = [gx1, 0, gx2, h]
         elif protected_union:
             meta["productAlphaProtectedCorridor"] = "skipped_non_rectangular_product_alpha"
+
+        if protected_union and meta.get("productAlphaFallback") == "label_seeded_grabcut_after_provider_failure":
+            try:
+                rgb = np.array(crop.convert("RGB"), dtype=np.uint8)
+                grab_mask = np.full((h, w), cv2.GC_PR_BGD, dtype=np.uint8)
+                px1, py1, px2, py2 = protected_union
+                protected_cx = (px1 + px2) / 2.0
+                protected_w = max(1, px2 - px1)
+                corridor_half = max(int(protected_w * 1.15), int(w * 0.20), 18)
+                gx1 = max(0, int(round(protected_cx - corridor_half)))
+                gx2 = min(w, int(round(protected_cx + corridor_half)))
+                grab_mask[:, gx1:gx2] = cv2.GC_PR_FGD
+                for lx1, ly1, lx2, ly2 in protected_locals:
+                    grab_mask[max(0, ly1):min(h, ly2), max(0, lx1):min(w, lx2)] = cv2.GC_FGD
+                border = max(4, min(w, h) // 35)
+                grab_mask[:border, :] = cv2.GC_BGD
+                grab_mask[-border:, :] = cv2.GC_BGD
+                grab_mask[:, :border] = cv2.GC_BGD
+                grab_mask[:, -border:] = cv2.GC_BGD
+                grab_mask[:, :max(0, gx1 - max(8, w // 40))] = cv2.GC_BGD
+                grab_mask[:, min(w, gx2 + max(8, w // 40)):] = cv2.GC_BGD
+                grab_mask[forbidden > 0] = cv2.GC_BGD
+                bgd_model = np.zeros((1, 65), np.float64)
+                fgd_model = np.zeros((1, 65), np.float64)
+                cv2.grabCut(rgb, grab_mask, None, bgd_model, fgd_model, 7, cv2.GC_INIT_WITH_MASK)
+                grab_fg = ((grab_mask == cv2.GC_FGD) | (grab_mask == cv2.GC_PR_FGD)).astype(np.uint8) * 255
+                color = rgb.astype(np.int16)
+                red, green, blue = color[:, :, 0], color[:, :, 1], color[:, :, 2]
+                luma = (0.299 * red + 0.587 * green + 0.114 * blue)
+                saturation = color.max(axis=2) - color.min(axis=2)
+                neutral_packaging = (
+                    (luma > 145)
+                    & (np.abs(red - green) < 24)
+                    & (np.abs(green - blue) < 28)
+                    & (blue >= red - 14)
+                )
+                label_or_print = (saturation > 35) & (luma > 20)
+                label_guard = np.zeros((h, w), dtype=bool)
+                label_guard[:, max(0, gx1 - max(4, w // 80)) : min(w, gx2 + max(4, w // 80))] = True
+                refined = (grab_fg > 0) & (neutral_packaging | (label_or_print & label_guard))
+                count, refined_labels, refined_stats, _ = cv2.connectedComponentsWithStats(refined.astype(np.uint8), 8)
+                refined_keep = np.zeros((h, w), dtype=np.uint8)
+                for label in range(1, count):
+                    component = refined_labels == label
+                    touches_protected = any(
+                        bool(np.any(component[max(0, ly1):min(h, ly2), max(0, lx1):min(w, lx2)]))
+                        for lx1, ly1, lx2, ly2 in protected_locals
+                    )
+                    if not touches_protected:
+                        continue
+                    area = int(refined_stats[label, cv2.CC_STAT_AREA])
+                    if area < max(24, int(w * h * 0.002)):
+                        continue
+                    refined_keep[component] = 255
+                if refined_keep.max() > 0:
+                    refine_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+                    refined_keep = cv2.morphologyEx(refined_keep, cv2.MORPH_CLOSE, refine_kernel, iterations=1)
+                    center_x = int(round(protected_cx))
+                    central_keep = np.zeros_like(refined_keep)
+                    for row_index in range(h):
+                        xs = np.where(refined_keep[row_index] > 0)[0]
+                        if xs.size == 0:
+                            continue
+                        runs: list[tuple[int, int]] = []
+                        start = int(xs[0])
+                        previous = int(xs[0])
+                        for value in xs[1:]:
+                            value = int(value)
+                            if value > previous + 1:
+                                runs.append((start, previous + 1))
+                                start = value
+                            previous = value
+                        runs.append((start, previous + 1))
+                        selected = min(
+                            runs,
+                            key=lambda run: 0 if run[0] <= center_x <= run[1] else min(abs(center_x - run[0]), abs(center_x - run[1])),
+                        )
+                        central_keep[row_index, selected[0] : selected[1]] = refined_keep[row_index, selected[0] : selected[1]]
+                    refined_keep = central_keep
+                    refined_keep = cv2.morphologyEx(refined_keep, cv2.MORPH_CLOSE, refine_kernel, iterations=1)
+                    refined_keep = cv2.GaussianBlur(refined_keep, (0, 0), sigmaX=0.75, sigmaY=0.75)
+                    alpha = refined_keep.astype(np.uint8)
+                    meta["productAlphaFallbackRefinement"] = "grabcut_neutral_packaging_label_seeded_central_runs"
+            except Exception as exc:
+                meta["productAlphaFallbackRefinement"] = "failed"
+                meta["productAlphaFallbackRefinementError"] = str(exc)[:220]
 
         # Keep only product-scale connected components. Detached logos/text and
         # cream-background flakes are rejected here even if the raw alpha kept them.
