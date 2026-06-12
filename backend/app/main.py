@@ -13475,6 +13475,8 @@ def build_resize_product_completion_prompt(edge_touch: list[str]) -> str:
         "Complete only the missing outer shape of this isolated product packaging asset. "
         f"The product is visibly truncated at: {missing_parts}. "
         "Preserve the existing opaque product pixels exactly, especially all brand marks, label text, colors, shadows, perspective, and bottle geometry. "
+        "Continue the visible closure/cap/body geometry that is already present; do not invent a new closure type. "
+        "Do not add screw caps, metal caps, pumps, nozzles, foil, ridges, hands, holders, or any hardware/details that are not clearly implied by the visible product. "
         "Do not translate, rewrite, redraw, approximate, or invent any label text. "
         "Do not add marketing copy, badges, logos, UI, background scenery, frames, hands, people, or extra products. "
         "Generate only the physically continuous missing cap/body/bottom pixels needed to make the same single product look complete. "
@@ -13750,11 +13752,14 @@ def _constrain_completed_product_to_source_footprint(
         original_visible = original_alpha > 24
         if np.any(original_visible):
             median_rgb = np.median(source_rgb[original_visible], axis=0).astype(np.uint8)
+            std_rgb = np.std(source_rgb[original_visible].astype(np.float32), axis=0)
             new_visible = new_area & (alpha > 24)
             rgb = comp[:, :, :3]
             saturation = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2).astype(np.int16)
             dark = rgb.min(axis=2) < 42
-            artifact = new_visible & ((saturation > 96) | dark)
+            distance_from_product = np.linalg.norm(rgb.astype(np.float32) - median_rgb.reshape(1, 1, 3).astype(np.float32), axis=2)
+            allowed_distance = max(42.0, float(np.linalg.norm(std_rgb)) * 1.45)
+            artifact = new_visible & ((saturation > 96) | dark | (distance_from_product > allowed_distance))
             if np.any(artifact):
                 rgb[artifact] = median_rgb
                 comp[:, :, :3] = rgb
@@ -13778,7 +13783,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v4-dense-footprint"
+    cache_version = b"resize-product-completion-v5-strict-closure-and-edge-cleanup"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
