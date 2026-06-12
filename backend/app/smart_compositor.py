@@ -33,6 +33,36 @@ def _placement_is_display_ad(placement_id: str | None) -> bool:
     return _placement_preserves_creative_brand_layers(placement_id)
 
 
+def classify_text_role(text: str) -> str:
+    normalized = (text or "").strip().lower()
+    cta_hints = {
+        "buy",
+        "shop",
+        "learn",
+        "discover",
+        "order",
+        "try",
+        "start",
+        "get",
+        "view",
+        "see",
+        "incele",
+        "satın",
+        "al",
+        "keşfet",
+        "öğren",
+        "daha fazla",
+        "hemen",
+    }
+    if any(hint in normalized for hint in cta_hints):
+        return "cta" if len((text or "").split()) <= 6 else "headline"
+    if (text or "").isupper() and len((text or "").split()) <= 3:
+        return "product_label"
+    if any(char.isdigit() for char in (text or "")) and len((text or "").split()) <= 4 and "%" not in (text or ""):
+        return "product_label"
+    return "headline" if len(text or "") > 10 else "product_label"
+
+
 def _rgba_alpha_edge_touch(rgba: Image.Image, *, threshold: int = 24) -> list[str]:
     try:
         alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
