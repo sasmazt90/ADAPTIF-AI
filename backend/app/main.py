@@ -13348,7 +13348,10 @@ def build_vertex_outpaint_base_and_mask(seed: Image.Image, seed_meta: dict[str, 
     alpha = np.array(rgba_seed.getchannel("A"), dtype=np.uint8)
     rgb_seed = rgba_seed.convert("RGB")
     if seed_meta.get("layoutSeedTransparentPixels"):
-        base = rgb_seed
+        visible = np.array(rgb_seed, dtype=np.uint8)[alpha > 0]
+        fill_color = tuple(int(value) for value in (np.median(visible, axis=0) if visible.size else np.array([245, 245, 245])))
+        base = Image.new("RGB", seed.size, fill_color)
+        base.paste(rgb_seed, (0, 0), rgba_seed.getchannel("A"))
     elif int(np.count_nonzero(alpha)) < seed.width * seed.height:
         visible = np.array(rgb_seed, dtype=np.uint8)[alpha > 0]
         fill_color = tuple(int(value) for value in (visible.mean(axis=0) if visible.size else np.array([245, 245, 245])))
@@ -13474,6 +13477,109 @@ def build_resize_product_completion_seed(product: Image.Image, edge_touch: list[
     }
 
 
+def _edge_strip_color_stats(image: Image.Image, edge: str, strip: int) -> tuple[np.ndarray, np.ndarray]:
+    rgba = image.convert("RGBA")
+    arr = np.array(rgba, dtype=np.uint8)
+    alpha = arr[:, :, 3]
+    if edge == "top":
+        region = arr[:strip, :, :]
+    elif edge == "bottom":
+        region = arr[max(0, arr.shape[0] - strip):, :, :]
+    elif edge == "left":
+        region = arr[:, :strip, :]
+    elif edge == "right":
+        region = arr[:, max(0, arr.shape[1] - strip):, :]
+    else:
+        region = arr
+    visible = region[region[:, :, 3] > 24][:, :3]
+    if visible.size == 0:
+        visible = arr[alpha > 24][:, :3]
+    if visible.size == 0:
+        return np.array([245.0, 245.0, 245.0]), np.array([0.0, 0.0, 0.0])
+    return np.median(visible.astype(np.float32), axis=0), np.std(visible.astype(np.float32), axis=0)
+
+
+def _validate_completed_product_asset(
+    original_product: Image.Image,
+    completed_product: Image.Image,
+    paste_box: list[int],
+    edge_touch: list[str],
+) -> tuple[bool, dict[str, Any]]:
+    original = original_product.convert("RGBA")
+    completed = completed_product.convert("RGBA")
+    comp = np.array(completed, dtype=np.uint8)
+    alpha = comp[:, :, 3]
+    left, top, right, bottom = [int(v) for v in paste_box]
+    new_area = np.zeros(alpha.shape, dtype=bool)
+    if "top" in edge_touch:
+        new_area[:max(0, top), :] = True
+    if "bottom" in edge_touch:
+        new_area[min(alpha.shape[0], bottom):, :] = True
+    if "left" in edge_touch:
+        new_area[:, :max(0, left)] = True
+    if "right" in edge_touch:
+        new_area[:, min(alpha.shape[1], right):] = True
+    new_visible = new_area & (alpha > 24)
+    new_pixels = comp[new_visible][:, :3].astype(np.float32)
+    if new_pixels.size == 0:
+        return False, {"productCompletionRejected": "no_visible_completed_pixels"}
+
+    original_alpha_pixels = np.count_nonzero(np.array(original.getchannel("A"), dtype=np.uint8) > 24)
+    new_alpha_pixels = int(np.count_nonzero(new_visible))
+    max_new_ratio = float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MAX_NEW_ALPHA_RATIO", "0.55"))
+    new_ratio = new_alpha_pixels / max(1, int(original_alpha_pixels))
+    if new_ratio > max_new_ratio:
+        return False, {
+            "productCompletionRejected": "excessive_new_alpha_area",
+            "productCompletionNewAlphaRatio": round(new_ratio, 4),
+        }
+
+    strip = max(6, min(32, int(min(original.width, original.height) * 0.08)))
+    failures: list[str] = []
+    distances: dict[str, float] = {}
+    for edge in edge_touch:
+        source_median, source_std = _edge_strip_color_stats(original, edge, strip)
+        if edge == "top":
+            edge_region = comp[:max(0, top), :, :]
+        elif edge == "bottom":
+            edge_region = comp[min(comp.shape[0], bottom):, :, :]
+        elif edge == "left":
+            edge_region = comp[:, :max(0, left), :]
+        elif edge == "right":
+            edge_region = comp[:, min(comp.shape[1], right):, :]
+        else:
+            continue
+        edge_pixels = edge_region[edge_region[:, :, 3] > 24][:, :3].astype(np.float32)
+        if edge_pixels.size == 0:
+            continue
+        generated_median = np.median(edge_pixels, axis=0)
+        tolerance = max(52.0, float(np.linalg.norm(source_std)) * 1.8)
+        distance = float(np.linalg.norm(generated_median - source_median))
+        distances[edge] = round(distance, 2)
+        if distance > tolerance:
+            failures.append(f"{edge}:color_drift_{distance:.1f}>{tolerance:.1f}")
+
+    dark_ratio = float(np.mean(np.min(new_pixels, axis=1) < 36))
+    saturation = new_pixels.max(axis=1) - new_pixels.min(axis=1)
+    high_saturation_ratio = float(np.mean(saturation > 128))
+    if dark_ratio > 0.18:
+        failures.append(f"dark_detail_ratio_{dark_ratio:.2f}")
+    if high_saturation_ratio > 0.35:
+        failures.append(f"high_saturation_ratio_{high_saturation_ratio:.2f}")
+    if failures:
+        return False, {
+            "productCompletionRejected": "failed_edge_consistency_gate",
+            "productCompletionGateFailures": failures,
+            "productCompletionColorDistances": distances,
+            "productCompletionNewAlphaRatio": round(new_ratio, 4),
+        }
+    return True, {
+        "productCompletionGate": "passed",
+        "productCompletionColorDistances": distances,
+        "productCompletionNewAlphaRatio": round(new_ratio, 4),
+    }
+
+
 def render_resize_product_asset_completion(product: Image.Image, meta: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
     edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
     if not edge_touch:
@@ -13591,13 +13697,19 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     paste_box = seed_meta["productCompletionSeedPasteBox"]
     completed.alpha_composite(product.convert("RGBA"), (paste_box[0], paste_box[1]))
     completed = _prepare_foreground_rgba_crop(completed)
+    accepted, gate_meta = _validate_completed_product_asset(product, completed, paste_box, edge_touch)
     result_meta = {
         **provider_meta,
         **seed_meta,
+        **gate_meta,
         "productCompletionInputEdgeTouch": edge_touch,
         "productCompletionOutputSize": list(completed.size),
         "productCompletionCache": "miss",
     }
+    if not accepted:
+        result = product.convert("RGBA")
+        _RESIZE_PRODUCT_COMPLETION_CACHE[cache_key] = (result.copy(), result_meta.copy())
+        return result, result_meta
     if len(_RESIZE_PRODUCT_COMPLETION_CACHE) > 8:
         _RESIZE_PRODUCT_COMPLETION_CACHE.clear()
     _RESIZE_PRODUCT_COMPLETION_CACHE[cache_key] = (completed.copy(), result_meta.copy())

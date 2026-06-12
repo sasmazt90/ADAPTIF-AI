@@ -4942,7 +4942,9 @@ def composite_wide_creative_director_relayout(
                         },
                     )
                     completed_product = _prepare_foreground_rgba_crop(completed_product.convert("RGBA"))
-                    if completed_product.getchannel("A").getbbox():
+                    if completion_meta.get("productCompletionRejected"):
+                        product_foreground_meta.update(completion_meta)
+                    elif completed_product.getchannel("A").getbbox():
                         product_foreground_source = completed_product
                         product_foreground_box = (0, 0, product_foreground_source.width, product_foreground_source.height)
                         product_foreground_meta.update(
