@@ -735,7 +735,8 @@ def _detect_role_aware_visual_box(source: Image.Image, analysis: VisualAnalysis)
         box_h_ratio = (box[3] - box[1]) / max(1, source.height)
         if source_ratio > 1.35 and cy < source.height * 0.24 and box_h_ratio < 0.30:
             continue
-        if source_ratio > 1.35 and box_h_ratio < 0.38:
+        touches_vertical_edge = box[1] <= source.height * 0.035 or box[3] >= source.height * 0.965
+        if source_ratio > 1.35 and (box_h_ratio < 0.45 or touches_vertical_edge):
             box = _expand_product_seed_box(source, box)
         text_overlap_ratio = sum(_box_overlap(box, text_box) for text_box in text_boxes_for_filter) / max(1, _box_area(box))
         if source_ratio > 1.35 and text_overlap_ratio > 0.18:
@@ -3772,6 +3773,12 @@ def build_creative_director_resize_plan(
     target_area_smaller: bool,
 ) -> dict[str, Any]:
     fallback = _fallback_creative_director_plan(width, height, display_placement=display_placement)
+    if display_placement and width / max(1, height) < 0.55:
+        fallback["allowLogo"] = True
+        fallback["allowCta"] = True
+        fallback["allowGuides"] = True
+        fallback["validationNotes"] = ["forced_display_skyscraper_hard_grid"]
+        return fallback
     ai_plan = _request_ai_creative_director_plan(
         width=width,
         height=height,
