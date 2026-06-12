@@ -13476,6 +13476,7 @@ def build_resize_product_completion_prompt(edge_touch: list[str]) -> str:
         f"The product is visibly truncated at: {missing_parts}. "
         "Preserve the existing opaque product pixels exactly, especially all brand marks, label text, colors, shadows, perspective, and bottle geometry. "
         "Continue the visible closure/cap/body geometry that is already present; do not invent a new closure type. "
+        "If the visible top is an angled or smooth cosmetic cap, continue that same cap form only; never replace it with a pump, glass cap, dispenser, or mechanical closure. "
         "Do not add screw caps, metal caps, pumps, nozzles, foil, ridges, hands, holders, or any hardware/details that are not clearly implied by the visible product. "
         "Do not create a separate neck, stem, plug, detached cap, or protruding part above/below the existing product. "
         "The completed silhouette must be a smooth continuation of the existing package footprint, not a new component attached to it. "
@@ -13498,6 +13499,92 @@ def build_resize_product_completion_seed(product: Image.Image, edge_touch: list[
         "productCompletionSeedPadding": [pad_x, top_pad, pad_x, bottom_pad],
         "layoutSeedTransparentPixels": True,
     }
+
+
+def _alpha_row_stats(alpha: np.ndarray, rows: np.ndarray | list[int]) -> tuple[float, float, float]:
+    widths: list[int] = []
+    centers: list[float] = []
+    for row in rows:
+        y = int(row)
+        if y < 0 or y >= alpha.shape[0]:
+            continue
+        xs = np.where(alpha[y, :] > 24)[0]
+        if xs.size == 0:
+            continue
+        widths.append(int(xs[-1] - xs[0] + 1))
+        centers.append(float((xs[0] + xs[-1]) / 2.0))
+    if not widths:
+        return 0.0, 0.0, 0.0
+    return float(np.median(widths)), float(np.median(centers)), float(np.max(widths))
+
+
+def _significant_alpha_components(mask: np.ndarray, *, min_area: int) -> int:
+    if mask.size == 0 or not np.any(mask):
+        return 0
+    try:
+        import cv2
+
+        count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(mask.astype(np.uint8), 8)
+        return sum(1 for label in range(1, count) if int(stats[label, cv2.CC_STAT_AREA]) >= min_area)
+    except Exception:
+        return 1
+
+
+def _product_completion_geometry_failures(
+    original_product: Image.Image,
+    completed_product: Image.Image,
+    paste_box: list[int],
+    edge_touch: list[str],
+) -> list[str]:
+    original_alpha = np.array(original_product.convert("RGBA").getchannel("A"), dtype=np.uint8)
+    completed_alpha = np.array(completed_product.convert("RGBA").getchannel("A"), dtype=np.uint8)
+    if original_alpha.size == 0 or completed_alpha.size == 0:
+        return ["empty_alpha_geometry"]
+    if Image.fromarray(original_alpha, "L").getbbox() is None or Image.fromarray(completed_alpha, "L").getbbox() is None:
+        return ["empty_product_geometry"]
+
+    left, top, right, bottom = [int(v) for v in paste_box]
+    original_h = max(1, original_alpha.shape[0])
+    original_w = max(1, original_alpha.shape[1])
+    failures: list[str] = []
+    source_rows = np.where(np.any(original_alpha > 24, axis=1))[0]
+    source_rows_top = source_rows[: max(4, min(14, original_h // 18))]
+    source_rows_bottom = source_rows[-max(4, min(14, original_h // 18)) :]
+    source_top_width, source_top_center, _source_top_max = _alpha_row_stats(original_alpha, source_rows_top)
+    source_bottom_width, source_bottom_center, _source_bottom_max = _alpha_row_stats(original_alpha, source_rows_bottom)
+
+    def check_horizontal_edge(edge: str, region: np.ndarray, source_width: float, source_center: float, offset_x: int) -> None:
+        if region.size == 0 or not np.any(region > 24):
+            return
+        ys, _xs = np.where(region > 24)
+        extension_h = int(ys.max() - ys.min() + 1)
+        max_extension = max(28, int(original_h * float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_MAX_EDGE_EXTENSION_RATIO", "0.34"))))
+        if extension_h > max_extension:
+            failures.append(f"{edge}:extension_height_{extension_h}>{max_extension}")
+        min_component_area = max(18, int(np.count_nonzero(region > 24) * 0.035))
+        components = _significant_alpha_components(region > 24, min_area=min_component_area)
+        if components > 1:
+            failures.append(f"{edge}:fragmented_components_{components}")
+        row_width, row_center, row_max = _alpha_row_stats(region, np.unique(ys))
+        if source_width > 0 and row_width > 0:
+            if row_width < source_width * 0.42:
+                failures.append(f"{edge}:too_narrow_{row_width:.1f}<{source_width * 0.42:.1f}")
+            max_width = max(source_width * 1.65, source_width + original_w * 0.20)
+            if row_max > max_width:
+                failures.append(f"{edge}:too_wide_{row_max:.1f}>{max_width:.1f}")
+        if source_center > 0 and row_center > 0:
+            absolute_center = row_center - float(offset_x)
+            max_center_drift = max(18.0, original_w * 0.16)
+            drift = abs(absolute_center - source_center)
+            if drift > max_center_drift:
+                failures.append(f"{edge}:center_drift_{drift:.1f}>{max_center_drift:.1f}")
+
+    if "top" in edge_touch:
+        check_horizontal_edge("top", completed_alpha[: max(0, top), :], source_top_width, source_top_center, left)
+    if "bottom" in edge_touch:
+        check_horizontal_edge("bottom", completed_alpha[min(completed_alpha.shape[0], bottom) :, :], source_bottom_width, source_bottom_center, left)
+
+    return failures
 
 
 def _edge_strip_color_stats(image: Image.Image, edge: str, strip: int) -> tuple[np.ndarray, np.ndarray]:
@@ -13679,6 +13766,8 @@ def _validate_completed_product_asset(
         failures.append(f"dark_detail_ratio_{dark_ratio:.2f}")
     if high_saturation_ratio > 0.35:
         failures.append(f"high_saturation_ratio_{high_saturation_ratio:.2f}")
+    geometry_failures = _product_completion_geometry_failures(original, completed, paste_box, edge_touch)
+    failures.extend(geometry_failures)
     if failures:
         return False, {
             "productCompletionRejected": "failed_edge_consistency_gate",
@@ -13869,7 +13958,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v8-protrusion-filter"
+    cache_version = b"resize-product-completion-v9-geometry-gate"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
