@@ -5062,7 +5062,7 @@ def composite_wide_creative_director_relayout(
                             "targetCanvas": [width, height],
                         },
                     )
-                    completed_product = _prepare_foreground_rgba_crop(completed_product.convert("RGBA"))
+                    completed_product = _trim_rgba_to_alpha(_prepare_foreground_rgba_crop(completed_product.convert("RGBA")), pad_ratio=0.025)
                     if completion_meta.get("productCompletionRejected"):
                         product_foreground_meta.update(completion_meta)
                         print(

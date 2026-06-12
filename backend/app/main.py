@@ -13805,7 +13805,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v6-no-detached-neck"
+    cache_version = b"resize-product-completion-v7-partial-edge-salvage"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -13919,18 +13919,38 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     remaining_edges = _rgba_alpha_edge_touch_local(completed)
     unresolved_edges = [edge for edge in edge_touch if edge in remaining_edges]
     if unresolved_edges:
-        result_meta = {
-            **provider_meta,
-            **seed_meta,
-            **footprint_meta,
-            "productCompletionInputEdgeTouch": edge_touch,
-            "productCompletionOutputSize": list(completed.size),
-            "productCompletionCache": "miss",
-            "productCompletionRejected": "unresolved_truncated_edges_after_completion",
-            "productCompletionRemainingEdgeTouch": remaining_edges,
-            "productCompletionUnresolvedEdges": unresolved_edges,
-        }
-        return product.convert("RGBA"), result_meta
+        resolved_edges = [edge for edge in edge_touch if edge not in unresolved_edges]
+        if resolved_edges:
+            comp = np.array(completed.convert("RGBA"), dtype=np.uint8)
+            left, top, right, bottom = [int(v) for v in paste_box]
+            if "top" in unresolved_edges:
+                comp[:max(0, top), :, 3] = 0
+            if "bottom" in unresolved_edges:
+                comp[min(comp.shape[0], bottom):, :, 3] = 0
+            if "left" in unresolved_edges:
+                comp[:, :max(0, left), 3] = 0
+            if "right" in unresolved_edges:
+                comp[:, min(comp.shape[1], right):, 3] = 0
+            completed = Image.fromarray(comp, "RGBA")
+            footprint_meta = {
+                **footprint_meta,
+                "productCompletionPartialApplied": True,
+                "productCompletionRemovedUnresolvedEdges": unresolved_edges,
+                "productCompletionResolvedEdges": resolved_edges,
+            }
+        else:
+            result_meta = {
+                **provider_meta,
+                **seed_meta,
+                **footprint_meta,
+                "productCompletionInputEdgeTouch": edge_touch,
+                "productCompletionOutputSize": list(completed.size),
+                "productCompletionCache": "miss",
+                "productCompletionRejected": "unresolved_truncated_edges_after_completion",
+                "productCompletionRemainingEdgeTouch": remaining_edges,
+                "productCompletionUnresolvedEdges": unresolved_edges,
+            }
+            return product.convert("RGBA"), result_meta
     accepted, gate_meta = _validate_completed_product_asset(product, completed, paste_box, edge_touch)
     result_meta = {
         **provider_meta,
