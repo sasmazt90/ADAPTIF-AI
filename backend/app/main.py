@@ -13963,7 +13963,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v10-dense-edge-gate"
+    cache_version = b"resize-product-completion-v11-openai-first"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -13971,8 +13971,11 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return cached_image.copy(), {**cached_meta, "productCompletionCache": "hit"}
     seed, seed_meta = build_resize_product_completion_seed(product, edge_touch)
     prompt = build_resize_product_completion_prompt(edge_touch)
-    openai_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_PRODUCT_COMPLETION", "0").strip().lower() in {"1", "true", "yes", "on"}
+    openai_enabled = os.getenv("ADAPTIFAI_ENABLE_OPENAI_PRODUCT_COMPLETION", "1").strip().lower() in {"1", "true", "yes", "on"}
     vertex_enabled = env_flag("ADAPTIFAI_ENABLE_VERTEX_PRODUCT_COMPLETION", "1")
+    preferred_provider = os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_PROVIDER", "openai").strip().lower() or "openai"
+    if preferred_provider != "vertex" and openai_enabled and os.getenv("OPENAI_API_KEY", "").strip():
+        vertex_enabled = False
     rendered: Image.Image | None = None
     provider_meta: dict[str, Any] = {}
 
