@@ -17,6 +17,7 @@ ImageRenderer = Callable[[Image.Image, int, int, ReframePlan, VisualAnalysis], t
 FallbackRenderer = Callable[[Image.Image, int, int], Image.Image]
 TextRenderer = Callable[[Image.Image, list[Any]], Image.Image]
 _REMBG_SESSION: Any | None = None
+_PRODUCT_ALPHA_BASE_CACHE: dict[tuple[int, tuple[int, int, int, int], str], Image.Image] = {}
 
 
 def _placement_preserves_creative_brand_layers(placement_id: str | None) -> bool:
@@ -1686,7 +1687,27 @@ def _product_only_foreground_crop(
     try:
         import cv2
 
-        extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
+        segmentation_backend = os.getenv("ADAPTIFAI_PRODUCT_SEGMENTATION_BACKEND", "rembg").strip().lower()
+        cache_key = (id(source), source_box, segmentation_backend)
+        cached = _PRODUCT_ALPHA_BASE_CACHE.get(cache_key)
+        if cached is not None:
+            extracted = cached.copy()
+            meta["productAlphaBaseCache"] = "hit"
+        else:
+            if segmentation_backend in {"rembg", "u2net", "isnet", "auto", "1", "true", "yes", "on"}:
+                extracted = _apply_foreground_alpha(crop).convert("RGBA")
+            else:
+                extracted = _cv_foreground_alpha_crop(crop).convert("RGBA")
+            raw_alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
+            raw_ratio = float(np.count_nonzero(raw_alpha > 16)) / max(1, raw_alpha.size)
+            if raw_ratio < 0.12:
+                # Lightweight CV often sees only printed labels on white packaging.
+                # If the product body did not survive, try the real matting path once.
+                extracted = _apply_foreground_alpha(crop).convert("RGBA")
+            if len(_PRODUCT_ALPHA_BASE_CACHE) > 16:
+                _PRODUCT_ALPHA_BASE_CACHE.clear()
+            _PRODUCT_ALPHA_BASE_CACHE[cache_key] = extracted.copy()
+            meta["productAlphaBaseCache"] = "miss"
         alpha = np.array(extracted.getchannel("A"), dtype=np.uint8)
         h, w = alpha.shape[:2]
         if h < 8 or w < 8:
