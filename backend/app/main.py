@@ -13477,6 +13477,8 @@ def build_resize_product_completion_prompt(edge_touch: list[str]) -> str:
         "Preserve the existing opaque product pixels exactly, especially all brand marks, label text, colors, shadows, perspective, and bottle geometry. "
         "Continue the visible closure/cap/body geometry that is already present; do not invent a new closure type. "
         "Do not add screw caps, metal caps, pumps, nozzles, foil, ridges, hands, holders, or any hardware/details that are not clearly implied by the visible product. "
+        "Do not create a separate neck, stem, plug, detached cap, or protruding part above/below the existing product. "
+        "The completed silhouette must be a smooth continuation of the existing package footprint, not a new component attached to it. "
         "Do not translate, rewrite, redraw, approximate, or invent any label text. "
         "Do not add marketing copy, badges, logos, UI, background scenery, frames, hands, people, or extra products. "
         "Generate only the physically continuous missing cap/body/bottom pixels needed to make the same single product look complete. "
@@ -13518,6 +13520,26 @@ def _edge_strip_color_stats(image: Image.Image, edge: str, strip: int) -> tuple[
     if visible.size == 0:
         return np.array([245.0, 245.0, 245.0]), np.array([0.0, 0.0, 0.0])
     return np.median(visible.astype(np.float32), axis=0), np.std(visible.astype(np.float32), axis=0)
+
+
+def _rgba_alpha_edge_touch_local(rgba: Image.Image, *, threshold: int = 24) -> list[str]:
+    try:
+        alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
+        if alpha.size == 0:
+            return []
+        band = max(1, min(alpha.shape[:2]) // 80)
+        touches: list[str] = []
+        if float(np.count_nonzero(alpha[:band, :] > threshold)) / max(1, alpha[:band, :].size) > 0.025:
+            touches.append("top")
+        if float(np.count_nonzero(alpha[-band:, :] > threshold)) / max(1, alpha[-band:, :].size) > 0.025:
+            touches.append("bottom")
+        if float(np.count_nonzero(alpha[:, :band] > threshold)) / max(1, alpha[:, :band].size) > 0.025:
+            touches.append("left")
+        if float(np.count_nonzero(alpha[:, -band:] > threshold)) / max(1, alpha[:, -band:].size) > 0.025:
+            touches.append("right")
+        return touches
+    except Exception:
+        return []
 
 
 def _extract_product_completion_from_seed(
@@ -13783,7 +13805,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v5-strict-closure-and-edge-cleanup"
+    cache_version = b"resize-product-completion-v6-no-detached-neck"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -13894,6 +13916,21 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
     paste_box = seed_meta["productCompletionSeedPasteBox"]
     completed = _extract_product_completion_from_seed(rendered, seed, product, paste_box)
     completed, footprint_meta = _constrain_completed_product_to_source_footprint(completed, product, paste_box, edge_touch)
+    remaining_edges = _rgba_alpha_edge_touch_local(completed)
+    unresolved_edges = [edge for edge in edge_touch if edge in remaining_edges]
+    if unresolved_edges:
+        result_meta = {
+            **provider_meta,
+            **seed_meta,
+            **footprint_meta,
+            "productCompletionInputEdgeTouch": edge_touch,
+            "productCompletionOutputSize": list(completed.size),
+            "productCompletionCache": "miss",
+            "productCompletionRejected": "unresolved_truncated_edges_after_completion",
+            "productCompletionRemainingEdgeTouch": remaining_edges,
+            "productCompletionUnresolvedEdges": unresolved_edges,
+        }
+        return product.convert("RGBA"), result_meta
     accepted, gate_meta = _validate_completed_product_asset(product, completed, paste_box, edge_touch)
     result_meta = {
         **provider_meta,
