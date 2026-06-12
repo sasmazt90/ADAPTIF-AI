@@ -5414,7 +5414,7 @@ def render_deterministic_compositor(
                     provider_background = provider_background.resize((width, height), Image.Resampling.LANCZOS)
                 provider_foreground_salvage_enabled = os.getenv(
                     "ADAPTIFAI_RESIZE_ENABLE_PROVIDER_FOREGROUND_SALVAGE",
-                    "1",
+                    "0",
                 ).strip().lower() in {"1", "true", "yes", "on"}
                 if (
                     provider_foreground_salvage_enabled
