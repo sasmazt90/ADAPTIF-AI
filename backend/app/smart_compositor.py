@@ -367,6 +367,15 @@ def build_safe_background_texture_canvas(clean_source: Image.Image, width: int, 
     return Image.blend(texture, gradient, 0.22)
 
 
+def build_resize_texture_background_canvas(clean_source: Image.Image, width: int, height: int) -> Image.Image:
+    """Resize fallback background that keeps source texture instead of solid fills."""
+    source_ratio = clean_source.width / max(1, clean_source.height)
+    target_ratio = width / max(1, height)
+    if abs(source_ratio - target_ratio) >= 0.35 or width * height <= clean_source.width * clean_source.height:
+        return build_safe_background_texture_canvas(clean_source, width, height)
+    return build_low_artifact_background_canvas(clean_source, width, height)
+
+
 def _edge_median_rgb(image: Image.Image) -> np.ndarray:
     source = image.convert("RGB")
     arr = np.array(source, dtype=np.uint8)
@@ -1840,9 +1849,21 @@ def _build_display_copy_stack_blocks(
     )
     stack_w = max(1, stack_zone[2] - stack_zone[0])
     stack_h = max(1, stack_zone[3] - stack_zone[1])
+    def source_lines_for_block(block: Any) -> list[str]:
+        line_texts = [str(line).strip() for line in (getattr(block, "line_texts", []) or []) if str(line).strip()]
+        if line_texts:
+            return line_texts
+        raw = str(getattr(block, "translated_text", None) or getattr(block, "text", "") or "")
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if lines:
+            return lines
+        text = raw.strip()
+        return [text] if text else []
+
     source_texts = [
-        str(getattr(block, "translated_text", None) or getattr(block, "text", "") or "").strip()
+        line
         for block in ordered
+        for line in source_lines_for_block(block)
     ]
     source_texts = [text for text in source_texts if text]
 
@@ -1864,6 +1885,12 @@ def _build_display_copy_stack_blocks(
             else:
                 current = candidate
         return line_count
+
+    def text_width_px(text: str, font: ImageFont.ImageFont, size: int) -> float:
+        try:
+            return float(font.getlength(text))
+        except Exception:
+            return len(text) * max(1, size) * 0.58
 
     spacious_stack = copy_w >= 320 and copy_h >= 220
     is_secondary = stack_role == "secondary"
@@ -1889,9 +1916,10 @@ def _build_display_copy_stack_blocks(
     # A resize should not add extra line breaks just to make text larger.
     for candidate_size in range(max_font, readable_floor - 1, -1):
         font = _load_cta_font(candidate_size)
-        total_lines = sum(wrapped_line_count(text, font) for text in source_texts)
+        total_lines = len(source_texts)
         line_height = max(candidate_size + 2, int(round(candidate_size * 1.22)))
-        if total_lines <= preferred_line_count and total_lines * line_height <= stack_h:
+        widest_source_line = max((text_width_px(text, font, candidate_size) for text in source_texts), default=0.0)
+        if widest_source_line <= stack_w and total_lines <= preferred_line_count and total_lines * line_height <= stack_h:
             best_fit = (candidate_size, 1.0)
             break
 
@@ -1944,13 +1972,14 @@ def _build_display_copy_stack_blocks(
         block_text = str(getattr(block, "translated_text", None) or getattr(block, "text", "") or "").strip()
         if not block_text:
             continue
-        texts.append(block_text)
+        block_lines = source_lines_for_block(block)
+        texts.extend(block_lines or [block_text])
         block_spans = [dict(span) for span in (getattr(block, "translated_style_spans", []) or []) if isinstance(span, dict)]
         if not block_spans:
             block_spans = [
                 {
-                    "translatedText": block_text,
-                    "sourceText": block_text,
+                    "translatedText": "\n".join(block_lines or [block_text]),
+                    "sourceText": "\n".join(block_lines or [block_text]),
                     "style": {
                         "fontSize": stack_font_size,
                         "fontWeight": int(getattr(block, "font_weight", 700) or 700),
@@ -2666,32 +2695,39 @@ def _resolve_display_cta_zone(
     ]
     if not blocking_boxes:
         return zone
-    safe_gap = max(6, int(round(height * 0.035)))
+    safe_gap = max(20, int(round(height * 0.045)))
+    min_cta_h = max(18, min(zone_h, int(round(height * 0.16))))
 
     def has_collision(candidate: tuple[int, int, int, int]) -> bool:
         expanded = (candidate[0], candidate[1] - safe_gap, candidate[2], candidate[3] + safe_gap)
         return any(_box_overlap(expanded, box) > 0 for box in blocking_boxes)
 
-    if not has_collision(zone):
+    max_text_bottom = max(box[3] for box in blocking_boxes)
+    # Hard rule: CTA must start below every rendered copy/RTB box plus a
+    # concrete margin. If there is not enough room, drop CTA instead of
+    # letting it crush the advertising copy.
+    below_top = max(zone[1], max_text_bottom + safe_gap)
+    below_bottom = min(height - margin_y, below_top + zone_h)
+    if below_bottom - below_top >= min_cta_h:
+        below = _clip_box((zone[0], below_top, zone[2], below_bottom), width, height)
+        if not has_collision(below):
+            return below
+
+    if zone[1] >= max_text_bottom + safe_gap and not has_collision(zone):
         return zone
 
-    max_text_bottom = max(box[3] for box in blocking_boxes)
-    below_top = max(zone[1], max_text_bottom + safe_gap)
-    below = _clip_box((zone[0], below_top, zone[2], below_top + zone_h), width, height)
-    if below[3] <= height - margin_y and not has_collision(below):
-        return below
-
-    min_text_top = min(box[1] for box in blocking_boxes)
-    above_bottom = min(zone[3], min_text_top - safe_gap)
-    above = _clip_box((zone[0], above_bottom - zone_h, zone[2], above_bottom), width, height)
-    if above[1] >= margin_y and not has_collision(above):
-        return above
+    compact_top = max_text_bottom + safe_gap
+    compact_bottom = min(height - margin_y, compact_top + min_cta_h)
+    compact = _clip_box((zone[0], compact_top, zone[2], compact_bottom), width, height)
+    if compact[3] - compact[1] >= min_cta_h and not has_collision(compact):
+        return compact
 
     fallback_left = margin_x
     fallback_right = min(width - margin_x, fallback_left + zone_w)
     fallback_top = max_text_bottom + safe_gap
-    fallback = _clip_box((fallback_left, fallback_top, fallback_right, fallback_top + zone_h), width, height)
-    if fallback[3] <= height - margin_y and not has_collision(fallback):
+    fallback_bottom = min(height - margin_y, fallback_top + zone_h)
+    fallback = _clip_box((fallback_left, fallback_top, fallback_right, fallback_bottom), width, height)
+    if fallback[3] - fallback[1] >= min_cta_h and not has_collision(fallback):
         return fallback
     return None
 
@@ -3311,7 +3347,8 @@ def build_wide_to_portrait_outpaint_layout_seed(
             source.width,
             source.height,
         )
-        if display_placement:
+        compact_display_target = width <= 420 and height <= 700
+        if compact_display_target:
             meaningful_visuals = [product_focus]
         else:
             # Social placements need the complete sellable object, not only the
@@ -4045,6 +4082,24 @@ def composite_wide_creative_director_relayout(
             visual_bounds[2] - inset_x,
             visual_bounds[3] - inset_y,
         )
+    if "bottom" in visual_edge_sides and target_ratio <= 1.25:
+        visual_w = max(1, visual_render_bounds[2] - visual_render_bounds[0])
+        visual_h = max(1, visual_render_bounds[3] - visual_render_bounds[1])
+        min_visual_h = int(round(height * (0.46 if target_ratio < 0.78 else 0.38)))
+        if visual_h < min_visual_h:
+            center_x = (visual_render_bounds[0] + visual_render_bounds[2]) / 2.0
+            expanded_h = min(height, min_visual_h)
+            expanded_w = min(width, max(visual_w, int(round(expanded_h * max(0.42, visual_w / max(1, visual_h))))))
+            left = int(round(center_x - expanded_w / 2.0))
+            left = max(0, min(width - expanded_w, left))
+            visual_render_bounds = (left, height - expanded_h, left + expanded_w, height)
+        else:
+            visual_render_bounds = (
+                visual_render_bounds[0],
+                max(0, height - visual_h),
+                visual_render_bounds[2],
+                height,
+            )
 
     if provider_background_is_target:
         if target_ratio < 0.78:
@@ -4066,7 +4121,7 @@ def composite_wide_creative_director_relayout(
             output = build_low_artifact_background_canvas(provider_clean_source, width, height).convert("RGBA")
         elif target_area_smaller:
             if display_placement:
-                output = build_deterministic_background_canvas(background_source.convert("RGB"), width, height).convert("RGBA")
+                output = build_resize_texture_background_canvas(background_source.convert("RGB"), width, height).convert("RGBA")
             else:
                 output = build_edge_gradient_background_canvas(background_source.convert("RGB"), width, height).convert("RGBA")
         elif source_ratio > 1.25 and target_ratio <= 1.25:
@@ -4096,7 +4151,7 @@ def composite_wide_creative_director_relayout(
                 output = build_safe_background_texture_canvas(background_scene_source, width, height).convert("RGBA")
         elif target_area_smaller:
             if display_placement:
-                output = build_deterministic_background_canvas(background_scene_source, width, height).convert("RGBA")
+                output = build_resize_texture_background_canvas(background_scene_source, width, height).convert("RGBA")
             else:
                 output = build_safe_background_texture_canvas(background_scene_source, width, height).convert("RGBA")
         elif source_ratio > 1.25 and target_ratio <= 1.25:
@@ -4467,6 +4522,44 @@ def composite_wide_creative_director_relayout(
                 )
             )
 
+    primary_visual_paste_box: tuple[int, int, int, int] | None = None
+    for layer in reversed(composited):
+        role = str(layer.get("role", ""))
+        if (
+            ("primary_visual" in role or "provider_visual_completion" in role or "original_visual_label" in role)
+            and layer.get("pasteBox")
+        ):
+            try:
+                primary_visual_paste_box = tuple(int(value) for value in layer["pasteBox"])
+                break
+            except Exception:
+                continue
+
+    if primary_visual_paste_box and _box_overlap(secondary_bounds, primary_visual_paste_box) > 0:
+        gap = max(8, int(round(min(width, height) * 0.035)))
+        secondary_h = max(1, secondary_bounds[3] - secondary_bounds[1])
+        min_secondary_h = max(22, int(round(height * (0.075 if display_placement else 0.055))))
+        above_bottom = primary_visual_paste_box[1] - gap
+        above_top = max(margin_y, above_bottom - secondary_h)
+        if above_bottom - above_top >= min_secondary_h:
+            secondary_bounds = (secondary_bounds[0], above_top, secondary_bounds[2], above_bottom)
+        else:
+            left_candidate = (
+                margin_x,
+                max(margin_y, secondary_bounds[1]),
+                min(primary_visual_paste_box[0] - gap, width - margin_x),
+                min(height - margin_y, secondary_bounds[3]),
+            )
+            right_candidate = (
+                max(primary_visual_paste_box[2] + gap, margin_x),
+                max(margin_y, secondary_bounds[1]),
+                width - margin_x,
+                min(height - margin_y, secondary_bounds[3]),
+            )
+            candidates = [box for box in (left_candidate, right_candidate) if box[2] - box[0] >= max(40, width * 0.24)]
+            if candidates:
+                secondary_bounds = max(candidates, key=lambda item: _box_area(item))
+
     drawn_redraw_zone_boxes: list[tuple[int, int, int, int]] = []
     if redraw_blocks and draw_text:
         if target_ratio < 0.78 or target_area_smaller or not display_placement:
@@ -4530,7 +4623,10 @@ def composite_wide_creative_director_relayout(
     safe_cta_bounds = (
         _resolve_display_cta_zone(
             cta_bounds,
-            drawn_text_boxes=drawn_redraw_zone_boxes,
+            drawn_text_boxes=[
+                *drawn_redraw_zone_boxes,
+                *([primary_visual_paste_box] if primary_visual_paste_box else []),
+            ],
             width=width,
             height=height,
             margin_x=margin_x,
