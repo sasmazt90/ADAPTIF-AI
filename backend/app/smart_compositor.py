@@ -4227,13 +4227,16 @@ def composite_wide_creative_director_relayout(
         visual_w = max(1, visual_render_bounds[2] - visual_render_bounds[0])
         visual_h = max(1, visual_render_bounds[3] - visual_render_bounds[1])
         if display_placement and target_ratio < 0.78:
-            min_visual_ratio = 0.32
+            min_visual_ratio = 0.42
         else:
             min_visual_ratio = 0.46 if target_ratio < 0.78 else 0.38
         min_visual_h = int(round(height * min_visual_ratio))
         if visual_h < min_visual_h:
             center_x = (visual_render_bounds[0] + visual_render_bounds[2]) / 2.0
             expanded_h = min(height, min_visual_h)
+            if display_placement:
+                min_visual_top = min(height - 1, cta_bounds[3] + max(6, int(round(height * 0.018))))
+                expanded_h = min(expanded_h, max(1, height - min_visual_top))
             expanded_w = min(width, max(visual_w, int(round(expanded_h * max(0.42, visual_w / max(1, visual_h))))))
             left = int(round(center_x - expanded_w / 2.0))
             left = max(0, min(width - expanded_w, left))
