@@ -2519,8 +2519,21 @@ def run_trocr_ocr_on_image(image_path: Path) -> list[TextBlock]:
 
 
 def run_resize_raw_ocr_on_image(image_path: Path) -> list[TextBlock]:
-    detector = load_ocr_detector()
     image = Image.open(image_path).convert("RGB")
+    vision_blocks = google_vision_word_blocks(image_path, image.size)
+    if vision_blocks:
+        return merge_blocks_into_lines(vision_blocks, image.size)
+
+    allow_local_resize_ocr = os.getenv("ADAPTIFAI_ALLOW_LOCAL_RESIZE_OCR", "0").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not allow_local_resize_ocr:
+        return []
+
+    detector = load_ocr_detector()
     ocr_image, scale = fit_for_ocr(image)
     detections = detector.readtext(
         np.array(ocr_image),
@@ -12542,7 +12555,13 @@ def build_heuristic_smart_reframe_analysis(source: Image.Image, focus_bbox: tupl
     temp_path = temp_root() / f"{uuid4().hex}-resize-analysis.png"
     try:
         source.save(temp_path, "PNG")
-        detector_blocks = marketing_filter(run_resize_raw_ocr_on_image(temp_path) or run_trocr_ocr_on_image(temp_path))
+        detector_blocks = run_resize_raw_ocr_on_image(temp_path)
+        if (
+            not detector_blocks
+            and os.getenv("ADAPTIFAI_ALLOW_LOCAL_RESIZE_OCR", "0").strip().lower() in {"1", "true", "yes", "on"}
+        ):
+            detector_blocks = run_trocr_ocr_on_image(temp_path)
+        detector_blocks = marketing_filter(detector_blocks)
         for index, block in enumerate(detector_blocks[:16]):
             sampled_color = sample_marketing_text_color(
                 source,
