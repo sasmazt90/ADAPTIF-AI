@@ -1840,7 +1840,7 @@ def _product_only_foreground_crop(
     try:
         import cv2
 
-        segmentation_backend = os.getenv("ADAPTIFAI_PRODUCT_SEGMENTATION_BACKEND", "auto").strip().lower()
+        segmentation_backend = os.getenv("ADAPTIFAI_PRODUCT_SEGMENTATION_BACKEND", "rembg").strip().lower()
         cache_key = (id(source), source_box, segmentation_backend)
         cached = _PRODUCT_ALPHA_BASE_CACHE.get(cache_key)
         if cached is not None:
