@@ -13856,9 +13856,14 @@ def _constrain_completed_product_to_source_footprint(
             # Top/bottom completion must not invent lateral label/text fragments
             # in the transparent side padding. Keep only the original footprint
             # plus a narrow horizontal tolerance for the completed cap/bottom.
-            lateral_allowed = np.zeros(alpha.shape, dtype=bool)
-            lateral_allowed[:, max(0, x1 - pad_x) : min(alpha.shape[1], x2 + pad_x)] = True
-            alpha = np.where(lateral_allowed | (full_original > 24), alpha, 0).astype(np.uint8)
+            edge_extension_allowed = np.zeros(alpha.shape, dtype=bool)
+            x_left = max(0, x1 - pad_x)
+            x_right = min(alpha.shape[1], x2 + pad_x)
+            if "top" in edge_touch:
+                edge_extension_allowed[:top, x_left:x_right] = True
+            if "bottom" in edge_touch:
+                edge_extension_allowed[bottom:, x_left:x_right] = True
+            alpha = np.where(edge_extension_allowed | (full_original > 24), alpha, 0).astype(np.uint8)
 
         # Product completion may invent a narrow detached neck/cap above a
         # package when the real asset only needs a smooth continuation. Generated
@@ -13963,7 +13968,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v12-rgba-openai-mask"
+    cache_version = b"resize-product-completion-v13-edge-only-footprint"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
