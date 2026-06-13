@@ -13634,6 +13634,44 @@ def _rgba_alpha_edge_touch_local(rgba: Image.Image, *, threshold: int = 24) -> l
         return []
 
 
+def _significant_product_completion_edges(rgba: Image.Image, edges: list[str], *, threshold: int = 24) -> list[str]:
+    try:
+        alpha = np.array(rgba.convert("RGBA").getchannel("A"), dtype=np.uint8)
+        if alpha.size == 0:
+            return []
+        h, w = alpha.shape
+        band = max(3, min(h, w) // 42)
+        significant: list[str] = []
+        for edge in edges:
+            if edge == "top":
+                region = alpha[:band, :]
+                row_counts = np.count_nonzero(region > threshold, axis=1)
+                density = float(np.max(row_counts)) / max(1, w)
+                if density >= float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_TOP_EDGE_DENSITY", "0.18")):
+                    significant.append(edge)
+            elif edge == "bottom":
+                region = alpha[-band:, :]
+                row_counts = np.count_nonzero(region > threshold, axis=1)
+                density = float(np.max(row_counts)) / max(1, w)
+                if density >= float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_BOTTOM_EDGE_DENSITY", "0.12")):
+                    significant.append(edge)
+            elif edge == "left":
+                region = alpha[:, :band]
+                col_counts = np.count_nonzero(region > threshold, axis=0)
+                density = float(np.max(col_counts)) / max(1, h)
+                if density >= float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_SIDE_EDGE_DENSITY", "0.18")):
+                    significant.append(edge)
+            elif edge == "right":
+                region = alpha[:, -band:]
+                col_counts = np.count_nonzero(region > threshold, axis=0)
+                density = float(np.max(col_counts)) / max(1, h)
+                if density >= float(os.getenv("ADAPTIFAI_PRODUCT_COMPLETION_SIDE_EDGE_DENSITY", "0.18")):
+                    significant.append(edge)
+        return significant
+    except Exception:
+        return edges
+
+
 def _extract_product_completion_from_seed(
     rendered: Image.Image,
     seed: Image.Image,
@@ -13963,12 +14001,17 @@ def _constrain_completed_product_to_source_footprint(
 
 
 def render_resize_product_asset_completion(product: Image.Image, meta: dict[str, Any]) -> tuple[Image.Image, dict[str, Any]]:
-    edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
+    raw_edge_touch = [str(item) for item in meta.get("productAlphaEdgeTouch", []) if str(item)]
+    edge_touch = _significant_product_completion_edges(product, raw_edge_touch)
     if not edge_touch:
-        return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
+        return product.convert("RGBA"), {
+            "productCompletionSkipped": "no_significant_truncated_alpha_edge",
+            "productCompletionRawEdgeTouch": raw_edge_touch,
+            "productCompletionSignificantEdgeTouch": edge_touch,
+        }
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v14-correct-openai-mask-alpha"
+    cache_version = b"resize-product-completion-v15-significant-edge-filter"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -14125,6 +14168,8 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         **footprint_meta,
         **gate_meta,
         "productCompletionInputEdgeTouch": edge_touch,
+        "productCompletionRawEdgeTouch": raw_edge_touch,
+        "productCompletionSignificantEdgeTouch": edge_touch,
         "productCompletionOutputSize": list(completed.size),
         "productCompletionCache": "miss",
     }
