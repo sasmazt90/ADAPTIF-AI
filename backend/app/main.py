@@ -13963,7 +13963,7 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         return product.convert("RGBA"), {"productCompletionSkipped": "no_truncated_alpha_edge"}
     cache_file = io.BytesIO()
     product.convert("RGBA").save(cache_file, format="PNG")
-    cache_version = b"resize-product-completion-v11-openai-first"
+    cache_version = b"resize-product-completion-v12-rgba-openai-mask"
     cache_key = hashlib.sha256(cache_file.getvalue() + "|".join(edge_touch).encode("utf-8") + cache_version).hexdigest()
     cached = _RESIZE_PRODUCT_COMPLETION_CACHE.get(cache_key)
     if cached is not None:
@@ -14043,7 +14043,8 @@ def render_resize_product_asset_completion(product: Image.Image, meta: dict[str,
         if not api_key:
             raise RuntimeError("OPENAI_API_KEY is required for OpenAI product completion.")
         mask_arr = np.where(np.array(seed.getchannel("A"), dtype=np.uint8) >= 250, 0, 255).astype(np.uint8)
-        mask = Image.fromarray(mask_arr, "L")
+        mask = Image.new("RGBA", seed.size, (0, 0, 0, 255))
+        mask.putalpha(Image.fromarray(mask_arr, "L"))
         image_file = io.BytesIO()
         seed.save(image_file, format="PNG")
         image_file.seek(0)
