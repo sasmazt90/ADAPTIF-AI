@@ -5,7 +5,7 @@ export async function GET(
   context: { params: Promise<{ jobId: string; filename: string }> },
 ) {
   const { jobId, filename } = await context.params;
-  const backendUrl = process.env.ADAPTIFAI_BACKEND_URL ?? "http://127.0.0.1:8000";
+  const backendUrl = process.env.VERCEL ? "https://adaptifai-backend-production.up.railway.app" : (process.env.ADAPTIFAI_BACKEND_URL ?? "http://127.0.0.1:8000");
   const response = await fetch(`${backendUrl}/outputs/${encodeURIComponent(jobId)}/${encodeURIComponent(filename)}`);
 
   if (!response.ok || !response.body) {
