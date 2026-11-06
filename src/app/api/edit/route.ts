@@ -4,7 +4,7 @@ import { estimateEditCredits } from "@/lib/credit-pricing";
 import { getCredits, spendCredits } from "@/lib/credits";
 
 export async function POST(request: Request) {
-  const backendUrl = process.env.ADAPTIFAI_BACKEND_URL ?? "http://127.0.0.1:8000";
+  const backendUrl = process.env.VERCEL ? "https://adaptifai-backend-production.up.railway.app" : (process.env.ADAPTIFAI_BACKEND_URL ?? "http://127.0.0.1:8000");
 
   try {
     const userId = await getAuthenticatedOrDevelopmentUser(request);
