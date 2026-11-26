@@ -15,6 +15,23 @@ python -m uvicorn app.main:app --reload --port 8000
 
 The Next.js app proxies `/api/adapt` to `http://127.0.0.1:8000` by default.
 
+## Localization pipeline v7 (default)
+
+`app/localize_v7.py` replaces the heuristic v5/v6 polygon path (`ADAPTIFAI_LOCALIZE_PIPELINE=legacy` restores it).
+
+1. **Geometry** - Google Vision when credentials exist, otherwise EasyOCR. Only the line boxes are trusted.
+2. **Semantics** - the vision model (`OPENAI_TRANSLATION_MODEL`, override with `ADAPTIFAI_LOCALIZE_VISION_MODEL`) sees the
+   creative plus a numbered set-of-marks overlay, groups boxes into copy elements, reads the real text from pixels,
+   keeps logos / logo taglines / product text untouched and transcreates the copy line by line.
+3. **Fit + review** - a dry layout measures which lines would have to shrink; one native-speaker review pass fixes
+   unnatural phrasing and shortens lines within a character budget (naturalness wins).
+4. **Removal** - per line, a robust polynomial background fit on a ring around the text, glyph segmentation against it
+   and analytic fill (flat panels, buttons, gradients). Textured backgrounds go to Replicate LaMa, then OpenCV.
+5. **Typography** - size, weight and width are measured from the source glyphs and matched with variable fonts
+   (`app/fonts`: Archivo wdth/wght, Noto Serif; OFL). Copy is set on the source baselines inside the layout grid.
+
+Debug artifacts per output: `*-v7-marks.png`, `*-v7-mask.png`, `*-v7-clean.png`, `*-v7-analysis.json`.
+
 ## Pipeline contract
 
 1. Saves uploads to an OS temp directory under `adaptifai/<job-id>`.

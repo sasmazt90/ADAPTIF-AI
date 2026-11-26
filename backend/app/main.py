@@ -18173,7 +18173,148 @@ def build_localize_assets_v2(paths: list[Path], languages: list[str], output_for
     return outputs, translations_summary, manifest_assets
 
 
+def localize_pipeline_name() -> str:
+    return os.getenv("ADAPTIFAI_LOCALIZE_PIPELINE", "v7").strip().lower() or "v7"
+
+
+def _v7_text_block(element: Any, language: str) -> TextBlock:
+    from app import localize_v7
+
+    box = element.box
+    color = localize_v7._element_color(element) if element.lines and element.lines[0].ink_box else (17, 17, 17)
+    line_heights = [max(1, line.box[3] - line.box[1]) for line in element.lines] or [16]
+    return TextBlock(
+        id=element.id,
+        text="\n".join(element.source_lines),
+        role=element.role,
+        translate=element.translate,
+        bbox=box,
+        clean_box=box,
+        font_family="Archivo" if element.font_style not in {"serif", "slab"} else "Noto Serif",
+        font_weight=element.font_weight,
+        font_size_estimate=int(np.median(line_heights)),
+        line_height_estimate=int(np.median(line_heights) * 1.2),
+        color="#%02x%02x%02x" % tuple(color),
+        translated_text="\n".join(element.target_lines) if element.translate else None,
+        align=element.align,
+        line_boxes=[line.box for line in element.lines],
+        line_texts=list(element.source_lines),
+        target_language=language,
+        render_strategy="v7_repaint" if element.changed else "v7_untouched",
+    )
+
+
+def build_localize_assets_v7(paths: list[Path], languages: list[str], output_format: str, job_dir: Path) -> tuple[list[OutputAsset], dict[str, list[str]], list[dict[str, Any]]]:
+    from app import localize_v7
+
+    def lama(image: Image.Image, mask: Image.Image) -> Image.Image | None:
+        return run_replicate_lama_inpaint(image, mask)
+
+    outputs: list[OutputAsset] = []
+    translations_summary: dict[str, list[str]] = {}
+    manifest_assets: list[dict[str, Any]] = []
+    for image_path in image_paths(paths):
+        source_image = Image.open(image_path).convert("RGB")
+        ocr_lines = None
+        for language in languages:
+            try:
+                result = localize_v7.localize_image(image_path, language, lama=lama, ocr_lines=ocr_lines)
+            except localize_v7.LocalizeError as exc:
+                raise HTTPException(status_code=422, detail=f"Localization failed for {image_path.name} ({language}): {exc}") from exc
+            # Detection is language independent: reuse it for the next language.
+            ocr_lines = [localize_v7.OcrLine(id=item["id"], text=item["guess"], box=tuple(item["box"])) for item in result.report["detected_boxes"]]
+            blocks = [_v7_text_block(element, language) for element in result.elements]
+            editable = [block for block in blocks if block.translate]
+            translations_summary[language] = [block.translated_text or block.text for block in editable]
+
+            filename = localize_filename(image_path, language, output_format)
+            save_image_output(result.image, job_dir / filename, normalize_output_format(output_format, image_path))
+            stem = f"debug-{sanitize_stem(image_path)}-{language.lower()}-v7"
+            clean_filename = f"{stem}-clean.png"
+            mask_filename = f"{stem}-mask.png"
+            marks_filename = f"{stem}-marks.png"
+            analysis_filename = f"{stem}-analysis.json"
+            result.clean_base.save(job_dir / clean_filename, "PNG")
+            result.mask.save(job_dir / mask_filename, "PNG")
+            result.marks.save(job_dir / marks_filename, "PNG")
+            (job_dir / analysis_filename).write_text(json.dumps(result.report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(
+                f"[localize-v7] {image_path.name} {language} provider={result.report.get('analysis_provider')} "
+                f"elements={len(result.elements)} removal={result.report.get('removal')} seconds={result.report.get('seconds')}",
+                flush=True,
+            )
+            artifacts = {
+                "analysis": f"/api/download/{job_dir.name}/{analysis_filename}",
+                "mask": f"/api/download/{job_dir.name}/{mask_filename}",
+                "cleanBase": f"/api/download/{job_dir.name}/{clean_filename}",
+                "marks": f"/api/download/{job_dir.name}/{marks_filename}",
+            }
+            asset = OutputAsset(
+                filename=filename,
+                width=result.image.width,
+                height=result.image.height,
+                safe_zone_warnings=[],
+                download_url=f"/api/download/{job_dir.name}/{filename}",
+                source_name=image_path.name,
+                language=language,
+                source_language=result.report.get("source_language"),
+                translated_text="\n\n".join(block.translated_text or "" for block in editable if block.translated_text),
+                extracted_blocks=blocks,
+                debug={"pipeline": "v7-vision-semantic", "report": result.report, "artifacts": artifacts},
+            )
+            outputs.append(asset)
+            manifest_assets.append(
+                {
+                    **asset.model_dump(mode="json"),
+                    "mode": "localize",
+                    "pipeline": "v7-vision-semantic",
+                    "source_path": str(image_path),
+                    "clean_path": str(job_dir / clean_filename),
+                    "v7_elements": [localize_v7.element_state(element) for element in result.elements],
+                    "debug": artifacts,
+                }
+            )
+        del source_image
+    return outputs, translations_summary, manifest_assets
+
+
+def regenerate_localize_asset_v7(job_dir: Path, asset_meta: dict[str, Any], edit: "EditRequest") -> OutputAsset:
+    from app import localize_v7
+
+    language = str(asset_meta.get("language") or "EN")
+    source_image = Image.open(asset_meta["source_path"]).convert("RGB")
+    clean_base = Image.open(asset_meta["clean_path"]).convert("RGB")
+    states = asset_meta.get("v7_elements") or []
+    editable_count = sum(1 for state in states if state.get("translate"))
+    replacement = [part for part in edit.copy_text.split("\n\n") if part.strip()] if edit.copy_text.strip() else None
+    if replacement and len(replacement) != editable_count:
+        replacement = split_editor_copy(edit.copy_text, editable_count) or None
+    rendered, elements = localize_v7.rerender_with_copy(source_image, clean_base, states, replacement, language)
+    output_path = job_dir / asset_meta["filename"]
+    save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
+    blocks = [_v7_text_block(element, language) for element in elements]
+    editable = [block for block in blocks if block.translate]
+    asset_meta["v7_elements"] = [localize_v7.element_state(element) for element in elements]
+    for state, element in zip(asset_meta["v7_elements"], elements):
+        state["changed"] = bool(element.changed)
+    asset_meta["translated_text"] = "\n\n".join(block.translated_text or "" for block in editable if block.translated_text)
+    return OutputAsset(
+        filename=asset_meta["filename"],
+        width=rendered.width,
+        height=rendered.height,
+        safe_zone_warnings=[],
+        download_url=f"/api/download/{job_dir.name}/{asset_meta['filename']}",
+        source_name=asset_meta["source_name"],
+        language=language,
+        source_language=asset_meta.get("source_language"),
+        translated_text=asset_meta["translated_text"],
+        extracted_blocks=blocks,
+    )
+
+
 def build_localize_assets(paths: list[Path], languages: list[str], output_format: str, job_dir: Path) -> tuple[list[OutputAsset], dict[str, list[str]], list[dict[str, Any]]]:
+    if localize_pipeline_name() == "v7":
+        return build_localize_assets_v7(paths, languages, output_format, job_dir)
     if localization_v2_enabled():
         return build_localize_assets_v2(paths, languages, output_format, job_dir)
 
@@ -19148,6 +19289,8 @@ def _apply_italic_shear(
 
 
 def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: EditRequest) -> OutputAsset:
+    if asset_meta.get("pipeline") == "v7-vision-semantic":
+        return regenerate_localize_asset_v7(job_dir, asset_meta, edit)
     source_image = Image.open(asset_meta["source_path"]).convert("RGB")
     stored_blocks = [TextBlock.model_validate(block) for block in asset_meta.get("blocks", [])]
     translate_blocks = [block for block in stored_blocks if block.translate]
@@ -19273,6 +19416,8 @@ def health() -> dict[str, str]:
         "inpainting_backend": os.getenv("ADAPTIFAI_INPAINT_BACKEND", "stable-diffusion"),
         "inpainting": os.getenv("ADAPTIFAI_INPAINT_MODEL", "runwayml/stable-diffusion-inpainting"),
         "resize_fit": os.getenv("ADAPTIFAI_RESIZE_FIT", "cover"),
+        "localize_pipeline": localize_pipeline_name(),
+        "localize_vision_model": os.getenv("ADAPTIFAI_LOCALIZE_VISION_MODEL", "") or os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5.6-terra"),
         "localize_translation_model": os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5.6-terra"),
         "localize_qa_model": os.getenv("ADAPTIFAI_LOCALIZE_QA_MODEL", "gpt-5.6-luna"),
         "localize_escalation_model": os.getenv("ADAPTIFAI_LOCALIZE_ESCALATION_MODEL", "gpt-5.6-sol"),

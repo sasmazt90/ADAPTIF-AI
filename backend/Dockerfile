@@ -19,6 +19,10 @@ RUN apt-get update \
         libgl1 \
         libglib2.0-0 \
         libgomp1 \
+        libfribidi0 \
+        libharfbuzz0b \
+        fonts-noto-core \
+        fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
 COPY backend/requirements.txt .
