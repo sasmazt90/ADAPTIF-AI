@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 FONT_DIR = Path(__file__).resolve().parent / "fonts"
 
@@ -927,8 +927,12 @@ def remove_text(
                 repaired = lama(result, mask_image)
             except Exception as exc:  # pragma: no cover
                 print(f"[localize-v7] LaMa failed: {exc}", flush=True)
+        provider_name = "lama"
+        if repaired is None:
+            repaired = openai_inpaint(result, mask_image)
+            provider_name = "openai-inpaint"
         if repaired is not None:
-            stats["provider"] = "analytic-surface+lama"
+            stats["provider"] = f"analytic-surface+{provider_name}"
             repaired_np = np.array(repaired.convert("RGB").resize(result.size))
             base = np.array(result)
             base[textured_mask] = repaired_np[textured_mask]
@@ -941,6 +945,47 @@ def remove_text(
             bgr = cv2.inpaint(bgr, textured_mask.astype(np.uint8) * 255, 5, cv2.INPAINT_TELEA)
             result = Image.fromarray(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
     return result, Image.fromarray((full_mask * 255).astype(np.uint8)), stats
+
+
+def openai_inpaint(image: Image.Image, mask: Image.Image) -> Image.Image | None:
+    """Generative fill of `mask` (white = fill) with the OpenAI image edit
+    endpoint.  Only masked pixels are taken from the result."""
+    if os.getenv("ADAPTIFAI_V7_OPENAI_INPAINT", "1") == "0" or not os.getenv("OPENAI_API_KEY", "").strip():
+        return None
+    try:
+        from openai import OpenAI  # type: ignore
+
+        w, h = image.size
+        ratio = w / h
+        target = (1536, 1024) if ratio > 1.2 else (1024, 1536) if ratio < 0.83 else (1024, 1024)
+        work = image.convert("RGB").resize(target, Image.Resampling.LANCZOS)
+        hole = mask.convert("L").resize(target, Image.Resampling.NEAREST)
+        edit_mask = Image.new("RGBA", target, (0, 0, 0, 255))
+        edit_mask.putalpha(Image.eval(hole, lambda v: 0 if v > 127 else 255))
+        image_buffer, mask_buffer = io.BytesIO(), io.BytesIO()
+        work.save(image_buffer, "PNG")
+        edit_mask.save(mask_buffer, "PNG")
+        image_buffer.seek(0)
+        mask_buffer.seek(0)
+        image_buffer.name, mask_buffer.name = "image.png", "mask.png"
+        client = OpenAI(timeout=float(os.getenv("ADAPTIFAI_V7_INPAINT_TIMEOUT", "120")))
+        response = client.images.edit(
+            model=os.getenv("ADAPTIFAI_OPENAI_IMAGE_MODEL", "gpt-image-2"),
+            image=image_buffer,
+            mask=mask_buffer,
+            prompt=(
+                "Remove the text in the transparent masked areas and rebuild exactly what is behind it, continuing the "
+                "surrounding photo seamlessly. Do not add any text, letters, logos or new objects."
+            ),
+            size=f"{target[0]}x{target[1]}",
+            quality=os.getenv("ADAPTIFAI_OPENAI_IMAGE_QUALITY", "medium"),
+        )
+        generated = Image.open(io.BytesIO(base64.b64decode(response.data[0].b64_json))).convert("RGB").resize((w, h), Image.Resampling.LANCZOS)
+        soft = mask.convert("L").filter(ImageFilter.MaxFilter(5)).filter(ImageFilter.GaussianBlur(2))
+        return Image.composite(generated, image.convert("RGB"), soft)
+    except Exception as exc:  # pragma: no cover - provider failures
+        print(f"[localize-v7] OpenAI inpaint failed: {exc}", flush=True)
+        return None
 
 
 # ---------------------------------------------------------------------------

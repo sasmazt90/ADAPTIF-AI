@@ -18926,6 +18926,19 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
     parity_report_filename = "previewTemplateParityReport.json"
     (job_dir / parity_report_filename).write_text(json.dumps(parity_report, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    if resize_pipeline_name() == "v7":
+        try:
+            rendered_v7 = build_resize_v7_renders(paths, canonical_placement_ids, custom_width, custom_height, job_dir)
+        except Exception as exc:
+            print(f"[resize-v7] failed, falling back to legacy resize: {exc}", flush=True)
+            rendered_v7 = None
+        if rendered_v7 is not None:
+            return finish_resize_outputs(
+                rendered_v7, paths, canonical_placement_ids, resolved_creative_modes, output_format,
+                custom_width, custom_height, job_dir, parity_report_filename, resize_mode, resize_strategy,
+                smart_reframe_enabled, safe_resize_strategy,
+            )
+
     source_entries: list[dict[str, Any]] = []
     for image_path in image_paths(paths):
         print(f"[resize_e2e] source_start name={image_path.name}", flush=True)
@@ -19031,6 +19044,83 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
             )
         rendered_assets_by_placement[canonical_id] = placement_assets
 
+    return finish_resize_outputs(
+        rendered_assets_by_placement, paths, canonical_placement_ids, resolved_creative_modes, output_format,
+        custom_width, custom_height, job_dir, parity_report_filename, resize_mode, resize_strategy,
+        smart_reframe_enabled, safe_resize_strategy,
+    )
+
+
+def resize_pipeline_name() -> str:
+    return os.getenv("ADAPTIFAI_RESIZE_PIPELINE", "v7").strip().lower() or "v7"
+
+
+def build_resize_v7_renders(
+    paths: list[Path],
+    placement_ids: list[str],
+    custom_width: int | None,
+    custom_height: int | None,
+    job_dir: Path,
+) -> dict[str, list[dict[str, Any]]]:
+    import pickle
+
+    from app import resize_v7
+
+    def lama(image: Image.Image, mask: Image.Image) -> Image.Image | None:
+        return run_replicate_lama_inpaint(image, mask)
+
+    rendered: dict[str, list[dict[str, Any]]] = {placement_id: [] for placement_id in placement_ids}
+    for image_path in image_paths(paths):
+        source_image = Image.open(image_path).convert("RGB")
+        targets = [(pid, *resolve_resize_dimensions(pid, custom_width, custom_height)) for pid in placement_ids]
+        results, model = resize_v7.resize_creative(image_path, targets, inpaint=lama)
+        model_path = job_dir / f"{sanitize_stem(image_path)}-resize-v7-model.pkl"
+        try:
+            model_path.write_bytes(pickle.dumps(model))
+        except Exception as exc:
+            print(f"[resize-v7] could not store layer model: {exc}", flush=True)
+        (job_dir / f"debug-{sanitize_stem(image_path)}-resize-v7-layers.json").write_text(json.dumps(model.report, ensure_ascii=False, indent=2), encoding="utf-8")
+        model.scene_clean.save(job_dir / f"debug-{sanitize_stem(image_path)}-resize-v7-scene.png", "PNG")
+        print(f"[resize-v7] {image_path.name} layers={json.dumps(model.report, ensure_ascii=False)[:600]}", flush=True)
+        for placement_id, (image, meta) in results.items():
+            print(f"[resize-v7] {image_path.name} {placement_id} {meta.get('family')} {meta.get('scene')} {meta.get('seconds')}s", flush=True)
+            rendered[placement_id].append(
+                {
+                    "source_name": image_path.name,
+                    "rendered": image,
+                    "source_image": source_image,
+                    "focus_bbox": tuple(model.hero_box),
+                    "reframe_plan": None,
+                    "visual_analysis": None,
+                    "render_meta": {**meta, "pipeline": "resize-v7-layers", "modelPath": str(model_path)},
+                }
+            )
+    return rendered
+
+
+def finish_resize_outputs(
+    rendered_assets_by_placement: dict[str, list[dict[str, Any]]],
+    paths: list[Path],
+    canonical_placement_ids: list[str],
+    resolved_creative_modes: dict[str, str],
+    output_format: str,
+    custom_width: int | None,
+    custom_height: int | None,
+    job_dir: Path,
+    parity_report_filename: str,
+    resize_mode: str,
+    resize_strategy: str,
+    smart_reframe_enabled: bool,
+    safe_resize_strategy: bool,
+) -> tuple[list[OutputAsset], list[dict[str, Any]]]:
+    outputs: list[OutputAsset] = []
+    manifest_assets: list[dict[str, Any]] = []
+    source_entries = [
+        {"path": image_path, "image": item["source_image"], "focus_bbox": item["focus_bbox"]}
+        for image_path in image_paths(paths)
+        for item in rendered_assets_by_placement[canonical_placement_ids[0]]
+        if item["source_name"] == image_path.name
+    ]
     for source_entry in source_entries:
         image_path = source_entry["path"]
         source_image = source_entry["image"]
@@ -19150,6 +19240,8 @@ async def build_resize_assets(paths: list[Path], placement_ids: list[str], outpu
                     "analysisProvider": analysis_provider,
                     "logicBucket": active_reframe_plan.logic_bucket.value if active_reframe_plan is not None else None,
                     "renderMeta": active_render_meta,
+                    "pipeline": active_render_meta.get("pipeline", "resize-legacy"),
+                    "resizeModelPath": active_render_meta.get("modelPath"),
                     "smartReframePlan": active_reframe_plan.model_dump(mode="json") if active_reframe_plan is not None else None,
                     "scale": 100,
                     "translated_text": "",
@@ -19358,6 +19450,32 @@ def regenerate_localize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: E
 
 
 def regenerate_resize_asset(job_dir: Path, asset_meta: dict[str, Any], edit: EditRequest) -> OutputAsset:
+    if asset_meta.get("pipeline") == "resize-v7-layers" and asset_meta.get("resizeModelPath") and Path(asset_meta["resizeModelPath"]).exists():
+        import pickle
+
+        from app import resize_v7
+
+        model = pickle.loads(Path(asset_meta["resizeModelPath"]).read_bytes())
+        rendered, render_meta = resize_v7.compose_adjusted(
+            model, int(asset_meta["width"]), int(asset_meta["height"]),
+            zoom=max(0.5, min(2.0, edit.scale / 100.0)), dx=float(edit.x), dy=float(edit.y),
+        )
+        output_path = job_dir / asset_meta["filename"]
+        save_image_output(rendered, output_path, output_path.suffix.lower().lstrip(".") or "png")
+        asset_meta["renderMeta"] = {**render_meta, "pipeline": "resize-v7-layers"}
+        asset_meta["scale"] = edit.scale
+        return OutputAsset(
+            placement_id=asset_meta.get("placement_id"),
+            filename=asset_meta["filename"],
+            width=int(asset_meta["width"]),
+            height=int(asset_meta["height"]),
+            safe_zone_warnings=safe_zone_warnings_for(asset_meta.get("placement_id", "")),
+            download_url=f"/api/download/{job_dir.name}/{asset_meta['filename']}",
+            source_name=asset_meta["source_name"],
+            language=None,
+            translated_text="",
+            extracted_blocks=[],
+        )
     source_image = Image.open(asset_meta["source_path"]).convert("RGB")
     focus_bbox = build_resize_focus_bbox(source_image)
     resize_strategy = os.getenv("ADAPTIFAI_RESIZE_STRATEGY", "smart-reframe").strip().lower()
@@ -19417,6 +19535,7 @@ def health() -> dict[str, str]:
         "inpainting": os.getenv("ADAPTIFAI_INPAINT_MODEL", "runwayml/stable-diffusion-inpainting"),
         "resize_fit": os.getenv("ADAPTIFAI_RESIZE_FIT", "cover"),
         "localize_pipeline": localize_pipeline_name(),
+        "resize_pipeline": resize_pipeline_name(),
         "localize_vision_model": os.getenv("ADAPTIFAI_LOCALIZE_VISION_MODEL", "") or os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5.6-terra"),
         "localize_translation_model": os.getenv("OPENAI_TRANSLATION_MODEL", "gpt-5.6-terra"),
         "localize_qa_model": os.getenv("ADAPTIFAI_LOCALIZE_QA_MODEL", "gpt-5.6-luna"),
